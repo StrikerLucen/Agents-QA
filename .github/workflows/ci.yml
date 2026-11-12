@@ -40,7 +40,7 @@ concurrency:
 jobs:
   test:
     name: tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -48,7 +48,23 @@ jobs:
         # `from __future__ import annotations` for 3.9-compatible typing and
         # the author's machine is 3.9.6, so a 3.9-only break must be caught
         # here rather than discovered by the person it blocks.
-        python-version: ["3.9", "3.11", "3.12"]
+        #
+        # The runner image is pinned per version rather than shared, because
+        # `ubuntu-latest` moved to 26.04 and setup-python no longer offers 3.9
+        # for it: the first CI run failed with "The version '3.9' with
+        # architecture 'x64' was not found for Ubuntu 26.04". Dropping 3.9
+        # would have been the easy read of that error and the wrong one -- it
+        # is the declared floor, so the image moves instead. 22.04 is the
+        # newest image that still carries it; when that image is retired,
+        # either the floor rises deliberately or 3.9 gets installed another
+        # way. Do not let it quietly stop being tested.
+        include:
+          - python-version: "3.9"
+            os: ubuntu-22.04
+          - python-version: "3.11"
+            os: ubuntu-latest
+          - python-version: "3.12"
+            os: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4

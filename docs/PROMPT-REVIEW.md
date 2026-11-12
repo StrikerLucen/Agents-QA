@@ -6,6 +6,12 @@ against `docs/RESEARCH.md`, `templates/report/RULES.md`, `templates/report/STYLE
 
 Counts: **5 critical, 5 high, 9 medium, 5 low.** Read-only review; nothing was edited.
 
+**On locations in this document.** Line numbers in this repo go stale within a single
+session — `skills/start/SKILL.md` was reordered twice on 2026-11-12, once between two reads
+taken minutes apart. Where a reference has been revisited it now quotes an anchor phrase
+instead of, or alongside, the line number. Un-revisited `file:NN` references predate that
+rule and should be treated as approximate.
+
 ---
 
 ## Findings, ranked by damage in a real run
@@ -74,7 +80,9 @@ test -f "${CLAUDE_PROJECT_DIR}/.testing/tasks/current" || exit 0
 
 `skills/test/SKILL.md:18` writes `.testing/tasks/<id>.md` and never
 `.testing/tasks/current`. No file in the repo creates, symlinks or removes it;
-`skills/start/SKILL.md:236` lists only `.testing/tasks/`. So the product-code guard and
+`skills/start/SKILL.md`'s "What gets written" table lists only `.testing/tasks/`
+(it does carry a `.testing/tasks/current` row, marked **not** committed, but nothing
+creates the file). So the product-code guard and
 the QA stop-gate exit 0 on every invocation, forever, while `hooks/examples/README.md:57`
 tells the user they are armed "during a testing task".
 
@@ -217,7 +225,8 @@ demote nothing").
 > recorded, record one.**
 
 `skills/learn/SKILL.md:52` — "**Promotion requires the user's approval. Always.**"
-`conventions.md` is the rules file "the agents *enforce*" (`skills/start/SKILL.md:154`)
+`conventions.md` is the rules file "the agents *enforce*" (`skills/start/SKILL.md`,
+step 9: *"a numbered rules file the agents *enforce*"*)
 and is read unquestioned by every agent on every run (`learn/SKILL.md:19-23`). A subagent
 that cannot prompt (`automation-engineer.md:159-164`) writing a flake threshold into it
 is a self-approved standing rule — the exact erosion `skills/verify/SKILL.md:86-91`
@@ -271,31 +280,45 @@ qualifies."*
 
 ### M14. "Ask once, batched, then unattended" is contradicted three times in the same file
 
-`skills/start/SKILL.md:22-24` — "**Ask once, at the start, batched.** … then the run
-proceeds unattended." Then: `:61-63` (UNSAFE → ask whether to continue), `:128` ("**Show
-the diff and get agreement before writing**" CLAUDE.md), `:177-178` ("**get explicit
-approval**" for the contract). Three further interruptions, all of them correct.
+`skills/start/SKILL.md` — "**Ask once, at the start, batched.** … then the run proceeds
+unattended." Then, in order: the step 3 UNSAFE branch (ask whether to continue), **step 5's
+consent gate** (*"Print those commands verbatim and get agreement"*), step 8 (*"**Show the
+diff and get agreement before writing.**"* — `CLAUDE.md`), and step 11 (*"**get explicit
+approval** before it becomes"* — the acceptance contract). **Four** further interruptions,
+all of them correct.
 
-Reword `:22` to what is actually meant: *"**Ask the configuration questions once**, at
-the start, batched. Later stops are approval gates, not questions: safety (step 3),
-writing to `CLAUDE.md` (step 7), and the contract (step 10). Nothing else interrupts."*
+*Updated 2026-11-12: this finding said "three", written before the step 5 consent gate
+existed (see `docs/SECURITY-REVIEW.md` S2-3). The step numbers in the original recommended
+wording — "`CLAUDE.md` (step 7)", "the contract (step 10)" — were also left behind by the
+renumbering; they are now 8 and 11.*
+
+Reword the "Ask once" rule to what is actually meant: *"**Ask the configuration questions
+once**, at the start, batched. Later stops are approval gates, not questions: safety
+(step 3), agreeing to execute this repo's code (step 5), writing to `CLAUDE.md` (step 8),
+and the contract (step 11). Nothing else interrupts."*
 
 ### M15. Report artifact names and paths differ between files
 
-| Thing | A | B |
+**All three naming conflicts are now fixed. Re-verified 2026-11-12:**
+
+| Thing | As found (A vs B) | Now |
 |---|---|---|
-| Dashboard filename | `start/SKILL.md:203`: `.testing/reports/diagnostic-<date>.html` | `report/SKILL.md:89`: `.testing/reports/dashboard-<date>.html` |
-| PR comment path | `report/SKILL.md:37`: `.testing/reports/pr-comment.md` | `templates/ci/testsquad-pr.yml:91,110`: `.testing/pr-comment.md` |
-| Normalized coverage | `diagnose/SKILL.md:51`: `.testing/coverage-raw.json` | `templates/ci/testsquad-pr.yml:69`: `.testing/coverage-current.json` |
+| Dashboard filename | `diagnostic-<date>.html` vs `dashboard-<date>.html` | **agreed** — `skills/start/SKILL.md` and `skills/report/SKILL.md` both say `.testing/reports/dashboard-<date>.html` |
+| PR comment path | `.testing/reports/pr-comment.md` vs `.testing/pr-comment.md` | **agreed** — `skills/report/SKILL.md` and `templates/ci/testsquad-pr.yml` both say `.testing/reports/pr-comment.md` |
+| Normalized coverage | `coverage-raw.json` vs `coverage-current.json` | **agreed** — `skills/diagnose/SKILL.md` and `templates/ci/testsquad-pr.yml` both say `.testing/coverage-raw.json` |
 
-The CI path matters most: `.testing/reports/` is gitignored (`start:242`) and
-`.testing/pr-comment.md` is not, so the CI template commits-eligible artifact escapes the
-ignore rule the design asks for.
+The CI half was the one that mattered, and it is closed: `.gitignore` line 1 is
+`.testing/reports/`, and the CI template now writes its comment *inside* that directory, so
+the artifact is no longer commit-eligible. **`HANDOFF.md` §4 still describes this as open**
+("the workflow writes `.testing/pr-comment.md`, outside the gitignored
+`.testing/reports/`") — that note is stale and `HANDOFF.md` is outside this document's
+ownership, so it is flagged here rather than edited.
 
-Also missing from `start/SKILL.md:219-242` "What gets written": `.testing/tooling-radar.md`
-(written by `/scout`), `.testing/coverage-raw.json` (by `/diagnose`), and
-`.testing/tasks/current` (see C3). `/testsquad:uninstall` enumerates nothing beyond
-`.testing/` wholesale, so this table is the only inventory that exists.
+**What remains of M15.** The "What gets written" inventory in `skills/start/SKILL.md` is
+still incomplete: `.testing/tooling-radar.md` (written by `/scout`) and
+`.testing/coverage-raw.json` (by `/diagnose`) do not appear in it. `.testing/tasks/current`
+**has** since been added, marked not-committed. `/testsquad:uninstall` enumerates nothing
+beyond `.testing/` wholesale, so this table is the only inventory that exists.
 
 ### M16. The reporter's binding contract is an unresolvable path, and the two contracts disagree
 
@@ -373,7 +396,9 @@ gap against a numbered criterion is never minor."*
 ### L21–L25 (low)
 
 - **L21.** `skills/upgrade/SKILL.md:70` names `ts-browser-engineer`; no such template
-  exists (`templates/agents/` has 4). Illustrative, but `/start:143` promises per-stack
+  exists (`templates/agents/` has 4). Illustrative, but `/start` step 9 (*"**Generate only
+  what fits.** A library with no UI gets an API/integration agent, not a Playwright one."*)
+  promises per-stack
   agent selection from a set of four fixed roles — say "the roles that fit the stack,
   from the four templates" or add the template.
 - **L22.** `agents/qa-gatekeeper.md:173` — "**Append** one file to `.testing/lessons/`
@@ -442,7 +467,7 @@ agent name used in a skill.
 | `ts-unit-test-engineer`, `ts-automation-engineer`, `ts-debugger`, `ts-qa-gatekeeper` | `skills/test/SKILL.md:43-46`, `plan/SKILL.md:71`, `debug/SKILL.md:14` | Exist **only after** `/testsquad:start`; no fallback stated |
 | `project-analyst`, `tech-scout`, `reporter` | — | **Referenced by no skill at all** |
 | `scripts/arid_nodes.py` | — | Exists, implements `mutate`'s rules, **invoked nowhere** |
-| `${CLAUDE_PLUGIN_ROOT}/scripts/{env_safety_check,risk_map,flake_smells,normalize_coverage,pr_comment,session_context}.py` | `start:56,109`, `health:83`, `verify:58`, `diagnose:50`, `report:36`, `hooks.json:8` | **Sound** — all exist, all flags match `argparse` |
+| `${CLAUDE_PLUGIN_ROOT}/scripts/{env_safety_check,risk_map,flake_smells,normalize_coverage,pr_comment,session_context}.py` | `start` (the `env_safety_check.py` call in step 3 and the `risk_map.py` call in step 7), `health:83`, `verify:58`, `diagnose:50`, `report:36`, `hooks.json:8` | **Sound** — all exist, all flags match `argparse` |
 | `${CLAUDE_PLUGIN_ROOT}/stacks/<stack>.md`, `/templates/agents/`, `/templates/report/{RULES.md,dashboard.html}` | `project-analyst:62`, `start:73,141,204`, `upgrade:48`, `report:90`, + 4 more | **Sound** |
 
 ---
@@ -513,20 +538,58 @@ and it cannot perform its single named output (C5).
 - **Script references.** All 6 invoked scripts exist and every flag used in a skill
   matches the script's `argparse` (`--out`, `--format text`, `--strip-prefix`,
   `--testing-dir`). No fabricated flags anywhere.
-- **Context budgets.** `python3 scripts/validate_plugin.py` → "Validation passed: 26
-  component(s) checked, 0 warning(s)." Every agent, skill, template and RULES.md is under
-  its ceiling, and the "no agent reads a stack playbook at task time" check passes
-  (`validate_plugin.py:288-300`) — only `project-analyst` references `stacks/`, correctly
-  exempted.
+- **Context budgets.** `python3 scripts/validate_plugin.py . --strict` prints, verbatim:
+
+  ```
+  Validation passed: 26 component(s) checked, 0 warning(s), 0 could not be validated.
+  ```
+
+  Every agent, skill, template and RULES.md is under its ceiling, and the "no agent reads a
+  stack playbook at task time" check passes (`scripts/validate_plugin.py`, the branch
+  guarded by `if "stacks/" in text:`) — only `project-analyst` references `stacks/`,
+  correctly exempted.
+
+  *The third clause of that string is load-bearing and was added after a defect in which one
+  unreadable component silently dropped a whole check's verdict for all 26. "0 could not be
+  validated" is the plugin's own rule — silence must never look like success — applied to
+  itself, so quote the string in full or not at all.*
+
+  **Headroom is nearly gone in three places.** Measured 2026-11-12 with the validator's own
+  estimator (`os.path.getsize(path) // 4`) against `BUDGETS` in `scripts/validate_plugin.py`:
+
+  | File | Tokens | Ceiling | Headroom |
+  |---|---|---|---|
+  | `agents/automation-engineer.md` | 3,486 | 3,500 | **14** |
+  | `templates/agents/ts-qa-gatekeeper.md.tmpl` | 1,572 | 1,600 | **28** |
+  | `skills/start/SKILL.md` | 2,951 | 3,000 | **49** |
+
+  The next edit to any of them breaches the budget and turns `--strict` red. Two
+  restructuring levers were identified while closing S3-2 and **deliberately not pulled**,
+  because they are content judgements for the owner rather than side effects of a cleanup:
+
+  1. `templates/agents/ts-qa-gatekeeper.md.tmpl` duplicates a flake-classification table
+     that also appears in `templates/agents/ts-debugger.md.tmpl` and
+     `agents/qa-gatekeeper.md` — roughly **90 tokens** recoverable from the template.
+  2. Several templates already use a *"the plugin's &lt;role&gt; agent holds the full rules"*
+     pointer; the rest could adopt it instead of carrying their own copy.
+
+  Both figures above are measured; the ~90 is an estimate made by whoever found it and is
+  labelled as such.
 - **Environment-safety gating.** Stated identically and in the same direction in
-  `start:26-28,53-68`, `health:18-27`, `diagnose:38-41`, `debug:19-24`, `mutate:116-118`,
+  `start` (the run-wide rule *"No test command, no coverage run, no dependency install,
+  until step 3 has passed and step 5 is agreed"*, plus step 3), `health:18-27`,
+  `diagnose:38-41`, `debug:19-24`, `mutate:116-118`,
   `advise:115-116`, `verify:28`, `project-analyst:41-43`. No file grants an exception.
 - **Install permission.** Never granted implicitly; "cannot execute + the exact command"
-  is the uniform fallback in `start:103`, `health:23-27`, `diagnose:38-41`, `debug:22-24`.
+  is the uniform fallback in `start` (step 2: *"reports \"cannot execute\" with the exact
+  command it would have needed"*; step 5: *"On a no, every later stage reports \"cannot
+  execute\" plus the command it would have run"*), `health:23-27`, `diagnose:38-41`,
+  `debug:22-24`.
   `preferences:33-51` adds scoped, 30-day, early-revalidated approvals and a correct list
   of never-remembered actions. This is the most coherent cross-file mechanism in the
   plugin.
-- **Secrets.** `start:61`, `preferences:80-82`, `report:61-62`, `RULES.md:33` all say key
+- **Secrets.** `start` (step 3 UNSAFE: *"key name, redacted preview — **never the secret
+  itself**"*), `preferences:80-82`, `report:61-62`, `RULES.md:33` all say key
   names and redacted previews only, and `preferences:80` goes further (no hash). No file
   contradicts it.
 - **"Never a number you did not measure."** Consistent and identically scoped in

@@ -15,11 +15,18 @@ or are writing the reporter itself. This file is what you follow.
 
 ## Hard rules
 - **Main list caps at 10.** Print `N of M shown, ranked by business risk`.
-- **Only ✅ reproduced and 👁 observed appear in the main list.** 📖 code-read and
+- **Every finding carries exactly one evidence badge.** ✅ **reproduced** — you ran it and
+  saw it fail, N of M times, on a stated commit. 👁 **observed** — present in a log, trace
+  or CI artifact you read, but not re-run by you. 📖 **code-read** — the path implies it;
+  you never saw it happen. 💭 **suspicion** — pattern-matching, and not a finding.
+- **Only ✅ reproduced and 👁 observed appear in the main list**, and the bug total is
+  `count(✅) + count(👁)`. Reproduction is not required of every finding, at any depth:
+  depth buys more attempts at turning 👁 into ✅, never a higher bar. 📖 code-read and
   💭 suspicion go to the collapsed appendix with the reason they did not qualify, and are
   **never counted in the bug total**.
 - **Bugs and issues are different lists.** A bug is a problem in the product; an issue is
-  a problem with the testing, including anything not reproduced.
+  a problem with the testing — broken fixture, missing mock, flaky test, dead environment.
+  The badge is a separate axis: a 👁 observed product defect is a bug, not an issue.
 - **Cluster by root cause.** 40 failures from one null guard is one finding with a count.
 - **Symptom, not cause.** *"Checkout fails for EU customers with a discount on a taxed
   line"* — not *"assertion failure in tax module"*. The cause goes inside the item.

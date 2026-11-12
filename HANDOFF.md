@@ -37,9 +37,9 @@ produced by running the commands above, not by recollection.**
 
 | | |
 |---|---|
-| Tests | **814, all passing** (1 skip, 1 expected failure) |
+| Tests | **902, all passing** (1 skip, 2 expected failures) |
 | Plugin validation | **passes**, 26 components, 0 warnings, 0 could not be validated |
-| Own flake gate on own code | **exit 0** |
+| Own flake gate on own code | **exit 0** (9 block findings on a pristine clone) |
 | Agents / skills / stacks | 7 / 16 / 10 |
 | Eval cases | 27, with 81 graders, over 11 claims |
 | Evals ever run | **No.** `evals/SCORECARD.md` is still a template |
@@ -127,34 +127,31 @@ did not know about are too.
    - **`flake_smells` emits the path as `"path"` in `summary["skipped"]` and `"file"`
      in `skipped_files`.** It crashed a consumer today. Unifying is a schema change to
      `testsquad.flakesmells/1`.
-   - **S3-2.** Only `tech-scout` treats repo content as untrusted. The other six agents
-     have no equivalent rule.
-   - **`docs/RESEARCH.md` §20 misapplies its own citation.** "Exotic operator sets buy
-     ≤13%" applies Gopinath et al.'s bound on operator *reduction* to operator
-     *addition*, which that paper explicitly exempts ("no limit to the improvement that
-     can be made by addition of new mutation operators"). A reviewer who opens the
-     citation finds it saying the opposite — worse than no citation. One sentence.
-   - **The consent record has no pinned key.** Both `skills/start/SKILL.md` and
-     `agents/project-analyst.md` say the agreement is "recorded in
-     `.testing/preferences.json`", and the analyst's static-vs-executing decision
-     depends on reading it, but no key name is specified and no script validates it.
-     Pin it before this is exercised, or the analyst will guess.
+   - **A shared reader for the consent record.** The contract is now pinned
+     (`consent.execute_repo_commands` in `.testing/preferences.json`, four states,
+     fail-closed) and `tests/test_consent_contract.py` guards it against drift. But it
+     is still prose executed by a model. A `scripts/consent.py` exposing
+     `read_consent(path) -> (state, covered_commands, reason)` would be the only way to
+     guarantee the writer and the reader agree — estimated ~100 lines plus tests. The
+     catch, stated by the agent that declined to build it: the analyst is a prompt, not
+     a process, so nothing *forces* it to call the reader, and a reader nobody must
+     invoke is a second contract on top of the first.
 4. **Smaller, well-specified cleanups** — each found and reported today, none urgent:
    - `test_robustness.py:386/529/553/1279/1483` skip when `arid_nodes.py` is absent.
      Those are missing-*production-code* skips, not platform guards, and should fail
      like the fixture ones now do.
-   - `pr_comment.py`: a `--data` file holding a valid but empty `{}` exits 2 saying
-     "could not read" — conflating unreadable with empty, one layer up from the bug
-     fixed today. And an input that is a readable object missing its key (e.g.
-     `gates.json` as `{"name": ...}`) still counts as "ran, found nothing".
-   - `docs/SECURITY-REVIEW.md` S2-3's "Where:" line numbers are stale after the
-     reorder, and its fix 3 says "step 4", now step 5.
-   - `docs/PROMPT-REVIEW.md:516` quotes the old `Validation passed:` string.
+   - `pr_comment.py`'s `health-baseline.json` and `coverage-diff.json` have no wrapper
+     key, so a `{}` there is still counted as an input that ran. Closing it means
+     deciding which field is mandatory — a product call, not a guess.
    - A mode-000 file in `templates/agents/*.tmpl` still passes validation; a UTF-16
      agent `.md` validates clean. The second needs the real CLI to judge, not a guess.
-   - `M13`/`M14`/`M15`/`M17` in `docs/PROMPT-REVIEW.md` remain open. M15's CI half:
-     the workflow writes `.testing/pr-comment.md`, outside the gitignored
-     `.testing/reports/`, so its artifact is commit-eligible.
+   - M15's last piece: the "What gets written" inventory in `skills/start/SKILL.md`
+     is missing `mutation-plan.json`, `tooling-radar.md`, `coverage-raw.json` and
+     `tasks/current`. M13, M14, M17 and M15's naming and CI halves are closed.
+   - **Three files are at their context ceiling**: `agents/automation-engineer.md` (14
+     tokens), `templates/agents/ts-qa-gatekeeper.md.tmpl` (28), `skills/start/SKILL.md`
+     (49). The next edit to any breaches the budget. Two restructuring levers exist and
+     were deliberately not pulled, both recorded in `docs/PROMPT-REVIEW.md`.
 
 ## 5. How work is done here
 

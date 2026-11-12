@@ -14,14 +14,15 @@ You are onboarding one or more repositories. By the end the user should have age
 fit *their* project, an honest picture of where they stand, and a ranked list of what to
 do first.
 
-**Everything here is a chain of the single-job commands.** Nothing is a black box: each
-stage can be re-run on its own afterwards, and you should say so.
+**Everything here is a chain of the single-job commands**, each re-runnable on its own
+afterwards. Nothing is a black box, and you should say so.
 
 ## Before anything: the two rules that govern this whole run
 
-**Ask once, at the start, batched.** Questions are gathered into one decision point, then
-the run proceeds unattended. Re-asking something already answered is a defect — check
-`.testing/preferences.json` before asking anything.
+**Ask the configuration questions once**, batched, at step 2. The run is then unattended
+*except at four approval gates*: safety (3), executing this repo's code (5), `CLAUDE.md`
+(8), the contract (11). Nothing else interrupts, and re-asking something already
+answered is a defect — check `.testing/preferences.json` first.
 
 **Nothing runs until it is safe and agreed.** No test command, no coverage run, no
 dependency install, until step 3 has passed and step 5 is agreed. A suite you have
@@ -44,8 +45,8 @@ In **one** AskUserQuestion call:
 
 1. **Depth** — quick / standard / deep / exhaustive. Explain it in terms of effort spent
    reproducing a finding, not in abstract terms. Standard is the default.
-2. **May I install dependencies?** If no, the run still works; some stages report
-   "cannot execute" instead of a number.
+2. **May I install dependencies?** On a no, nothing is installed and every stage that
+   needed it reports "cannot execute" with the exact command it would have needed.
 
 Write both to `.testing/preferences.json` immediately, with the date and a 30-day expiry
 on the install permission. Never ask either again.
@@ -74,11 +75,11 @@ are independent. It holds the method and writes `.testing/profile.json`, and it 
 only agent permitted to read `${CLAUDE_PLUGIN_ROOT}/stacks/<stack>.md` for its detection
 signals, because everything after onboarding reads the small profile instead.
 
-**This pass is static**: it reads the repo and runs nothing the repo supplied. Its
-glob-resolving probes (its rule 2) are deferred to step 6.
+**This pass is static**: nothing the repo supplied runs. Its glob-resolving probes are
+deferred to step 6.
 
 Check what comes back: every command traced to its config file, every unmeasurable
-field `null` with a reason.
+field `null` with a reason, and which consent state it read.
 
 ## Step 5 — Agree to execute this repo's code. This is a gate
 
@@ -92,8 +93,11 @@ as you, on this machine.** It is not a configuration value being approved. Step 
 *where* tests point, not *what* they do, so repeat its findings here beside the command.
 Showing the string is what closes the class; a detector list never will.
 
-Record it in `.testing/preferences.json`: asked once, re-asked when a command changes.
-On a no, every later stage reports "cannot execute" plus the command it would have run.
+Record it under `consent.execute_repo_commands` in `.testing/preferences.json`, in the
+shape `agents/project-analyst.md` defines under "The consent record" — the only
+definition; never restate it here. A no is `"refused"`, a different state from never
+having been asked. **A missing or malformed record is not consent**: it fails closed to
+the static pass and is reported as unreadable, never as agreement.
 
 ## Step 6 — Suite health. This is a gate
 
@@ -115,9 +119,6 @@ fixes:
 Verdict is GREEN / AMBER / RED. **RED still produces a useful report** — it just withholds
 coverage and makes fixing the suite roadmap item #0. There is no point writing new tests
 on a foundation that does not hold.
-
-If dependencies are missing and the user said no to installing, record "cannot execute"
-with the exact command that would be needed. Do not install anything.
 
 ## Step 7 — Risk map
 
@@ -149,8 +150,6 @@ Keep the block to 15 lines or fewer. `CLAUDE.md` is loaded into context on every
 request in that repo, so every line costs forever. The block holds the test commands and
 a pointer to `.testing/`; it does not hold the knowledge itself.
 
-Re-running `/start` replaces the block and never duplicates it.
-
 ## Step 9 — Generate the agents
 
 Write to `<repo>/.claude/agents/ts-*.md`, from the templates in
@@ -158,14 +157,11 @@ Write to `<repo>/.claude/agents/ts-*.md`, from the templates in
 
 **Generate only what fits.** A library with no UI gets an API/integration agent, not a
 Playwright one. Three agents that match the stack, each with a sentence saying why, beat
-eight generic ones — and the generic ones already exist in a dozen other marketplaces.
+eight generic ones.
 
 Every generated file is **fully regenerable**: stamp it with the plugin version and put
-nothing hand-written or learned inside it. If someone needs to hand-edit an agent, they
-copy it to `ts-<name>.local.md`, which `/testsquad:upgrade` never overwrites and which
-takes precedence over the generated file. Regeneration that silently discards someone's
-work is how a tool stops being trusted. All learning lives in `.testing/`, which is
-what lets `/testsquad:upgrade` rewrite these safely later.
+nothing hand-written or learned inside it. All learning lives in `.testing/`.
+`/testsquad:upgrade` holds the rest of that rule, including `ts-<name>.local.md`.
 
 Derive the repo's conventions into `.testing/conventions.md` — a numbered rules file the
 agents *enforce*. Separating the rules from the enforcer means `/start` can refresh the
@@ -245,6 +241,10 @@ reusing cached results for packages whose files have not changed.
 | `.testing/risk-map.json` | yes |
 | `.testing/health-baseline.json` | yes |
 | `.testing/coverage-state.md` | yes |
+| `.testing/coverage-raw.json`, `coverage-diff.json` — `/diagnose` | yes |
+| `.testing/findings.json` — `/test`, `/debug` | yes |
+| `.testing/gates.json` — `/verify` | yes |
+| `.testing/mutation-plan.json` — `/mutate`; `tooling-radar.md` — `/scout` | yes |
 | `.testing/known-issues.md` (each entry dated, with a review date) | yes |
 | `.testing/conventions.md` | yes |
 | `.testing/lessons/` | yes |
@@ -261,12 +261,11 @@ reusing cached results for packages whose files have not changed.
 Writes are atomic (temp file, then rename) and there is one file per item, so parallel
 agents cannot clobber each other or leave a half-written baseline.
 
-Add `.testing/reports/` and `.testing/tasks/current` to `.gitignore` — the knowledge is worth committing, the
-generated HTML is not.
+Add the **gitignored** rows above to `.gitignore` — the knowledge is worth committing,
+the generated HTML is not.
 
 ## Re-running
 
 `/start` is idempotent. The `CLAUDE.md` block is replaced, never duplicated; agents are
 regenerated; learned knowledge in `.testing/` is preserved. `/testsquad:uninstall` removes
-exactly what was added and leaves hand-written content alone — people need a way out
-before they will risk the way in.
+exactly what was added and leaves hand-written content alone.

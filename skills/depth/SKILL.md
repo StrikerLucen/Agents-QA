@@ -28,12 +28,20 @@ to anyone; "forty-five minutes including a bisect" means something.
 | **deep** | ~45 min | All, including `git bisect` and order randomization | A release, a hard bug, critical-tier code |
 | **exhaustive** | Until reproduced or genuinely exhausted | All, with environment sweeps over `TZ`, `LANG`, hash seed and clock | An incident, or a bug that has escaped twice |
 
-**Every finding must be reproduced at every level.** Quick does not mean "report
-hypotheses faster". It means fewer strategies are tried before the budget expires, and
-whatever did not reproduce is reported as *"could not reproduce in 2 minutes; here is
-what I tried"* — in the unconfirmed appendix, with its reason, never counted in the bug
-total. A wrong repro delays a fix more than a missing one, so the cheap setting buys
-less searching, never looser standards of proof.
+**Not every finding is reproduced, at any level — and depth never changes which ones
+qualify.** The main list admits two evidence levels: ✅ **reproduced** (you ran it and saw
+it fail, N of M times, on a stated commit) and 👁 **observed** (present in a log, trace or
+CI artifact you read, but not re-run by you). 📖 code-read and 💭 suspicion never reach
+it, at any depth, and are never counted in the bug total — see
+`${CLAUDE_PLUGIN_ROOT}/templates/report/RULES.md`, which is the authority on this.
+
+Depth changes **how many strategies you spend trying to turn 👁 into ✅**, and nothing
+else. Exhaustive buys more attempts, not a higher bar; quick buys fewer, not a lower one.
+Quick does not mean "report hypotheses faster": it means fewer strategies are tried
+before the budget expires, and whatever is neither reproduced nor observed is reported as
+*"could not reproduce in 2 minutes; here is what I tried"* — in the unconfirmed appendix,
+with its reason. A wrong repro delays a fix more than a missing one, so the cheap setting
+buys less searching, never looser standards of proof.
 
 `--deep` on `/testsquad:debug` lifts the budget for one item without changing the stored
 preference.

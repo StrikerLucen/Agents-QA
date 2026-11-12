@@ -148,7 +148,8 @@ changed. **Any figure you did not measure is `null`, never `0`** — the rendere
 `null` as "not measured" and omits the delta, which is the honest output. The `base_*`
 fields need coverage measured at the base commit; a single `/testsquad:diagnose` run has
 only one measurement, so leave them `null` unless you were given a base to compare
-against. With no diff scope at all, do not write the file: a missing input is reported
+against. CI does not fill them either: `templates/ci/testsquad-pr.yml` would have to
+re-run the suite at the merge base, and it deliberately does not. With no diff scope at all, do not write the file: a missing input is reported
 by name, and that is better than a mislabelled one.
 
 `coverage-state.md` and the dashboard are bound by

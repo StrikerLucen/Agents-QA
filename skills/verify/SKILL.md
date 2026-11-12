@@ -114,6 +114,14 @@ One object per gate, in contract order. `met` is a boolean and nothing else.
 and carry the reason in `actual`: `"CANNOT VERIFY — needs npm ci"`. A gate nobody could
 check must never be indistinguishable from one that passed.
 
+If the gates ran and no row resulted — no gates defined, none breached — still write the
+file **with the key and an empty list: `{"gates": []}`**. Never `{}` and never
+`{"gates": null}`: an empty list means *this ran and found nothing*, while an absent or
+`null` key means *something wrote this file but not what the reader needs*, and the PR
+comment has to keep those apart (`null` is this repo's "not measured", which a wrapper
+around a list never is). If you did not verify at all, write **no file** — an absent
+`gates.json` is reported as "run `/testsquad:verify`", which is the true fact.
+
 Update the dashboard via `/testsquad:report`, bound by
 `${CLAUDE_PLUGIN_ROOT}/templates/report/RULES.md`: every number carries its literal
 command, no number appears that was not measured, and no secret appears in any form.

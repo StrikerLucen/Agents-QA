@@ -131,7 +131,10 @@ is the one thing the evals check five times over.
 
 Write the round's findings to **`.testing/findings.json`** in the shape
 `/testsquad:debug` specifies — one object per root cause, `evidence` of `reproduced` or
-`observed`, nothing weaker promoted. It is the PR comment's only findings input, and a
+`observed`, nothing weaker promoted — and on a clean round still write
+`{"findings": []}`, never `{}` and never `null`, since an absent key reads as "wrote
+this file but not what the reader needs". If you never investigated, write no file.
+It is the PR comment's only findings input, and a
 comment with an empty findings section is indistinguishable from a clean run. Only the
 `findings` array is read from that file, so anything else you put beside it is dropped
 without a word: pre-existing counts belong in the report, not in there.

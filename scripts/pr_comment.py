@@ -398,13 +398,14 @@ def verdict_line(health, gates, findings, notes: list[str] | None = None,
 
     if missing and not anything_ran:
         return ("**Nothing was measured on this change.** No testsquad input "
-                "could be read, so this is not an all-clear — see below for "
+                "could be used, so this is not an all-clear — see below for "
                 "what did not run.")
 
     incomplete = ""
     if missing:
         incomplete = (f" Not everything ran: {len(missing)} input(s) were "
-                      "missing or unreadable, so the picture is incomplete.")
+                      "missing, unreadable or not in the shape this comment "
+                      "reads, so the picture is incomplete.")
 
     blocking = [f for f in findings if f.get("severity") in ("S1", "S2")]
     failed = [g for g in gates if not g.get("met")]
@@ -428,8 +429,8 @@ def verdict_line(health, gates, findings, notes: list[str] | None = None,
         # an all-clear from a partial run is the defect this branch exists to
         # prevent. Report what was found without claiming it is the whole
         # picture.
-        tail = (f"{len(missing)} input(s) were missing or unreadable — "
-                "see below for which.")
+        tail = (f"{len(missing)} input(s) were missing, unreadable or not in "
+                "the shape this comment reads — see below for which.")
         if findings:
             return ("**Not everything ran, so this is not an all-clear.** No "
                     "blocking issues in the checks that did run, and some "
@@ -580,8 +581,9 @@ def render(data) -> str:
         # Absence of data is not absence of problems. Say which checks did not
         # run, so nobody reads a short comment as a clean bill of health. The
         # headline above says the same thing; these two must never disagree.
-        out.append("> **Not everything ran.** These inputs were missing or "
-                   "unreadable, so the report above is incomplete:")
+        out.append("> **Not everything ran.** These inputs were missing, "
+                   "unreadable, or not in the shape this comment reads, so "
+                   "the report above is incomplete:")
         for item in missing[:MAX_ROWS]:
             out.append(f"> - {cell(item, notes, 'a missing-input name')}")
         out.append("")
@@ -616,6 +618,113 @@ def render(data) -> str:
 # entry point
 # --------------------------------------------------------------------------
 
+# The ways a `--data` file can fail to be usable. They are different facts
+# about the world, so they get different sentences: "I could not read it", "I
+# read it and it is empty" and "I read it and it is the wrong shape" are three
+# states, and one message covering all three is the same conflation as a
+# headline calling an unread input clean -- one layer up.
+DATA_UNREADABLE = "unreadable"
+DATA_NOT_AN_OBJECT = "not-an-object"
+DATA_EMPTY = "empty"
+DATA_FOREIGN = "foreign"
+
+# The keys this renderer reads. A `--data` object carrying none of them is not
+# this tool's data: every section would be empty and the headline would read
+# as an all-clear over a file that was never about this change.
+DATA_KEYS = ("health", "coverage", "gates", "findings",
+             "missing_inputs", "inputs_read", "pre_existing_count")
+
+# The four measured inputs, the file `--testing-dir` reads each from, and the
+# command that writes it. Declared once so neither mode can name a different
+# file or a different remedy than the other.
+INPUT_SOURCES = {
+    "health":   ("health-baseline.json", "/testsquad:health"),
+    "coverage": ("coverage-diff.json",   "/testsquad:diagnose"),
+    "gates":    ("gates.json",           "/testsquad:verify"),
+    "findings": ("findings.json",        "/testsquad:test or :debug"),
+}
+RENDERED_INPUTS = tuple(INPUT_SOURCES)
+
+# The three answers to "did this input run?".
+INPUT_RAN = "ran"
+INPUT_ABSENT = "absent"
+INPUT_NULL = "null"
+
+
+def input_outcome(data: dict, key: str) -> str:
+    """**The** definition of "this input ran". Both modes call this one.
+
+    It is one function on purpose. The defect this closes was the two modes
+    disagreeing: `--testing-dir` applied the rule per input and the `--data`
+    branch checked only that *some* recognised key existed, so a file
+    carrying `health` alone rendered as though all four inputs had run and
+    found nothing. A second copy of the rule in the `--data` branch would
+    drift apart again the next time one side is edited.
+
+    The false-positive line lives here, and it is the delicate part: a key
+    that is **present** has run, whatever it holds. `{"gates": []}` means
+    gates ran and none failed -- the overwhelmingly common clean run -- and
+    stays silent. Only a key that is absent, or explicitly `null`, was never
+    supplied. A notice that fired on every clean run would be worse than the
+    bug it was added for.
+    """
+    if key not in data:
+        return INPUT_ABSENT
+    if data[key] is None:
+        return INPUT_NULL
+    return INPUT_RAN
+
+
+def account_for_inputs(data: dict, describe) -> tuple:
+    """`(inputs_read, missing_inputs)` over the four rendered inputs.
+
+    `describe(key, outcome)` is the *only* thing the two modes vary. What
+    counts as having run is shared; how to word the remedy is not, because
+    the remedies genuinely differ -- `--testing-dir` sends the reader to a
+    file on disk and the command that writes it, `--data` sends them to the
+    key their assembler did not put in the blob.
+    """
+    read, missing = 0, []
+    for key in RENDERED_INPUTS:
+        outcome = input_outcome(data, key)
+        if outcome == INPUT_RAN:
+            read += 1
+        else:
+            missing.append(describe(key, outcome))
+    return read, missing
+
+DATA_ERRORS = {
+    DATA_UNREADABLE: "error: could not read {path}",
+    DATA_EMPTY: ("error: read {path}, but it is empty — there is nothing to "
+                 "report, and an empty comment is not an all-clear."),
+    DATA_NOT_AN_OBJECT: ("error: read {path}, but it is not a JSON object — "
+                         "expected an object with health/coverage/gates/"
+                         "findings keys."),
+    DATA_FOREIGN: ("error: read {path}, but it has none of the keys testsquad "
+                   "reads — expected health/coverage/gates/findings, found: "
+                   "{found}."),
+}
+
+
+def read_json_object(path: str):
+    """`(object, problem)` — the parsed top-level object, or which failure.
+
+    `problem` is None when the file parsed to an object (including an empty
+    one, which is a question for the caller, not for the parser), and
+    otherwise `DATA_UNREADABLE` or `DATA_NOT_AN_OBJECT`. Keeping those two
+    apart is what lets `main()` say which happened instead of blaming the
+    reader for a file it read perfectly well.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            blob = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError, RecursionError):
+        return None, DATA_UNREADABLE
+    if not isinstance(blob, dict):
+        return None, DATA_NOT_AN_OBJECT
+    return blob, None
+
+
 def read_object(path: str) -> dict | None:
     """The parsed object, or **None** when the file could not be read as one.
 
@@ -625,12 +734,7 @@ def read_object(path: str) -> dict | None:
     nothing. Callers that need to tell those apart use this; callers that only
     need a dict use `load()`.
     """
-    try:
-        with open(path, encoding="utf-8") as fh:
-            blob = json.load(fh)
-    except (OSError, json.JSONDecodeError, ValueError, RecursionError):
-        return None
-    return blob if isinstance(blob, dict) else None
+    return read_json_object(path)[0]
 
 
 def load(path: str | None) -> dict:
@@ -654,48 +758,109 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if args.data:
-        data = load(args.data)
-        if not data:
-            print(f"error: could not read {args.data}", file=sys.stderr)
+        # Three distinguishable refusals, all exit 2. The exit code is the
+        # same because the answer is the same -- refusing beats rendering a
+        # reassuring comment over a file that holds nothing -- but the
+        # sentence is not, because "I could not read it" said about a file
+        # that read perfectly well sends the reader to the wrong problem.
+        data, problem = read_json_object(args.data)
+        if problem is None and not data:
+            problem = DATA_EMPTY
+        elif problem is None and not any(k in data for k in DATA_KEYS):
+            problem = DATA_FOREIGN
+        if problem is not None:
+            found = ", ".join(sorted(data)[:5]) if data else ""
+            print(DATA_ERRORS[problem].format(path=args.data, found=found),
+                  file=sys.stderr)
             return 2
+
+        # The file is usable, and that is a statement about the file, not
+        # about the four inputs inside it. Each one is now classified by the
+        # same function `--testing-dir` uses, because the two modes must not
+        # disagree about what "this input ran" means.
+        #
+        # It is deliberately NOT a refusal. A `--data` blob is hand- or
+        # CI-assembled, so a key it does not carry legitimately means "this
+        # consumer only supplied part of the picture" -- which is worth
+        # saying out loud, and is not worth throwing the whole comment away
+        # for. Exit 2 stays reserved for a file that is unusable as a whole,
+        # so a partially-supplied file renders and exits 0, exactly as it did
+        # before; only the headline and the notice change.
+        name = os.path.basename(args.data) or args.data
+
+        def describe(key, outcome):
+            why = "is null" if outcome == INPUT_NULL else "is absent"
+            return (f'"{key}" {why} in {name} — supply it, or rerun '
+                    f"{INPUT_SOURCES[key][1]}")
+
+        read, missing = account_for_inputs(data, describe)
+        # An assembler that named what it could not collect has done this
+        # accounting already and knows more about why than this scan can;
+        # adding a second list on top would double-count into a headline
+        # number nobody measured. So its list stands, and only its *count* is
+        # replaced when it did not give a usable one.
+        if not _as_missing(data.get("missing_inputs")) and missing:
+            data["missing_inputs"] = missing
+        supplied = data.get("inputs_read")
+        if isinstance(supplied, bool) or not isinstance(supplied, int):
+            data["inputs_read"] = read
     else:
         # Each input, and the command that produces it. A missing file must be
         # diagnosable: "no findings" and "nobody looked" render identically,
         # and the second one shipped as the first is the worst output this
         # tool could produce -- a reassuring comment that means nothing.
-        sources = {
-            "health":   ("health-baseline.json", "/testsquad:health"),
-            "coverage": ("coverage-diff.json",   "/testsquad:diagnose"),
-            "gates":    ("gates.json",           "/testsquad:verify"),
-            "findings": ("findings.json",        "/testsquad:test or :debug"),
-        }
-        data, missing, absent, read = {}, [], [], 0
-        for key, (filename, producer) in sources.items():
+        data, file_problem, absent = {}, {}, []
+        for key in RENDERED_INPUTS:
+            filename, producer = INPUT_SOURCES[key]
             path = os.path.join(args.testing_dir, filename)
-            empty = [] if key in ("gates", "findings") else {}
             if not os.path.exists(path):
                 absent.append(filename)
-                missing.append(f"{filename} (run {producer})")
-                data[key] = empty
+                file_problem[key] = f"{filename} (run {producer})"
                 continue
             blob = read_object(path)
             if blob is None:
                 # Present but unreadable is not "ran and found nothing". It
                 # has to be declared exactly as loudly as an absent file, or
                 # four broken files render as a clean bill of health.
-                missing.append(f"{filename} (unreadable — rerun {producer})")
-                data[key] = empty
+                file_problem[key] = f"{filename} (unreadable — rerun {producer})"
                 continue
-            read += 1
-            data[key] = blob.get(key, []) if key in ("gates", "findings") else blob
+            # gates.json and findings.json wrap their rows under their own
+            # key; health-baseline.json and coverage-diff.json *are* the
+            # object. Either way, what lands in `data` is exactly what
+            # render() will read -- which is what lets one classifier judge
+            # this mode and `--data` alike. A key the file never carried is
+            # left out rather than defaulted, so the classifier can still
+            # tell "absent" from "null" from an empty result.
+            if key in ("gates", "findings"):
+                if key in blob:
+                    data[key] = blob[key]
+            else:
+                data[key] = blob
 
-        if len(absent) == len(sources):
+        def describe(key, outcome):
+            # A file-level failure outranks the key-level one: "it is not
+            # there" and "I could not read it" are different facts from "I
+            # read it and it does not carry the key", and the house rule is
+            # that all three read differently.
+            if key in file_problem:
+                return file_problem[key]
+            filename, producer = INPUT_SOURCES[key]
+            why = "is null" if outcome == INPUT_NULL else "is absent"
+            return (f'{filename} (readable, but its "{key}" key {why} '
+                    f"— rerun {producer})")
+
+        # Counted, not guessed: render() needs to tell "nothing ran" from
+        # "everything ran and found nothing", and only this scan knows.
+        read, missing = account_for_inputs(data, describe)
+
+        # Unchanged, and deliberately still keyed on *file absence* alone: an
+        # empty .testing/ is nothing to report, while four files that exist
+        # and disappoint still render a comment saying so.
+        if len(absent) == len(RENDERED_INPUTS):
             print("error: no testsquad data in "
                   f"{args.testing_dir}. Nothing to report.\n  missing: "
                   + "\n           ".join(missing), file=sys.stderr)
             return 2
-        # Counted, not guessed: render() needs to tell "nothing ran" from
-        # "everything ran and found nothing", and only this loop knows.
         data["inputs_read"] = read
         if missing:
             data["missing_inputs"] = missing

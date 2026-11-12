@@ -896,21 +896,25 @@ class FlakeSmellsManifestTest(ChainCase):
                                  .format(repo))
 
     def test_java_no_assertion_line_matches_the_manifest_exactly(self):
-        """DEFECT, documented rather than fixed (another agent owns these
-        files).
+        """The manifest and the scanner must anchor a finding on the same
+        line, because anything joining manifest ids to findings by
+        (file, line) drops the item silently when they drift.
 
-        JAVA-WEAK-01 is recorded in MANIFEST.json at line 15, the
-        `void splitBillRuns()` declaration. flake_smells reports it at line
-        14, the `@Test` annotation above it. Both are defensible anchors; they
-        are not the same anchor, and the Java assertion-based rules
-        (tautological-assertion at 21, weak-oracle at 27, ...) agree with the
-        manifest exactly, so Java `no-assertion` is the odd one out rather
-        than a consistent convention.
+        JAVA-WEAK-01 is recorded in MANIFEST.json at line 14 -- the `@Test`
+        annotation, not the `void splitBillRuns()` declaration under it --
+        because a finding anchors on the earliest line of the declaration,
+        annotations and decorators included. The manifest states that
+        convention in its own `why`, and Python behaves the same way on a
+        decorated test. Measured 2026-11-12: flake_smells reports
+        no-assertion at 14, snippet `@Test`. The other four Java weak-test
+        items (21, 27, 33, 42) agree with the manifest too.
 
-        Consequence: any tool joining manifest ids to findings by (file, line)
-        silently drops this item. Either the manifest should say 14 or the
-        rule should anchor on the method declaration. Marked expectedFailure
-        so the suite is green today and turns on the day it is reconciled.
+        An earlier version of this docstring called that a live defect --
+        "the manifest says 15" -- and said the test was marked
+        expectedFailure. Neither was ever true: `git show` puts 14 in the
+        manifest at the initial commit, and no decorator was ever applied.
+        A test that advertises itself as known-broken while passing teaches
+        readers to ignore the label, so the label is gone.
         """
         expectations = [e for e in self.expectations("java-min")
                         if e[3] == "no-assertion"]
@@ -1017,22 +1021,22 @@ class PrCommentLeakTest(ChainCase):
         self.assertIn("2 unconfirmed item(s) withheld", body)
 
     def test_red_health_withholds_the_coverage_numbers(self):
-        """DEFECT, documented rather than fixed.
+        """Does a RED verdict actually withhold coverage downstream?
 
-        With `health.verdict == "RED"` the comment prints, in bold:
+        Measured 2026-11-12: yes. `render()` gates the verdict line *and*
+        the coverage block on RED (scripts/pr_comment.py), so the comment
+        says the figures are withheld and then does not print them. Saying
+        "withheld" above a table reading "81.0% | 80.0% | +1.0 pts" would be
+        worse than printing nothing, because the number is the part people
+        read.
 
-            "Coverage figures are withheld because they would not mean
-             anything until it runs clean."
+        The assertion discriminates: the same payload with a GREEN verdict
+        renders "81.0%", and with RED it does not.
 
-        and then renders the coverage table immediately underneath, complete
-        with "81.0% | 80.0% | +1.0 pts". The sentence and the table contradict
-        each other in the same comment, and the number is the part people
-        read. `render()` gates the *verdict line* on RED but the `if coverage:`
-        block below it is unconditional (scripts/pr_comment.py).
-
-        This is the "does a RED verdict actually withhold coverage
-        downstream?" seam, and today the answer is no. Marked expectedFailure:
-        it will start passing the moment the coverage block is gated too.
+        An earlier version of this docstring called the ungated block a live
+        defect and said the test was marked expectedFailure. Neither was ever
+        true: the gate is in `pr_comment.py` at the initial commit and no
+        decorator was ever applied.
         """
         data = dict(LEAKY_DATA)
         data["health"] = {"verdict": "RED", "flaky_count": 3}
@@ -1042,9 +1046,9 @@ class PrCommentLeakTest(ChainCase):
         self.assertNotIn("+1.0 pts", body)
 
     def test_red_health_at_least_says_the_numbers_are_untrustworthy(self):
-        """The half of the promise that does hold today. Kept separate from
-        the expectedFailure above so the working behaviour stays guarded while
-        the defect is open."""
+        """The other half of the same promise: a RED comment must say *why*
+        the figures are missing, not merely omit them. Kept separate from the
+        withholding test above so each half fails on its own terms."""
         data = dict(LEAKY_DATA)
         data["health"] = {"verdict": "RED", "flaky_count": 3}
         body = self.render(data)
@@ -1731,8 +1735,11 @@ class FixtureAvailabilityPolicyTest(unittest.TestCase):
         A CI job that sets it turns every missing fixture back into a green
         run -- which is the failure mode this whole policy exists to end.
 
-        Both locations are checked because the workflow is parked at
-        `templates/ci/github-ci.yml` and moves to `.github/workflows/`.
+        Both locations are checked. `.github/workflows/` holds this repo's
+        own CI (`ci.yml`, added 2026-11-12); `templates/ci/` holds what gets
+        generated into a *user's* repo (`testsquad-pr.yml`). Neither may set
+        the override, and a new workflow in either place is covered without
+        anyone remembering to add it here.
         """
         candidates = []
         for directory in (os.path.join(ROOT, "templates", "ci"),

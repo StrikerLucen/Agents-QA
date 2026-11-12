@@ -141,3 +141,12 @@ symptoms clustered under it, not a second finding. `evidence` is `reproduced` or
 `observed`; anything weaker is written out with that badge and the renderer withholds it
 by count, which is the behaviour you want — do not drop it silently and do not promote it.
 `repro` is a command, so it goes through the same redaction as everything else.
+
+If the session ran and nothing qualified — nothing reproduced, nothing observed — still
+write the file **with the key and an empty list: `{"findings": []}`**. Never `{}` and
+never `{"findings": null}`: an empty list means *this ran and found nothing*, while an
+absent or `null` key means *something wrote this file but not what the reader needs*, and
+the PR comment has to keep those apart (`null` is this repo's "not measured", which a
+wrapper around a list never is). If you never got as far as investigating, write **no
+file** — an absent `findings.json` is reported as "run `/testsquad:test or :debug`",
+which is the true fact.

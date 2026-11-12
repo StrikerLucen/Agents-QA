@@ -46,6 +46,16 @@ class Report:
         # nothing while sounding like it told you something.
         self.unvalidated: list[str] = []
         self.checked = 0
+        # Budget coverage. "0 warnings" answers "did anything breach a
+        # ceiling", and on its own it reads as "everything fits" -- which is
+        # a different claim, and a false one for any file no ceiling applies
+        # to. These two lists let the run say how many files it actually
+        # weighed, so a zero is interpretable instead of merely reassuring.
+        self.budgeted: list[str] = []
+        self.unbudgeted: list[str] = []
+        # Set when a directory could not be listed while enumerating the
+        # above: the counts are then floors, not totals, and must say so.
+        self.budget_scan_incomplete = False
 
     def error(self, where: str, message: str) -> None:
         self.errors.append(f"{where}: {message}")
@@ -74,8 +84,8 @@ class Unreadable(Exception):
     """
 
 
-def read_text(path: str) -> str:
-    """Read any component file without letting its encoding stop the run.
+def read_text_sniffed(path: str) -> tuple[str, str]:
+    """Read a component file, and say which encoding that took.
 
     A UTF-16 or latin-1 markdown file is a real thing to find in a checkout.
     `open(..., encoding="utf-8").read()` raises UnicodeDecodeError out of
@@ -89,19 +99,35 @@ def read_text(path: str) -> str:
     out of whichever check asked for it -- and for check_context_budget() that
     one file cost every other component its budget verdict. Callers catch
     Unreadable per file and carry on to the next one.
+
+    The encoding comes back with the text because "we decoded it" and "the
+    loader will accept it" are two different claims, and only the first one is
+    ours to make. See the note in check_markdown_component().
     """
     try:
         with open(path, "rb") as fh:
             raw = fh.read()
     except OSError as exc:
         raise Unreadable(str(exc)) from exc
-    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-        text = raw.decode("utf-16", errors="replace")
+    if raw.startswith(b"\xff\xfe"):
+        encoding, text = "UTF-16 LE", raw.decode("utf-16", errors="replace")
+    elif raw.startswith(b"\xfe\xff"):
+        encoding, text = "UTF-16 BE", raw.decode("utf-16", errors="replace")
+    elif raw.startswith(b"\xef\xbb\xbf"):
+        # A UTF-8 BOM is explicitly tolerated: load_json() already documents
+        # that the Claude CLI accepts one on plugin.json, so a file that only
+        # differs by a BOM is UTF-8 as far as this validator is concerned.
+        encoding, text = "UTF-8", raw.decode("utf-8-sig", errors="replace")
     else:
-        text = raw.decode("utf-8-sig", errors="replace")
+        encoding, text = "UTF-8", raw.decode("utf-8-sig", errors="replace")
     # Reading bytes loses universal-newline translation, and split_frontmatter()
     # matches a literal "---\n". A Windows checkout must validate identically.
-    return text.replace("\r\n", "\n").replace("\r", "\n")
+    return text.replace("\r\n", "\n").replace("\r", "\n"), encoding
+
+
+def read_text(path: str) -> str:
+    """read_text_sniffed() for the callers that do not care how it decoded."""
+    return read_text_sniffed(path)[0]
 
 
 def load_json(path: str, where: str, r: Report) -> dict | None:
@@ -261,11 +287,39 @@ def check_marketplace(root: str, plugin_name: str | None, r: Report) -> None:
 
 def check_markdown_component(path: str, expected_name: str, kind: str, r: Report) -> None:
     try:
-        text = read_text(path)
+        text, encoding = read_text_sniffed(path)
     except Unreadable as exc:
         r.cannot_validate(path, f"could not be read ({exc}); this component has "
                                 "no verdict — every other component was still checked")
         return
+    if encoding != "UTF-8":
+        # WHAT THIS VALIDATOR GUARANTEES ABOUT ENCODING, stated so the limit is
+        # explicit rather than accidental: it accepts UTF-8 (BOM or not) and
+        # BOM-marked UTF-16, decodes both, and judges the decoded text. A
+        # BOM-less UTF-16 file is not accepted -- it decodes to NUL-separated
+        # ASCII, fails to start with "---\n", and is reported as missing
+        # frontmatter. That is a claim about THIS program and nothing more. The
+        # loader that will actually run the plugin has never been measured on a
+        # non-UTF-8 component, because `claude plugin validate` has never run on
+        # this machine (HANDOFF.md section 4, item 2).
+        #
+        # WHAT WOULD SETTLE IT, for whoever installs the CLI -- two commands:
+        #     printf '---\nname: probe\ndescription: >\n  encoding probe\n---\n\nbody\n' \
+        #       | iconv -f UTF-8 -t UTF-16 > agents/probe.md
+        #     claude plugin validate --strict .    # then: is `probe` dispatchable?
+        # If the loader accepts it, delete this warning; it is then noise.
+        # If the loader refuses it, this becomes r.error() and the message
+        # stops hedging. Until one of those two runs happens a warning is the
+        # only honest verdict available: an error asserts knowledge nobody here
+        # has, and silence asserts the opposite just as confidently.
+        #
+        # On warning fatigue: measured at 0 of 26 components on this repo, and a
+        # component is non-UTF-8 only by accident -- a Windows editor saving as
+        # "Unicode". A rule that fires on nothing legitimate is not fatigue.
+        r.warn(path, f"is {encoding}, not UTF-8; it was decoded and checked, but "
+                     "whether the real plugin loader accepts this encoding has "
+                     "never been measured -- re-save it as UTF-8 unless you have "
+                     "verified that it loads")
     if "\ufffd" in text:
         # errors="replace" is what keeps one stray byte from costing the whole
         # file, but a silent substitution is a file validated as something
@@ -310,7 +364,12 @@ def check_markdown_component(path: str, expected_name: str, kind: str, r: Report
 
 def check_hooks(root: str, r: Report) -> None:
     path = os.path.join(root, "hooks", "hooks.json")
-    if not os.path.exists(path):
+    # lexists, not exists: os.path.exists() follows the link and answers False
+    # for a dangling symlink or a symlink loop, so a hooks.json that will
+    # certainly fail to load was indistinguishable from a plugin that ships no
+    # hooks at all -- the check returned here and the run passed in silence.
+    # The open() below turns both into cannot_validate, which is the truth.
+    if not os.path.lexists(path):
         return
     try:
         with open(path, "rb") as fh:
@@ -389,13 +448,35 @@ EXEMPT = {
 }
 
 
-def estimate_tokens(path: str) -> int:
+def readable_size(path: str) -> int:
+    """Size in bytes of a file whose bytes can actually be obtained.
+
+    The open() is not redundant with the getsize(). getsize() stats, and stat
+    needs no read permission and does not care what kind of thing it found:
+    a mode-000 file reports its size happily, and a *directory* named
+    `foo.tmpl` reports 64 -- which the budget check turned into "~16 tokens",
+    a number measured from nothing, about contents that do not exist.
+    Reporting a budget verdict on a file whose bytes cannot be obtained is
+    the same defect as reporting any other verdict on it: the size is real,
+    and it is still not a statement about the file's contents.
+
+    One byte is enough to establish that the bytes are obtainable, and the
+    budget needs nothing but the size, so nothing larger is read.
+    """
     try:
-        return os.path.getsize(path) // 4
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            fh.read(1)
     except OSError as exc:
         # A broken symlink or a symlink loop in templates/ raised out of the
         # budget check and took the budgets of all 26 components with it.
         raise Unreadable(str(exc)) from exc
+    return size
+
+
+def estimate_tokens(path: str) -> int:
+    """Roughly 4 characters per token. Raises Unreadable, never OSError."""
+    return readable_size(path) // 4
 
 
 def check_context_budget(root: str, r: Report) -> None:
@@ -405,26 +486,61 @@ def check_context_budget(root: str, r: Report) -> None:
     check is the *set* of components that are over budget; losing the set
     because one entry is a dangling symlink is the failure this exists to
     avoid.
+
+    What this check claims, and the limit of it: for `templates/agents/*.tmpl`
+    and `templates/report/RULES.md` this is the ONLY check in the whole
+    program -- nothing else opens them, and they are not counted in
+    `Report.checked`. So a passing run says of a template exactly two things:
+    its bytes could be obtained, and there are not too many of them. It says
+    nothing about placeholders, frontmatter or whether the file is coherent.
+    Both halves are load-bearing: a size alone is not a verdict on contents,
+    and until estimate_tokens() opened the file a mode-000 template produced
+    a clean "Validation passed" about a file nobody had read.
     """
+    # The fourth field is whether this is the ONLY check in the program that
+    # opens these files. It decides what the messages below are allowed to
+    # claim: for an agent, check_markdown_component() and the stack-playbook
+    # scan both read it, and saying "nothing else opened it" about an agent
+    # would be a confident false statement of exactly the kind this validator
+    # exists to stop printing.
     checks = [
-        (os.path.join(root, "agents", "*.md"), BUDGETS["agents"], "agent"),
-        (os.path.join(root, "skills", "*", "SKILL.md"), BUDGETS["skills"], "skill"),
+        (os.path.join(root, "agents", "*.md"), BUDGETS["agents"], "agent", False),
+        (os.path.join(root, "skills", "*", "SKILL.md"),
+         BUDGETS["skills"], "skill", False),
         (os.path.join(root, "templates", "agents", "*.tmpl"),
-         BUDGETS["templates/agents"], "agent template"),
+         BUDGETS["templates/agents"], "agent template", True),
         (os.path.join(root, "templates", "report", "RULES.md"),
-         BUDGETS["report-rules"], "report rules"),
+         BUDGETS["report-rules"], "report rules", True),
     ]
-    for pattern, ceiling, label in checks:
+    for pattern, ceiling, label, sole_check in checks:
         for path in sorted(glob.glob(pattern)):
             rel = os.path.relpath(path, root)
             if rel in EXEMPT:
                 continue
             try:
-                tokens = estimate_tokens(path)
+                size = readable_size(path)
             except Unreadable as exc:
-                r.cannot_validate(rel, f"its size could not be read ({exc}); "
-                                       f"this {label} has no context-budget verdict")
+                alone = (" and nothing else in this run opened it"
+                         if sole_check else "")
+                r.cannot_validate(rel, f"could not be read ({exc}); this {label} "
+                                       f"has no context-budget verdict{alone}")
                 continue
+            # Weighed: its size is known. That includes the empty and the
+            # over-budget cases below, both of which got a real verdict.
+            r.budgeted.append(rel)
+            if size == 0 and sole_check:
+                # Readable, and empty. The budget is satisfied in the most
+                # useless way available: an empty file is inside every ceiling
+                # there is while being a component that does nothing. "Under
+                # budget" is not the same statement as "fit to load", and here
+                # this is the only check there is to say it with. An empty
+                # agent or skill is already an error about its frontmatter, so
+                # saying it again there would be noise, not honesty.
+                r.warn(rel, f"is empty; it is inside the {ceiling:,}-token "
+                            f"budget because there is nothing in it, which is "
+                            f"not the same as a usable {label}")
+                continue
+            tokens = size // 4
             if tokens > ceiling:
                 r.warn(rel, f"~{tokens:,} tokens of context for a {label}, "
                             f"over the {ceiling:,} budget -- trim it or move the "
@@ -449,6 +565,48 @@ def check_context_budget(root: str, r: Report) -> None:
             r.warn(rel,
                    "reads a stack playbook at task time; it should read "
                    ".testing/profile.json, which /start already distilled")
+
+
+# Directories that hold shipped plugin components. Walked only to answer
+# "what did the budget check not look at" -- see record_budget_coverage().
+COMPONENT_DIRS = ("agents", "skills", "templates", "stacks", "hooks")
+
+
+def record_budget_coverage(root: str, r: Report) -> None:
+    """Enumerate the files under COMPONENT_DIRS that no ceiling applies to.
+
+    `0 warning(s)` answers one question -- did any file breach its ceiling --
+    and is routinely read as the answer to a bigger one: does everything fit.
+    They differ for every file that has no ceiling, and there are more of
+    those than the BUDGETS table suggests. A count of files weighed makes the
+    zero interpretable; without it, "nothing warned" means both "checked and
+    fine" and "never checked", which is the distinction this whole program
+    exists to preserve.
+
+    This is deliberately a *count*, not a finding. Most of these files have
+    no ceiling on purpose -- a stack playbook is large by design, a CI
+    workflow is executed by a runner that has no context window at all -- so
+    warning about them would be a false positive, and a check above ~10%
+    false positives gets switched off, taking the real rules with it.
+    """
+    budgeted = set(r.budgeted)
+
+    def unlistable(_exc: OSError) -> None:
+        # os.walk swallows a directory it cannot list and walks on, which
+        # would silently shrink the total and make the printed count a
+        # confident understatement. Record it instead.
+        r.budget_scan_incomplete = True
+
+    for component in COMPONENT_DIRS:
+        base = os.path.join(root, component)
+        if not os.path.isdir(base):
+            continue
+        for dirpath, _dirs, names in os.walk(base, onerror=unlistable):
+            for name in sorted(names):
+                rel = os.path.relpath(os.path.join(dirpath, name), root)
+                if rel not in budgeted and rel not in EXEMPT:
+                    r.unbudgeted.append(rel)
+    r.unbudgeted.sort()
 
 
 def guarded(where: str, r: Report, fn, *args) -> object:
@@ -494,6 +652,8 @@ def validate(root: str) -> Report:
     guarded("layout", r, check_layout, root, r)
     guarded("context budget", r, check_context_budget, root, r)
     guarded("skills layout", r, check_skill_directories, root, r)
+    # After the budget check, so it can see what that check weighed.
+    guarded("budget coverage", r, record_budget_coverage, root, r)
 
     for path in sorted(glob.glob(os.path.join(root, "agents", "*.md"))):
         guarded(path, r, check_markdown_component,
@@ -528,6 +688,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error:   {error}", file=sys.stderr)
     for item in r.unvalidated:
         print(f"UNKNOWN: {item}", file=sys.stderr)
+
+    # Printed on every run, pass or fail, and kept off the summary line so
+    # that line stays quotable. It is what makes "0 warning(s)" readable: a
+    # ceiling was applied to this many files and to no others.
+    floor = "at least " if r.budget_scan_incomplete else ""
+    print(f"Context budgets: {len(r.budgeted)} file(s) weighed against a "
+          f"ceiling, {floor}{len(r.unbudgeted)} file(s) under "
+          f"{'/, '.join(COMPONENT_DIRS)}/ have no ceiling and were not "
+          f"weighed (deliberate; see BUDGETS in {os.path.basename(__file__)}).",
+          file=sys.stderr)
+    if r.budget_scan_incomplete:
+        print("warning: a directory under those paths could not be listed, so "
+              "the second number is a floor, not a total", file=sys.stderr)
 
     if r.errors:
         judged_wrong = len(r.errors) - len(r.unvalidated)

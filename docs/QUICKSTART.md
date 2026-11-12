@@ -101,6 +101,13 @@ shows everything remembered, with dates, and lets you withdraw any of it.
 - **Run nothing before the safety check.** Step 3 is `env_safety_check.py`. On
   UNSAFE it stops and asks before a single test command executes. A suite
   pointed at a live database deletes real data.
+- **Run nothing from your repo before you have seen it and agreed.** Step 4
+  profiles the project without executing any of it; step 5 then prints the
+  commands it found — whole-suite, changed-files, coverage, any dependency
+  install — verbatim, names what the runner invokes implicitly (`npm` runs
+  `pretest` before `test`), and says plainly that agreeing runs code written by
+  whoever wrote that repository, as you, on this machine. On a no, every later
+  stage reports "cannot execute" and the command it would have run.
 - **Install nothing without permission**, even when that leaves a stage
   unanswerable.
 - **Edit no product code.** Push nothing, merge nothing.
@@ -109,11 +116,15 @@ shows everything remembered, with dates, and lets you withdraw any of it.
 
 ### The stages
 
-Profile → safety → health → risk map → agents → diagnose → contract → roadmap.
-Each is a separate command you can re-run on its own; `/testsquad:start` only
-chains them. Two stages ask for agreement before writing: the `CLAUDE.md` block
-(diff shown first) and `.testing/acceptance-contract.md`, which includes naming
-the handful of features where failure costs money.
+Targets → questions → safety → profile → **agree to execute** → health → risk
+map → `CLAUDE.md` → agents → diagnose → contract → roadmap → report. Each is a
+separate command you can re-run on its own; `/testsquad:start` only chains them.
+
+Four stages stop for you: the safety check if it returns UNSAFE; the agreement
+to execute the repo's own commands (step 5, before anything of its runs); the
+`CLAUDE.md` block, with the diff shown first; and
+`.testing/acceptance-contract.md`, which includes naming the handful of features
+where failure costs money.
 
 ### How long, and what it costs
 

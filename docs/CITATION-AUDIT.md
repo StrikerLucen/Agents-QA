@@ -68,7 +68,7 @@ anything else.
 
 | # | Claim | Live locations | Sourceable? | Recommendation |
 |---|---|---|---|---|
-| D-1 | "Exotic operator sets buy **≤13%** over random selection" | 2 | **Yes — number exact, sentence misapplies it** | **A**, with corrected wording |
+| D-1 | "Exotic operator sets buy **≤13%** over random selection" | 2 | **Number exact; sentence inverts the paper** | **A — done in `docs/RESEARCH.md` §20; 2 downstream edits still owed** |
 | D-2 | SBR is **~68%** of generated mutants | 2 | **Yes — exact** | **A** (add inline §20 pointer) |
 | D-3 | ROR **84.1% productive** | 4 | **Yes — exact, verbatim quote** | **A** |
 | D-4 | UOI **74.5% productive** | 4 | **Yes — exact, verbatim quote** | **A** |
@@ -128,22 +128,43 @@ bound in the one direction the paper explicitly exempts. §20's own framing is f
 ("any reduction strategy"); its heading "Why not a larger operator set" and its closing
 "the ceiling there is 13%" are not.
 
-What the paper *does* support for this project is stronger and simpler: operator-based
-selection is **not** superior to uniform random sampling, so a bigger operator catalogue
-is not where the leverage is.
+**Correction to an earlier draft of this entry.** A previous version of this section said
+the paper supports "operator-based selection is not superior to uniform random sampling, so
+a bigger operator catalogue is not where the leverage is." That is wrong twice over, and it
+is the same defect one level up, so it is recorded rather than quietly deleted:
+
+1. Gopinath et al. 2016 does not establish that result. It appears in the **related work**
+   of the companion ISSRE 2015 paper, attributed there to Zhang et al., ICSE 2010
+   (*"Is operator-based mutant selection superior to random mutant selection?"*): *"Lu Zhang
+   et al. compared operator-based mutant selection techniques to random mutant sampling, and
+   found that random sampling performs as well as the operator selection methods."* Citing
+   either Gopinath paper for it is a second-hand attribution. **The primary (Zhang et al.
+   2010) has not been read in this repo**, so §20 no longer asserts it at all.
+2. Even if true, it is about *selecting a subset for score estimation*, not about whether a
+   larger catalogue helps. Both Gopinath papers say a larger catalogue **does** help:
+   ICSE 2016 §8 — *"the maximum reduction in utility due to addition of newer operators is
+   just 23.268%, while there is no limit to the achievable improvement"* — and ISSRE 2015's
+   advice to tool implementers is *"to be generous in the operators implemented, and use
+   statistics to your advantage."*
+
+What the paper actually supports for this project is narrower: **nothing**, in the direction
+§20 was using it. It bounds reduction strategies, and we are not running one. §20 now cites
+it for what it bounds, and states the five-operator set as a scope choice justified by
+Petrović et al.'s published per-operator numbers, not by this bound.
+
+**Verified against the primary source, 2026-11-12**, by extracting the text of the PDF at
+`rahul.gopinath.org/resources/icse2016/gopinath2016on.pdf` rather than from the abstract
+page used in the earlier pass. Abstract, §8 and the conclusion all agree.
 
 **Options**
 
 - **(A) Cite, with the direction corrected.** No new RESEARCH entry needed — §20 already
-  holds the citation. The change is downstream wording, in files this pass does not own:
-  - `skills/mutate/SKILL.md:56` → "Selective operator sets cannot beat plain random
-    selection by more than ~13% (Gopinath et al., ICSE 2016 — RESEARCH §20), and
-    operator-based selection is not superior to uniform random sampling, so the leverage
-    is in suppression, not in a bigger catalogue:"
-  - `scripts/arid_nodes.py:65-66` → the same sentence in comment form, plus "(RESEARCH §20)".
-  - `docs/RESEARCH.md:657` → "the ceiling on *reduction* strategies is 13%, and adding
-    operators is explicitly not bounded by it — the reason we stop at five is cost, not
-    that ceiling."
+  holds the citation. **Done in `docs/RESEARCH.md` §20** (now headed *"Why we stop at five —
+  which part is evidence, which part is a choice"*): the 13.078% is attributed to reduction
+  strategies, the *"no limit … by addition of new mutation operators"* sentence is quoted
+  beside it, and the five-operator set is stated as a scope choice backed by Petrović et
+  al.'s per-operator numbers. Two downstream edits are **still owed**, in files this pass
+  does not own — see "Owed outside `docs/`" below.
 - **(B) Restate as a design choice.** "We ship the five operators Google measured, because
   a set we can explain and weight beats a set we cannot. (RESEARCH §20)" Loses the
   argument for *why* a bigger set is a poor investment.
@@ -151,10 +172,27 @@ is not where the leverage is.
   pre-emptive answer to "why not add more operators?", which is the first question a
   reviewer asks about a mutation engine.
 
-**Recommendation: (A).** The citation is real, the number is right, and the only defect is
-a direction of application that takes one sentence to fix. Leaving it as-is is the one
-option that is actually wrong — a reader who opens the cited paper finds it saying the
-opposite about added operators, which is worse than no citation at all.
+**Recommendation: (A). `docs/RESEARCH.md` §20 is now done; the two downstream copies are not.**
+The citation is real and the number is right; the defect was the direction of application.
+
+### Owed outside `docs/` — D-1
+
+Both carry the inverted sentence and both are user-visible (`arid_nodes.py` prints its
+`why=` strings). Neither was touched, because `skills/` and `scripts/` belong to other
+agents. Anchors are quoted rather than given as line numbers, because line numbers in this
+repo drift within a single session.
+
+| File | Anchor to find | Replace with |
+|---|---|---|
+| `skills/mutate/SKILL.md` | the line "Exotic operator sets buy **≤13%** over random selection:", directly under "The script draws one of these per line; this is what they are and why there are no more." | "These are the five with published per-operator survivability and productivity (Petrović et al., TSE 2021 — RESEARCH §20), so they are the five we can weight honestly. Carrying more is a cost question, not a settled one:" |
+| `scripts/arid_nodes.py` | the sentence "Exotic operator sets buy <=13% over plain random selection, which does not pay for the mutants they add.", in the module docstring after "Exactly the five Google uses, and no more: SBR, UOI, LCR, ROR, AOR." | "Carrying more is a cost choice, not a bound: Gopinath et al.'s 13.078% limit is on operator *reduction*, and that paper states there is no limit to the improvement from *adding* operators (RESEARCH Sec 20)." |
+
+*Anchors re-read 2026-11-12. The `skills/mutate/SKILL.md` sentence has already been shortened
+since the original audit — it no longer ends "so there is no reason to carry more than
+these" — which is another reason to search for the phrase rather than a line number.*
+
+Do **not** substitute "operator-based selection is not superior to uniform random sampling"
+into either, for the reasons in the correction note above.
 
 ---
 

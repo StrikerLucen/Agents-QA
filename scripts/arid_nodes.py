@@ -124,6 +124,77 @@ MAX_FILE_BYTES = 2 * 1024 * 1024
 # which is indistinguishable from a genuinely unmutable file.
 MAX_LINE_CHARS = 2000
 
+# The one ceiling in this file we do NOT set and cannot raise.
+#
+# `ast.parse` builds the Python AST objects from the C parse tree with a
+# recursive C function (`ast2obj_expr` in Python-ast.c), so a deeply NESTED
+# expression costs C stack, and past some depth `ast.parse` raises
+# `RecursionError`. That depth is not `sys.getrecursionlimit()`. Measured
+# here, binop chains (`a + a + a + ...`, nesting depth = term count):
+#
+#   CPython 3.14.6, macOS, main thread   accepts 95,065; RecursionError at
+#                                        95,066; still RecursionError at
+#                                        400,000 -- it never crashes
+#   CPython 3.14.6, 512KB thread stack   accepts 2,834; RecursionError at 2,835
+#   CPython 3.9.6 (this repo's FLOOR),   accepts 260,937; SIGSEGV (rc -11) by
+#   macOS, main thread                   262,500. Bisected in child processes.
+#                                        The macOS crash report for one of
+#                                        those runs names the cause: "Thread
+#                                        stack size exceeded due to excessive
+#                                        recursion", dead at recursion level
+#                                        261,942 -- inside the bracket above.
+#   CPython 3.9.6, 512KB thread stack,   SIGBUS, exit 138
+#   depth 20,000
+#
+# Three consequences, all measured rather than assumed:
+#
+#  1. `sys.setrecursionlimit()` is NOT the knob. On 3.14.6 at a 512KB stack and
+#     depth 3,000 the result is RecursionError at limits of 1,000, 10,000,
+#     100,000 and 1,000,000 alike.
+#  2. On 3.9.6 there is NO depth at which this raises. The bisect found no
+#     RecursionError anywhere between "accepted" and "crashed": it goes
+#     straight from OK at 260,937 to SIGSEGV. So the margin that raising the
+#     limit would be spending is not small -- on the interpreter this repo
+#     declares as its floor it does not exist. A RecursionError is catchable
+#     and can be reported; a SIGSEGV has no exception, no traceback, no output
+#     and no exit code a caller can act on. Raising the limit trades the
+#     former for the latter, which is strictly worse than the bug it would be
+#     trying to fix. We therefore do NOT raise it, and do not call
+#     threading.stack_size() either -- both are depth guesses, and a depth
+#     guess is exactly what is not portable here.
+#  3. The depth at which it bites depends on the C stack, which differs
+#     between macOS and Linux and between the main thread and a worker. A file
+#     that parses on a developer's machine can fail on a CI runner. That is
+#     exactly how this escaped: one machine could not have told us.
+#
+# Catching RecursionError at the call site needs no depth guess at all, which
+# is why it is the fix. Residual risk, stated plainly: on an interpreter whose
+# AST builder has no counter (3.9.6) a deep enough file still kills the
+# process, and nothing in this script can catch that. What this script
+# controls is that where the interpreter DOES raise, the run survives and says
+# so.
+#
+# So it has to be REPORTED, not merely survived. The AST pass is what gives
+# exact function spans and real parameter names; without it the regex scanner
+# still runs, but it misses lambdas, nested closures and any declaration shape
+# not in its table. A file where that happened is in `unparsed_files` and is
+# counted in summary.files_ast_unparsed -- a third state, distinct from both
+# "not read at all" (skipped_files) and "read and planned in full".
+AST_TOO_DEEP = "ast-nesting-too-deep"
+AST_TOO_DEEP_REASON = (
+    "ast.parse raised RecursionError: expression nesting is too deep for "
+    "CPython's AST builder on this interpreter and stack. No flag raises this "
+    "ceiling -- it is the C stack, not --max-file-bytes, --max-line-chars or "
+    "sys.setrecursionlimit, and it moves between platforms. The AST pass did "
+    "NOT run on this file."
+)
+AST_TOO_DEEP_LOST = (
+    "exact function spans and real parameter names; the regex scanner ran "
+    "instead, so rules needing function context (trivial-accessor, "
+    "pure-delegation, repr/equality boilerplate) may not have fired on "
+    "lambdas, nested closures or unrecognised declaration shapes"
+)
+
 
 # --------------------------------------------------------------------------
 # operators
@@ -641,8 +712,8 @@ BRACE_FUNC_RE = re.compile(
 RUBY_DEF_RE = re.compile(r"^(\s*)def\s+(?:self\.)?([\w?!=]+)\s*(?:\((.*)\))?")
 
 
-def python_funcs(source: str) -> list[Func] | None:
-    """Exact spans from Python's own parser.
+def python_funcs_detailed(source: str) -> tuple[list[Func] | None, str | None]:
+    """(funcs, why_not) -- funcs is None when Python's own parser refused it.
 
     `ast` genuinely helps here and is not decoration: it gives real parameter
     names (so pure-delegation can compare arguments to parameters rather than
@@ -650,11 +721,29 @@ def python_funcs(source: str) -> list[Func] | None:
     one-line even when its decorators and type hints span four). Returns None
     when the file does not parse, so the caller can fall back to the regex
     scanner -- a half-written file still deserves an answer.
+
+    `why_not` exists because those refusals are not one thing. A SyntaxError is
+    an ordinary, expected state: the file is half-written, the regex scanner
+    is the right answer and saying so every time would be noise. A
+    RecursionError is not: nothing about the file is wrong, the limit is the
+    interpreter's C stack (see AST_TOO_DEEP above), it differs per platform,
+    and the caller MUST be able to tell the reader that the AST pass did not
+    run. Falling back silently in that case is the whole defect class this
+    file exists to avoid.
+
+    This function never raises. The docstring used to promise that while the
+    code only caught SyntaxError and ValueError, so a deeply nested expression
+    killed the entire run from inside plan().
     """
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
-        return None
+        return None, "syntax-error"
+    except RecursionError:
+        # Caught here and NOT re-raised, but the caller is handed the reason so
+        # it can put the file in unparsed_files. Catch-and-continue on its own
+        # would be silence wearing a fix's clothes.
+        return None, AST_TOO_DEEP
     funcs: list[Func] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -682,7 +771,14 @@ def python_funcs(source: str) -> list[Func] | None:
         head = body[0].col_offset if body[0].lineno == node.lineno else 0
         funcs.append(Func(node.name, params, node.lineno, end, body_lines, head))
     funcs.sort(key=lambda f: f.start)
-    return funcs
+    return funcs, None
+
+
+def python_funcs(source: str) -> list[Func] | None:
+    """Back-compatible wrapper: spans only. Prefer python_funcs_detailed(),
+    which also hands back WHY the parser refused -- a caller that cannot tell
+    "half-written" from "too deeply nested" cannot report the second one."""
+    return python_funcs_detailed(source)[0]
 
 
 def regex_funcs(code: list[str], lang: str) -> list[Func]:
@@ -1182,10 +1278,16 @@ class FileScan:
         self.raw = raw
         self.code, self.strings = scrub(raw, lang)
         self.ast_used = False
+        # None unless the AST pass was attempted and the interpreter refused
+        # the file for depth. "Not attempted" (Java, --no-ast) and "attempted
+        # and failed" must not look alike downstream.
+        self.ast_unavailable: str | None = None
         funcs = None
         if lang == "python" and use_ast:
-            funcs = python_funcs("".join(raw))
+            funcs, why = python_funcs_detailed("".join(raw))
             self.ast_used = funcs is not None
+            if why == AST_TOO_DEEP:
+                self.ast_unavailable = why
         self.funcs = funcs if funcs is not None else regex_funcs(self.code, lang)
         self.unreachable = _unreachable_lines(self.code)
         self._by_line: dict[int, Func] = {}
@@ -1569,6 +1671,12 @@ def analyse_file(path: str, raw: list[str], lang: str, *, seed: int = 0,
 
     scan = FileScan(path, lang, raw, use_ast=use_ast)
     entry["parsed_with"] = "ast" if scan.ast_used else "regex"
+    if scan.ast_unavailable:
+        # `parsed_with: "regex"` is also what a Java file and a --no-ast run
+        # say, so it cannot carry this on its own. A separate key, named for
+        # what happened, so "regex because that is the right tool here" and
+        # "regex because the AST pass could not run" stay distinguishable.
+        entry["ast_unavailable"] = scan.ast_unavailable
 
     pool: list[dict] = []
     for i in range(1, len(scan.code) + 1):
@@ -1703,6 +1811,7 @@ def plan(paths: list[str], *, seed: int = 0, max_per_file: int = 7,
     files: list[dict] = []
     skipped_files: list[dict] = []
     truncated_lines: list[dict] = []
+    unparsed_files: list[dict] = []
     by_rule: dict[str, int] = {}
     considered = 0
     capped = 0
@@ -1740,6 +1849,19 @@ def plan(paths: list[str], *, seed: int = 0, max_per_file: int = 7,
             continue
         entry = analyse_file(path, raw, lang, seed=seed, max_per_file=max_per_file,
                              feedback=feedback, changed=changed, use_ast=use_ast)
+        if entry.get("ast_unavailable") == AST_TOO_DEEP:
+            # The file WAS read and WAS planned -- so it is not in
+            # skipped_files and it does count in summary.files -- but it was
+            # planned by the weaker of the two scanners. Saying which, and
+            # what that costs, is the difference between a partial analysis
+            # and a partial analysis reported as complete.
+            unparsed_files.append({
+                "file": path,
+                "stage": "ast",
+                "reason": AST_TOO_DEEP_REASON,
+                "fell_back_to": "regex",
+                "not_analysed": AST_TOO_DEEP_LOST,
+            })
         considered += len(entry["candidates"])
         selected += len(entry["selected"])
         for s in entry["suppressed"]:
@@ -1771,10 +1893,17 @@ def plan(paths: list[str], *, seed: int = 0, max_per_file: int = 7,
         # planned, but part of a line was not looked at, so "no mutants on
         # this line" is a statement about its head only.
         "truncated_lines": truncated_lines,
+        # A third state again, one level sideways: the file was read in full
+        # and planned in full, but by the regex scanner, because the AST pass
+        # could not run on it. Never a finding -- deeply nested generated code
+        # is legitimate, and a check that fires on it would be switched off
+        # inside a week, taking the rest of the gate with it.
+        "unparsed_files": unparsed_files,
         "files": files,
         "summary": {
             "files": len(files),
             "files_skipped": len(skipped_files),
+            "files_ast_unparsed": len(unparsed_files),
             "lines_truncated": len(truncated_lines),
             "files_with_truncated_lines": len({t["file"] for t in truncated_lines}),
             "lines_considered": considered,
@@ -1824,6 +1953,19 @@ def render_text(result: dict) -> str:
                        "considered, the rest NOT read")
         if len(cut) > 5:
             out.append(f"  ... and {len(cut) - 5} more")
+    # And the state between the two: fully read, fully planned, but with the
+    # AST pass missing. Out loud in the terminal as well as in the JSON,
+    # because the terminal is where a developer decides the run went fine.
+    deep = result.get("unparsed_files") or []
+    if deep:
+        out.append(f"{len(deep)} file(s) planned WITHOUT the AST pass "
+                   "(see unparsed_files):")
+        for entry in deep[:5]:
+            out.append(f"  not parsed {entry['file']}: expression nesting too "
+                       f"deep for ast.parse; fell back to {entry['fell_back_to']}, "
+                       "so exact function spans and parameter names were NOT used")
+        if len(deep) > 5:
+            out.append(f"  ... and {len(deep) - 5} more")
     return "\n".join(out)
 
 
@@ -1882,6 +2024,10 @@ def main(argv: list[str] | None = None) -> int:
         for entry in result["truncated_lines"]:
             print(f"warning: only partly read: {entry['file']}:"
                   f"{entry['line']}: {entry['reason']}", file=sys.stderr)
+        for entry in result["unparsed_files"]:
+            print(f"warning: planned without the AST pass: {entry['file']}: "
+                  f"{entry['reason']} Fell back to {entry['fell_back_to']}; "
+                  f"NOT analysed: {entry['not_analysed']}.", file=sys.stderr)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

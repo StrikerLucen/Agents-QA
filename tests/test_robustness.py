@@ -22,6 +22,7 @@ Everything is built in a temp directory. Large inputs are generated, never
 committed. Platform-dependent cases skip rather than fail.
 """
 
+import ast
 import contextlib
 import json
 import os
@@ -30,8 +31,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
@@ -95,6 +98,157 @@ def timed(case, label, budget=SLOW):
                     f"{label} took {elapsed:.1f}s (budget {budget}s) -- "
                     "unbounded work on attacker-controlled input")
 
+
+
+# --------------------------------------------------------------------------
+# ast.parse's depth ceiling -- the one limit these scripts do not control
+# --------------------------------------------------------------------------
+# CPython builds the Python AST objects from the C parse tree with a recursive
+# C function, so a deeply NESTED expression costs C stack and past some depth
+# `ast.parse` raises RecursionError. Three things make this a nightmare to
+# test, and all three are why it reached CI unnoticed:
+#
+#  * the depth is NOT sys.getrecursionlimit(). Measured on this machine,
+#    CPython 3.14.6, `a + a + ... ` chains: raising the limit from 1,000 to
+#    1,000,000 moves the threshold by nothing at all.
+#  * the depth depends on the C stack, so it differs by platform and by
+#    thread. Measured: 3.14.6 on the macOS main thread (8MB) accepts 95,065
+#    and raises at 95,066; the same interpreter on a 512KB thread accepts
+#    2,834 and raises at 2,835. The suite's baits are 4,000 and 20,000 deep --
+#    comfortably fine on macOS, over the line on the Ubuntu runners.
+#  * on an interpreter whose AST builder has no counter, going past the depth
+#    does not raise AT ALL. Measured on CPython 3.9.6, this repo's floor, by
+#    bisecting in child processes: the main thread accepts 260,937 and is
+#    dead by 262,500 (SIGSEGV, rc -11), with NO depth in between that raises
+#    RecursionError. A 512KB thread at depth 20,000 exits 138 (SIGBUS). No
+#    traceback, no output, nothing to catch.
+#
+# So a test that just feeds deeper input is either vacuous (macOS) or fatal to
+# the whole suite (3.9.6). `forced_ast_recursion_error` is the portable half:
+# it makes ast.parse raise on every platform, so the assertion that the
+# scripts REPORT the file is live everywhere and cannot pass by accident.
+# `ast_depth_raises_here` is the honest half: it reproduces the real thing in
+# a child process, where a segfaulting interpreter cannot take the suite down.
+
+AST_RECURSION_DEPTH_KB = 512
+
+
+@contextlib.contextmanager
+def forced_ast_recursion_error():
+    """Make `ast.parse` raise RecursionError, on any platform.
+
+    Not a substitute for the real thing -- see `ast_depth_raises_here` -- but
+    the only way to assert the reporting path identically on macOS, on Linux
+    and on an interpreter that would otherwise crash rather than raise.
+    """
+    with mock.patch.object(
+            ast, "parse",
+            side_effect=RecursionError(
+                "maximum recursion depth exceeded during ast construction")):
+        yield
+
+
+def ast_depth_raises_here(kb=AST_RECURSION_DEPTH_KB, depth=20_000):
+    """Does a `depth`-deep expression make ast.parse RAISE on a `kb` stack?
+
+    Answered in a child process, because on an interpreter without the
+    AST-construction counter the answer is "no, it dies", and finding that out
+    in-process would end the test run. Returns True only when the child came
+    back alive having caught a RecursionError.
+    """
+    probe = textwrap.dedent("""
+        import ast, sys, threading
+        src = "y = " + "a + " * %d + "1\\n"
+        out = []
+        def run():
+            try:
+                ast.parse(src)
+                out.append("parsed")
+            except RecursionError:
+                out.append("raised")
+        threading.stack_size(%d * 1024)
+        t = threading.Thread(target=run)
+        t.start(); t.join()
+        sys.stdout.write(out[0] if out else "lost")
+    """ % (depth, kb))
+    try:
+        done = subprocess.run([sys.executable, "-c", probe],
+                              capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - platform
+        return False
+    return done.returncode == 0 and done.stdout.strip() == "raised"
+
+
+def scan_on_a_thin_stack(script, call, kb=AST_RECURSION_DEPTH_KB):
+    """Run `call` in a child process on a thread with a small C stack.
+
+    `script` is "arid_nodes" or "flake_smells"; `call` is the expression to
+    evaluate against it. Returns (returncode, parsed_json_or_None, stderr).
+    A child that dies instead of returning is the whole point of using one.
+    """
+    body = textwrap.dedent("""
+        import json, sys, threading
+        sys.path.insert(0, %r)
+        import %s as mod
+        out = {}
+        def run():
+            try:
+                out["result"] = %s
+            except BaseException as exc:
+                out["raised"] = type(exc).__name__ + ": " + str(exc)
+        threading.stack_size(%d * 1024)
+        t = threading.Thread(target=run)
+        t.start(); t.join()
+        sys.stdout.write(json.dumps(out))
+    """ % (SCRIPTS, script, call, kb))
+    done = subprocess.run([sys.executable, "-c", body],
+                          capture_output=True, text=True, timeout=120)
+    try:
+        return done.returncode, json.loads(done.stdout), done.stderr
+    except ValueError:
+        return done.returncode, None, done.stderr
+
+
+def assert_ast_depth_reported(case, result, module, path, *, scanned_key,
+                              scanned_value):
+    """The explicit signal, asserted the same way for both scripts.
+
+    Deliberately NOT a finding: deeply nested generated code is legitimate, a
+    rule that fired on it would run far past this repo's ~10% false-positive
+    threshold, and a check at that rate gets switched off entirely. It is the
+    `skipped_files` precedent instead -- its own top-level list, its own
+    summary counter, and a line in the human-readable render.
+    """
+    deep = result["unparsed_files"]
+    case.assertEqual([d["file"] for d in deep], [path],
+                     "a file whose AST could not be built must be NAMED, not "
+                     "quietly handed to the regex scanner")
+    entry = deep[0]
+    case.assertEqual(entry["stage"], "ast")
+    case.assertEqual(entry["fell_back_to"], "regex")
+    # The fallback DID run, and the output has to say the AST pass did not --
+    # a partial analysis reported as complete is the failure mode here.
+    case.assertIn("RecursionError", entry["reason"])
+    case.assertIn("nesting", entry["reason"])
+    case.assertIn("did NOT run", entry["reason"])
+    case.assertIn("sys.setrecursionlimit", entry["reason"],
+                  "the reason must name the limit that does NOT control this, "
+                  "or a reader will try to raise it")
+    case.assertTrue(entry["not_analysed"],
+                    "the record has to say what was lost, not only that "
+                    "something was")
+    case.assertEqual(result["summary"]["files_ast_unparsed"], 1)
+    # Still read, still analysed: this is a third state, not skipped_files.
+    case.assertEqual(result["skipped_files"], [])
+    case.assertEqual(result["summary"][scanned_key], scanned_value)
+    # Per-file, too: `parsed_with: regex` is also what a Java file says, so it
+    # cannot carry this on its own.
+    case.assertEqual(result["files"][0]["parsed_with"], "regex")
+    case.assertEqual(result["files"][0]["ast_unavailable"], module.AST_TOO_DEEP)
+    # And in the terminal output, where a human decides the run went fine.
+    rendered = module.render_text(result)
+    case.assertIn("WITHOUT the AST pass", rendered)
+    case.assertIn(path, rendered)
 
 
 def grant_session_consent(case, repo_path):
@@ -561,19 +715,42 @@ class StructureTests(TempMixin, unittest.TestCase):
 
         Asserted as a ratio rather than a wall time: an absolute budget on a
         shared CI box is a flake, but a quadratic still doubles its ratio.
+
+        The body used to be `x = (a +\n a +\n ... a)`, which is one expression
+        nested n deep. That made the fixture's PARSE PATH depend on the C
+        stack: on the Ubuntu runners 1,000 deep parsed and 4,000 deep did not,
+        so the two halves of the ratio were timed through different scanners
+        and the comparison stopped meaning anything -- on 3.11 it did not even
+        get that far, because the RecursionError escaped plan() and errored
+        the test. It is a flat tuple now: same line count, same
+        lines_considered (measured: 1,003 and 4,003, identical to the nested
+        shape), same ~4x ratio, but AST depth 2 on every platform, so what is
+        being timed is the line count and nothing else. Depth is covered
+        properly by the two dedicated tests in ReDoSTests.
         """
         def cost(n):
             shutil.rmtree(self.tmp, ignore_errors=True)
             os.makedirs(self.tmp)
             self.write("mod.py",
-                       "def f():\n    x = (\n" + "        a +\n" * n
+                       "def f():\n    x = (\n" + "        a,\n" * n
                        + "        a\n    )\n    return x\n")
             start = time.time()
-            arid.plan([self.tmp])
-            return time.time() - start
+            result = arid.plan([self.tmp])
+            return time.time() - start, result
 
-        small = cost(1000)
-        large = cost(4000)
+        small, small_result = cost(1000)
+        large, large_result = cost(4000)
+        # Like-for-like or the ratio is noise. Both halves must have gone
+        # through the SAME scanner, and neither may have fallen back -- a
+        # silent fallback is what made the old fixture's number meaningless.
+        for label, result in (("1,000", small_result), ("4,000", large_result)):
+            self.assertEqual(result["files"][0]["parsed_with"], "ast",
+                             f"the {label}-line run did not reach the AST "
+                             "path, so the two timings are not comparable")
+            self.assertEqual(result["unparsed_files"], [])
+            self.assertEqual(result["summary"]["files_ast_unparsed"], 0)
+        self.assertEqual(small_result["summary"]["lines_considered"], 1003)
+        self.assertEqual(large_result["summary"]["lines_considered"], 4003)
         # 4x the lines. Linear predicts ~4x, quadratic predicts ~16x. A
         # generous 8x still catches the quadratic and tolerates a noisy box.
         # The floor guards against a timer too coarse to divide by.
@@ -1240,6 +1417,67 @@ class ResourceBoundTests(unittest.TestCase):
                 self.assertIn("skipped_files", src)
                 self.assertIn("--max-file-bytes", src)
 
+    def _ast_parse_scripts(self):
+        return [n for n in sorted(os.listdir(SCRIPTS))
+                if n.endswith(".py") and "ast.parse(" in self.source(n)]
+
+    def test_the_two_scanners_guard_and_report_ast_recursion(self):
+        """A structural guard, because the next ast.parse call site will be
+        written by someone who never saw this bug.
+
+        `ast.parse` raises RecursionError on deeply nested input at a depth
+        that is not sys.getrecursionlimit() and differs by platform, so a new
+        unguarded site is a crash that only CI will find -- which is exactly
+        what happened. Grepping the source is crude, but it is the only check
+        that fires without depending on the machine's C stack, so it is as
+        true on a developer's Mac as on an Ubuntu runner.
+        """
+        for name in ("arid_nodes.py", "flake_smells.py"):
+            if arid is None and name == "arid_nodes.py":
+                continue
+            self.assertIn(name, self._ast_parse_scripts())
+            src = self.source(name)
+            with self.subTest(script=name):
+                self.assertIn("except RecursionError", src,
+                              f"{name} calls ast.parse without catching "
+                              "RecursionError; a deeply nested expression "
+                              "will kill the whole run")
+                # Catching it is only half. Silence must never look like
+                # success, so the file has to be named in the output too.
+                self.assertIn("unparsed_files", src,
+                              f"{name} catches RecursionError but has no "
+                              "unparsed_files report; a silent fallback to "
+                              "the regex scanner is the same defect in new "
+                              "clothes")
+                self.assertIn("files_ast_unparsed", src,
+                              f"{name} has no summary counter for files "
+                              "whose AST could not be built")
+
+    @unittest.expectedFailure
+    def test_every_ast_parse_site_guards_against_recursion(self):
+        """OPEN DEFECT, reported rather than fixed -- it is outside this
+        branch's ownership (scripts/arid_nodes.py, scripts/flake_smells.py).
+
+        `scripts/project_state.py:_xfail_tests()` has the identical bug the
+        two scanners just had: it wraps `ast.parse` in
+        `except (SyntaxError, ValueError)` and its docstring promises it
+        "Returns None when the file does not parse, so the caller can fall
+        back". RecursionError is not caught, so a deeply nested expression in
+        any scanned .py propagates out of section_markers() and takes down the
+        whole state report -- the script whose entire purpose is to measure
+        the project when nothing else can be trusted.
+
+        Marked expectedFailure, per this file's convention, so it shows up in
+        the run summary rather than hiding in a passing assertion. When
+        project_state.py is fixed this turns into an unexpected success and
+        the marker can go.
+        """
+        for name in self._ast_parse_scripts():
+            with self.subTest(script=name):
+                self.assertIn("except RecursionError", self.source(name),
+                              f"{name} calls ast.parse without catching "
+                              "RecursionError")
+
     def test_risk_map_counts_lines_without_reading_the_file_whole(self):
         # FIXED. current_files() needs a newline count and nothing else, so
         # holding the file in memory to produce one int bought nothing and
@@ -1448,6 +1686,10 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         self.assertEqual(result["summary"]["files_scanned"], 1)
         self.assertEqual(result["skipped_files"], [])
         self.assertEqual(result["summary"]["lines_truncated"], 4)
+        # Raising the ceiling is what re-exposes ast.parse to the bait: at the
+        # default 2,000 the deep line never reaches the parser. This call used
+        # to die with RecursionError on the Ubuntu runners and pass here, so
+        # it is also the regression site for that.
         with timed(self, "flake_smells on assertion bait, line ceiling raised"):
             full = fsm.scan_paths([self.tmp], max_line_chars=200_000)
         self.assertEqual(full["summary"]["lines_truncated"], 0)
@@ -1455,6 +1697,87 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         # `assert aaa... is not None`. That is the proof the regexes really
         # ran over the bait rather than over a 2,000-character stub of it.
         self.assertIn("weak-oracle", full["summary"]["by_rule"])
+        # Whether `a.b` x 20,000 is too deep for ast.parse depends on the C
+        # stack, so the only thing true on BOTH platforms is the invariant:
+        # either the AST pass ran, or the file is named. Never a third state,
+        # and never an exception out of scan_paths().
+        self.assertEqual(full["summary"]["files_ast_unparsed"],
+                         len(full["unparsed_files"]))
+        if full["files"][0]["parsed_with"] == "ast":
+            self.assertEqual(full["unparsed_files"], [])
+            self.assertNotIn("ast_unavailable", full["files"][0])
+        else:
+            assert_ast_depth_reported(
+                self, full, fsm, self.path("test_bait2.py"),
+                scanned_key="files_scanned", scanned_value=1)
+
+    def test_flake_smells_reports_a_file_it_could_not_parse(self):
+        """The platform-independent half of the test above.
+
+        That one asserts an invariant that happens to take the `ast` branch on
+        macOS and the `regex` branch on a CI runner -- which is precisely the
+        shape of test that let this defect through, because the branch that
+        matters never ran locally. Here ast.parse is MADE to raise, so the
+        reporting path is exercised on every platform and at every stack size,
+        and a regression cannot hide behind a roomy stack.
+        """
+        # Deliberately a CLEAN test file -- a real oracle, nothing to find.
+        # That is the pointed case: the gate reports zero findings, and the
+        # reader still has to be able to tell that from "the AST pass ran and
+        # found nothing".
+        self.write("test_deep.py",
+                   "def test_x():\n    y = " + "a + " * 400 + "1\n"
+                   "    assert y == 7\n")
+        with forced_ast_recursion_error():
+            result = fsm.scan_paths([self.tmp])
+        assert_ast_depth_reported(self, result, fsm, self.path("test_deep.py"),
+                                  scanned_key="files_scanned", scanned_value=1)
+        # The regex fallback still ran -- the file was scanned, not dropped.
+        self.assertEqual(len(result["files"]), 1)
+        self.assertEqual(result["summary"]["findings"], 0)
+        # ...and it is NOT a finding. `--fail-on` must not fire on it at ANY
+        # severity: deeply nested generated code is legitimate, and a gate
+        # that blocks on it gets switched off, taking every other rule with
+        # it. The report has to live outside --fail-on's path entirely.
+        for severity in fsm.SEVERITIES:
+            self.assertFalse(fsm.breaches(result, severity),
+                             f"--fail-on {severity} fired on an unparsable "
+                             "file; it must be a report, not a finding")
+        self.assertNotIn("ast-nesting-too-deep", result["summary"]["by_rule"])
+        # The whole point, in one pair of assertions: a clean verdict AND a
+        # visible statement that part of the analysis did not run.
+        self.assertEqual(result["summary"]["by_severity"],
+                         {"block": 0, "warn": 0, "info": 0})
+        self.assertEqual(result["summary"]["files_ast_unparsed"], 1)
+
+    def test_flake_smells_really_does_survive_a_too_deep_file(self):
+        """The forced test above proves the reporting; this proves the catch.
+
+        A real RecursionError out of a real ast.parse, in a child process on a
+        small stack, because on an interpreter without the AST-construction
+        counter the alternative to catching it is the process dying -- and
+        finding THAT out in-process would end the run.
+        """
+        if not ast_depth_raises_here():
+            self.skipTest(
+                "this interpreter does not raise RecursionError from "
+                "ast.parse at a 512KB stack -- it crashes instead, so there "
+                "is no catchable behaviour here to assert. Measured on "
+                "CPython 3.9.6: SIGBUS, exit 138. The forced-RecursionError "
+                "test covers the reporting path on this platform.")
+        self.write("test_deep.py",
+                   "def test_x():\n    y = " + "a + " * 20_000 + "1\n    assert y\n")
+        rc, out, err = scan_on_a_thin_stack(
+            "flake_smells",
+            "mod.scan_paths([%r], max_line_chars=200_000)" % self.tmp)
+        self.assertEqual(rc, 0, f"child died instead of returning: {err}")
+        self.assertIsNotNone(out, f"child produced no JSON: {err}")
+        self.assertNotIn("raised", out,
+                         "scan_paths() must never raise -- its docstring "
+                         f"promises it: {out.get('raised')}")
+        assert_ast_depth_reported(self, out["result"], fsm,
+                                  self.path("test_deep.py"),
+                                  scanned_key="files_scanned", scanned_value=1)
 
     def test_flake_smells_on_java_method_signature_bait(self):
         # JVM_METHOD_RE is `\w+\([^;]*\)\s*(?:throws\s[\w.,\s]+)?\{\s*$` -- two
@@ -1523,10 +1846,79 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         # holds when the ceiling is raised and the planner sees every
         # character the way it used to.
         self.assertEqual(result["summary"]["lines_truncated"], 2)
+        # Raising the ceiling is what re-exposes ast.parse to the bait: at the
+        # default 2,000 the 20,000-term chain never reaches the parser. This
+        # call used to die with RecursionError on the Ubuntu runners and pass
+        # here, so it is also the regression site for that.
         with timed(self, "arid_nodes on regex bait, line ceiling raised"):
             full = arid.plan([self.tmp], max_line_chars=1_000_000)
         self.assertEqual(full["summary"]["lines_truncated"], 0)
         self.assertEqual(full["summary"]["files"], 1)
+        # Whether a 20,000-term chain is too deep for ast.parse depends on the
+        # C stack, so the only thing true on BOTH platforms is the invariant:
+        # either the AST pass ran, or the file is named. Never a third state,
+        # and never an exception out of plan().
+        self.assertEqual(full["summary"]["files_ast_unparsed"],
+                         len(full["unparsed_files"]))
+        if full["files"][0]["parsed_with"] == "ast":
+            self.assertEqual(full["unparsed_files"], [])
+            self.assertNotIn("ast_unavailable", full["files"][0])
+        else:
+            assert_ast_depth_reported(self, full, arid, self.path("bait.py"),
+                                      scanned_key="files", scanned_value=1)
+
+    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    def test_arid_nodes_reports_a_file_it_could_not_parse(self):
+        """The platform-independent half of the test above.
+
+        That one asserts an invariant that happens to take the `ast` branch on
+        macOS and the `regex` branch on a CI runner -- which is precisely the
+        shape of test that let this defect through, because the branch that
+        matters never ran locally. Here ast.parse is MADE to raise, so the
+        reporting path is exercised on every platform and at every stack size,
+        and a regression cannot hide behind a roomy stack.
+        """
+        self.write("deep.py", "def f(a):\n    y = " + "a + " * 400 + "1\n    return y\n")
+        with forced_ast_recursion_error():
+            result = arid.plan([self.tmp])
+        assert_ast_depth_reported(self, result, arid, self.path("deep.py"),
+                                  scanned_key="files", scanned_value=1)
+        # The regex fallback still ran -- the file was planned, not dropped.
+        self.assertEqual(len(result["files"]), 1)
+        self.assertGreater(result["summary"]["selected"], 0)
+        # ...and it is NOT a finding. arid_nodes has no --fail-on, but the
+        # same rule applies: it must not appear as a suppression rule either,
+        # or it lands in a count a gate could grow a threshold on.
+        self.assertNotIn("ast-nesting-too-deep", result["summary"]["suppressed_by_rule"])
+
+    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    def test_arid_nodes_really_does_survive_a_too_deep_file(self):
+        """The forced test above proves the reporting; this proves the catch.
+
+        A real RecursionError out of a real ast.parse, in a child process on a
+        small stack, because on an interpreter without the AST-construction
+        counter the alternative to catching it is the process dying -- and
+        finding THAT out in-process would end the run.
+        """
+        if not ast_depth_raises_here():
+            self.skipTest(
+                "this interpreter does not raise RecursionError from "
+                "ast.parse at a 512KB stack -- it crashes instead, so there "
+                "is no catchable behaviour here to assert. Measured on "
+                "CPython 3.9.6: SIGBUS, exit 138. The forced-RecursionError "
+                "test covers the reporting path on this platform.")
+        self.write("deep.py",
+                   "def f(a):\n    y = " + "a + " * 20_000 + "1\n    return y\n")
+        rc, out, err = scan_on_a_thin_stack(
+            "arid_nodes", "mod.plan([%r], max_line_chars=1_000_000)" % self.tmp)
+        self.assertEqual(rc, 0, f"child died instead of returning: {err}")
+        self.assertIsNotNone(out, f"child produced no JSON: {err}")
+        self.assertNotIn("raised", out,
+                         "plan() must never raise -- its docstring promises "
+                         f"it: {out.get('raised')}")
+        assert_ast_depth_reported(self, out["result"], arid,
+                                  self.path("deep.py"),
+                                  scanned_key="files", scanned_value=1)
 
 
 # --------------------------------------------------------------------------

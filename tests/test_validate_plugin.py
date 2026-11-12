@@ -363,5 +363,327 @@ class SilentHoleTests(PluginTreeMixin, unittest.TestCase):
         self.assertSurvivors(report, "alpha.md", "charlie.md")
 
 
+# --------------------------------------------------------------------------
+# hole 1: a file whose bytes were never obtained is not a file that passed
+# --------------------------------------------------------------------------
+
+class TemplateContentsTests(PluginTreeMixin, unittest.TestCase):
+    """`templates/agents/*.tmpl` is checked by exactly one thing -- the context
+    budget -- and that check used os.path.getsize(), which stats rather than
+    opens. So a template nobody could read produced "Validation passed", which
+    is the defect this branch removed from four other places. The budget is
+    allowed to be the only claim made about a template; it is not allowed to be
+    made about bytes that cannot be obtained."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(self.path("templates/agents"))
+        self.write("templates/agents/aaa.tmpl", "a" * 2000)
+        self.write("templates/agents/mid.tmpl", "m" * 2000)
+        # zzz sorts last, so it is reached only if mid.tmpl did not abort.
+        self.write("templates/agents/zzz.tmpl", "z" * 2000)
+
+    def test_templates_do_not_disturb_the_clean_baseline(self):
+        self.assertBaselineIsClean()
+
+    def test_an_unreadable_template_is_unvalidated_not_passed(self):
+        os.chmod(self.path("templates/agents/mid.tmpl"), 0o000)
+        if os.access(self.path("templates/agents/mid.tmpl"), os.R_OK):
+            self.skipTest("running as a user that ignores file permissions")
+        report = vp.validate(self.tmp)
+        self.assertUnvalidated(report, "mid.tmpl")
+        self.assertSurvivors(report, "aaa.tmpl", "zzz.tmpl", "alpha.md")
+
+    def test_an_unreadable_template_fails_the_run(self):
+        os.chmod(self.path("templates/agents/mid.tmpl"), 0o000)
+        if os.access(self.path("templates/agents/mid.tmpl"), os.R_OK):
+            self.skipTest("running as a user that ignores file permissions")
+        # Exit 0 about a file nobody read is the whole bug; --strict is not
+        # needed to make it fail, because an unknown verdict is already one.
+        self.assertEqual(vp.main([self.tmp]), 1)
+
+    def test_a_directory_named_like_a_template_is_unvalidated(self):
+        """getsize() on a directory returns the dirent size -- 64 here -- which
+        the budget check turned into a confident '~16 tokens' about contents
+        that do not exist. A number measured from nothing is worse than none."""
+        self.replace_with_dir("templates/agents/mid.tmpl")
+        report = vp.validate(self.tmp)
+        self.assertUnvalidated(report, "mid.tmpl")
+        self.assertFalse([w for w in report.warnings if "mid.tmpl" in w],
+                         f"a directory got a budget number: {report.warnings!r}")
+        self.assertSurvivors(report, "aaa.tmpl", "zzz.tmpl")
+
+    def test_a_template_symlinked_to_a_directory_is_unvalidated(self):
+        target = self.path("templates/agents/mid.tmpl")
+        os.remove(target)
+        os.symlink(self.tmp, target)
+        report = vp.validate(self.tmp)
+        self.assertUnvalidated(report, "mid.tmpl")
+        self.assertSurvivors(report, "aaa.tmpl", "zzz.tmpl")
+
+    def test_an_empty_template_is_warned_about_not_passed(self):
+        """Under budget because there is nothing in it. The budget is the only
+        check a template gets, so it is the only place this can be said."""
+        self.write("templates/agents/mid.tmpl", "")
+        report = vp.validate(self.tmp)
+        self.assertTrue([w for w in report.warnings
+                         if "mid.tmpl" in w and "empty" in w],
+                        f"an empty template passed silently: {report.warnings!r}")
+        self.assertEqual(vp.main([self.tmp, "--strict"]), 1)
+
+    def test_the_unreadable_message_says_the_contents_were_never_checked(self):
+        # The point of the message: for a template this is the only check, so
+        # "no budget verdict" is the same as "no verdict at all". If it only
+        # said "no context-budget verdict" a reader could reasonably assume
+        # some other check had looked at the contents. None did.
+        os.chmod(self.path("templates/agents/mid.tmpl"), 0o000)
+        if os.access(self.path("templates/agents/mid.tmpl"), os.R_OK):
+            self.skipTest("running as a user that ignores file permissions")
+        hits = self.assertUnvalidated(vp.validate(self.tmp), "mid.tmpl")
+        self.assertIn("nothing else in this run opened it", " ".join(hits))
+
+    def test_the_budget_does_not_claim_sole_custody_of_an_agent(self):
+        """The other side of the same message. check_markdown_component() and
+        the stack-playbook scan both open an agent, so the budget check saying
+        'nothing else in this run opened it' about one would be a confident
+        false statement -- the exact failure mode this validator exists to
+        stop printing, committed by the fix for it."""
+        self.replace_with_dir("agents/bravo.md")
+        report = vp.validate(self.tmp)
+        budget_line = [m for m in report.unvalidated
+                       if "bravo.md" in m and "context-budget" in m]
+        self.assertTrue(budget_line, report.unvalidated)
+        self.assertNotIn("nothing else in this run opened it", budget_line[0])
+        # ...and the checks that did open it each said so separately.
+        self.assertTrue([m for m in report.unvalidated
+                         if "bravo.md" in m and "stack playbook" in m],
+                        report.unvalidated)
+
+    def test_an_empty_agent_is_not_double_reported_by_the_budget(self):
+        # An empty agent is already an error about its frontmatter. Saying
+        # "it is empty" a second time is noise, and a noisy check gets
+        # switched off, taking the rest of the rules with it.
+        self.write("agents/bravo.md", "")
+        report = vp.validate(self.tmp)
+        self.assertEqual([w for w in report.warnings
+                          if "bravo.md" in w and "empty" in w], [])
+        self.assertTrue([e for e in report.errors
+                         if "bravo.md" in e and "frontmatter" in e],
+                        report.errors)
+
+    def test_a_readable_template_over_budget_is_still_a_plain_warning(self):
+        # The readability probe must not have displaced the check it guards.
+        self.write("templates/agents/mid.tmpl", "m" * (1_600 * 4 + 400))
+        report = vp.validate(self.tmp)
+        self.assertTrue([w for w in report.warnings
+                         if "mid.tmpl" in w and "over the 1,600 budget" in w],
+                        report.warnings)
+        self.assertEqual([m for m in report.unvalidated if "mid.tmpl" in m], [])
+
+
+# --------------------------------------------------------------------------
+# "0 warnings" is not "everything fits"
+# --------------------------------------------------------------------------
+
+class BudgetCoverageTests(PluginTreeMixin, unittest.TestCase):
+    """A ceiling applies to four globs. Every other file under agents/,
+    skills/, templates/, stacks/ and hooks/ has none -- 23 of them in this
+    repo, including a 8,408-token dashboard.html and ten stack playbooks over
+    5,000 each. Most are unbudgeted on purpose, so warning about them would be
+    a false positive; but `0 warning(s)` read on its own says "everything
+    fits", and for those files nothing was ever weighed."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(self.path("templates/agents"))
+        self.write("templates/agents/aaa.tmpl", "a" * 2000)
+        os.makedirs(self.path("stacks"))
+        self.write("stacks/js-ts.md", "s" * 40000)      # huge, and no ceiling
+
+    def test_a_file_with_no_ceiling_is_counted_not_warned_about(self):
+        report = vp.validate(self.tmp)
+        self.assertIn("stacks/js-ts.md", report.unbudgeted)
+        self.assertEqual([w for w in report.warnings if "js-ts" in w], [],
+                         "a file with no ceiling must not produce a finding")
+
+    def test_a_weighed_file_is_not_counted_as_unweighed(self):
+        report = vp.validate(self.tmp)
+        self.assertIn("templates/agents/aaa.tmpl", report.budgeted)
+        self.assertNotIn("templates/agents/aaa.tmpl", report.unbudgeted)
+        for name in ("alpha", "bravo", "charlie"):
+            self.assertIn(f"agents/{name}.md", report.budgeted)
+
+    def test_an_exempt_file_is_neither_weighed_nor_counted_as_unweighed(self):
+        # EXEMPT records a decision with a reason. A file named there was
+        # considered; it is not part of the silence the count measures.
+        self.write("templates/report/STYLE.md", "y" * 40000)
+        report = vp.validate(self.tmp)
+        self.assertIn("templates/report/STYLE.md", vp.EXEMPT)
+        self.assertNotIn("templates/report/STYLE.md", report.unbudgeted)
+        self.assertNotIn("templates/report/STYLE.md", report.budgeted)
+
+    def test_the_run_states_how_many_files_it_weighed(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            self.assertEqual(vp.main([self.tmp]), 0)
+        out = buf.getvalue()
+        self.assertIn("Context budgets:", out)
+        self.assertIn("weighed against a ceiling", out)
+        self.assertIn("have no ceiling and were not", out)
+
+    def test_an_unlistable_directory_makes_the_count_a_floor(self):
+        """os.walk() swallows a directory it cannot list and walks on, which
+        would turn an unknown total into a confident understatement."""
+        locked = self.path("templates/locked")
+        os.makedirs(locked)
+        self.write("templates/locked/thing.md", "x" * 100)
+        os.chmod(locked, 0o000)
+        if os.access(locked, os.R_OK):
+            self.skipTest("running as a user that ignores file permissions")
+        import contextlib
+        import io
+        report = vp.validate(self.tmp)
+        self.assertTrue(report.budget_scan_incomplete)
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            vp.main([self.tmp])
+        self.assertIn("at least", buf.getvalue())
+        self.assertIn("is a floor, not a total", buf.getvalue())
+
+    def test_a_listable_tree_does_not_claim_an_incomplete_scan(self):
+        # The false-positive guard: "at least" must not appear when the walk
+        # saw everything, or the hedge becomes meaningless.
+        import contextlib
+        import io
+        report = vp.validate(self.tmp)
+        self.assertFalse(report.budget_scan_incomplete)
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            vp.main([self.tmp])
+        self.assertNotIn("at least", buf.getvalue())
+
+    def test_the_quotable_summary_line_is_unchanged(self):
+        """docs/SECURITY-REVIEW.md and docs/PROMPT-REVIEW.md quote this line
+        verbatim, and neither is this agent's to edit. The coverage statement
+        is a separate line for exactly that reason."""
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(vp.main([self.tmp]), 0)
+        self.assertEqual(
+            buf.getvalue().strip(),
+            "Validation passed: 7 component(s) checked, 0 warning(s), "
+            "0 could not be validated.")
+
+
+# --------------------------------------------------------------------------
+# hole 2: what we guarantee about encoding, and what we do not
+# --------------------------------------------------------------------------
+
+class EncodingGuaranteeTests(PluginTreeMixin, unittest.TestCase):
+    """The validator accepts UTF-8 (BOM or not) and BOM-marked UTF-16. Whether
+    the real plugin loader does is unmeasured -- `claude plugin validate` has
+    never run here -- so a non-UTF-8 component gets a WARNING that says the
+    uncertainty out loud. An error would assert knowledge nobody has; silence
+    would assert the opposite. See the note in check_markdown_component()."""
+
+    def test_a_utf16_agent_is_warned_about_by_encoding(self):
+        self.write("agents/bravo.md", good_agent("bravo").encode("utf-16"))
+        report = vp.validate(self.tmp)
+        hits = [w for w in report.warnings if "bravo.md" in w and "UTF-16" in w]
+        self.assertTrue(hits, f"the encoding went unsaid: {report.warnings!r}")
+        self.assertIn("never been measured", hits[0])
+
+    def test_the_utf16_warning_is_not_an_error_and_not_an_unknown(self):
+        # The file decoded and its contents were judged. Promoting that to an
+        # error would state as fact something nobody has run the CLI to learn.
+        self.write("agents/bravo.md", good_agent("bravo").encode("utf-16"))
+        report = vp.validate(self.tmp)
+        self.assertEqual([e for e in report.errors if "bravo.md" in e], [])
+        self.assertEqual([m for m in report.unvalidated if "bravo.md" in m], [])
+        self.assertEqual(report.checked, 7)   # it was checked, like any other
+
+    def test_a_utf16_be_agent_is_warned_about_too(self):
+        self.write("agents/bravo.md",
+                   b"\xfe\xff" + good_agent("bravo").encode("utf-16-be"))
+        report = vp.validate(self.tmp)
+        self.assertTrue([w for w in report.warnings
+                         if "bravo.md" in w and "UTF-16 BE" in w],
+                        report.warnings)
+
+    def test_a_utf16_skill_is_warned_about_too(self):
+        self.write("skills/one/SKILL.md", good_skill("one").encode("utf-16"))
+        report = vp.validate(self.tmp)
+        self.assertTrue([w for w in report.warnings
+                         if "SKILL.md" in w and "UTF-16" in w], report.warnings)
+
+    def test_a_utf8_bom_agent_is_not_warned_about(self):
+        """The false-positive guard. load_json() documents that the Claude CLI
+        accepts a BOM on plugin.json, so a BOM is UTF-8 here and warning about
+        it would fire on a file that is known-good."""
+        self.write("agents/bravo.md",
+                   b"\xef\xbb\xbf" + good_agent("bravo").encode("utf-8"))
+        self.assertBaselineIsClean()
+
+    def test_plain_utf8_components_produce_no_encoding_warning(self):
+        # The measured firing rate of this rule on well-formed components is
+        # zero; a rule above ~10% false positives gets switched off entirely.
+        report = vp.validate(self.tmp)
+        self.assertEqual([w for w in report.warnings if "UTF" in w], [])
+
+    def test_a_utf16_file_without_a_bom_is_not_accepted(self):
+        """The other half of the stated guarantee. Without a BOM the bytes
+        decode as NUL-separated ASCII, which is valid UTF-8 and so raises no
+        U+FFFD, but does not start with '---\\n'. It is reported as missing
+        frontmatter -- not accepted, and not silently passed."""
+        self.write("agents/bravo.md", good_agent("bravo").encode("utf-16-le"))
+        report = vp.validate(self.tmp)
+        self.assertTrue([e for e in report.errors
+                         if "bravo.md" in e and "frontmatter" in e],
+                        report.errors)
+
+    def test_read_text_sniffed_names_the_encoding_it_used(self):
+        for raw, expected in (
+            (good_agent("x").encode("utf-8"), "UTF-8"),
+            (b"\xef\xbb\xbf" + good_agent("x").encode("utf-8"), "UTF-8"),
+            (good_agent("x").encode("utf-16"), "UTF-16 LE"),
+            (b"\xfe\xff" + good_agent("x").encode("utf-16-be"), "UTF-16 BE"),
+        ):
+            path = self.write("agents/probe.md", raw)
+            self.assertEqual(vp.read_text_sniffed(path)[1], expected)
+
+
+# --------------------------------------------------------------------------
+# a hooks.json that cannot resolve is not a plugin without hooks
+# --------------------------------------------------------------------------
+
+class HooksPresenceTests(PluginTreeMixin, unittest.TestCase):
+    def test_a_dangling_symlink_hooks_file_is_unvalidated_not_absent(self):
+        """os.path.exists() follows the link and says False, so a hooks.json
+        that will certainly fail to load read as 'this plugin ships no hooks'
+        and the run passed in silence. lexists() tells the two apart."""
+        os.makedirs(self.path("hooks"), exist_ok=True)
+        os.symlink(self.path("hooks/nowhere.json"), self.path("hooks/hooks.json"))
+        report = vp.validate(self.tmp)
+        self.assertUnvalidated(report, "hooks")
+        self.assertSurvivors(report, "alpha.md", "one/SKILL.md")
+
+    def test_a_symlink_loop_hooks_file_is_unvalidated_not_absent(self):
+        os.makedirs(self.path("hooks"), exist_ok=True)
+        loop = self.path("hooks/hooks.json")
+        os.symlink(loop, loop)
+        report = vp.validate(self.tmp)
+        self.assertUnvalidated(report, "hooks")
+
+    def test_a_plugin_with_no_hooks_at_all_is_still_silent(self):
+        # The false-positive guard for the lexists change: absent must stay
+        # absent, which is the legitimate shape for most plugins.
+        self.assertFalse(os.path.exists(self.path("hooks")))
+        self.assertBaselineIsClean()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

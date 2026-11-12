@@ -18,9 +18,10 @@ cd tests && ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest
 python3 scripts/validate_plugin.py . --strict
 ```
 
-Expect **717 tests with 3 failures**, all named in `HANDOFF.md` §2. None is a broken
-feature; each is a test that outlived the behaviour it asserted. Start there — it is
-about half an hour of work and takes the suite green.
+Expect **902 tests, all passing**, plus one skip and two expected failures. The three
+failures the previous handoff named are fixed, as are two it did not know about. One of
+the expected failures is deliberate: it pins an unguarded `ast.parse` in
+`scripts/project_state.py` and flips to an unexpected success when that is fixed.
 
 **Ask, do not assume**, on anything in `HANDOFF.md` §4. Those are the owner's calls.
 

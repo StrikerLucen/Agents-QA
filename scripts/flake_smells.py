@@ -969,13 +969,102 @@ def _python_blocks_regex(code: list[str]) -> list[Block]:
     return blocks
 
 
-def python_blocks_ast(source: str) -> list[Block] | None:
-    """Exact block boundaries from Python's own parser. Returns None if the
-    file does not parse, so the caller can fall back to the regex path."""
+# The one ceiling in this file we do NOT set and cannot raise.
+#
+# `ast.parse` builds the Python AST objects from the C parse tree with a
+# recursive C function (`ast2obj_expr` in Python-ast.c), so a deeply NESTED
+# expression costs C stack, and past some depth `ast.parse` raises
+# `RecursionError`. That depth is not `sys.getrecursionlimit()`. Measured
+# here, binop chains (`a + a + a + ...`, nesting depth = term count):
+#
+#   CPython 3.14.6, macOS, main thread   accepts 95,065; RecursionError at
+#                                        95,066; still RecursionError at
+#                                        400,000 -- it never crashes
+#   CPython 3.14.6, 512KB thread stack   accepts 2,834; RecursionError at 2,835
+#   CPython 3.9.6 (this repo's FLOOR),   accepts 260,937; SIGSEGV (rc -11) by
+#   macOS, main thread                   262,500. Bisected in child processes.
+#                                        The macOS crash report for one of
+#                                        those runs names the cause: "Thread
+#                                        stack size exceeded due to excessive
+#                                        recursion", dead at recursion level
+#                                        261,942 -- inside the bracket above.
+#   CPython 3.9.6, 512KB thread stack,   SIGBUS, exit 138
+#   depth 20,000
+#
+# Three consequences, all measured rather than assumed:
+#
+#  1. `sys.setrecursionlimit()` is NOT the knob. On 3.14.6 at a 512KB stack and
+#     depth 3,000 the result is RecursionError at limits of 1,000, 10,000,
+#     100,000 and 1,000,000 alike.
+#  2. On 3.9.6 there is NO depth at which this raises. The bisect found no
+#     RecursionError anywhere between "accepted" and "crashed": it goes
+#     straight from OK at 260,937 to SIGSEGV. So the margin that raising the
+#     limit would be spending is not small -- on the interpreter this repo
+#     declares as its floor it does not exist. A RecursionError is catchable
+#     and can be reported; a SIGSEGV has no exception, no traceback, no output
+#     and no exit code a caller can act on. Raising the limit trades the
+#     former for the latter, which is strictly worse than the bug it would be
+#     trying to fix. We therefore do NOT raise it, and do not call
+#     threading.stack_size() either -- both are depth guesses, and a depth
+#     guess is exactly what is not portable here.
+#  3. The depth at which it bites depends on the C stack, which differs
+#     between macOS and Linux and between the main thread and a worker. A file
+#     that parses on a developer's machine can fail on a CI runner. That is
+#     exactly how this escaped: one machine could not have told us.
+#
+# Catching RecursionError at the call site needs no depth guess at all, which
+# is why it is the fix. Residual risk, stated plainly: on an interpreter whose
+# AST builder has no counter (3.9.6) a deep enough file still kills the
+# process, and nothing in this script can catch that. What this script
+# controls is that where the interpreter DOES raise, the run survives and says
+# so.
+#
+# So it has to be REPORTED, not merely survived. The AST pass is what gives
+# exact test-block boundaries; without it the regex scanner guesses them from
+# indentation, so a rule can fire on the wrong block or not at all. A file
+# where that happened is in `unparsed_files` and is counted in
+# summary.files_ast_unparsed -- a third state, distinct from both "not scanned
+# at all" (skipped_files) and "scanned in full".
+AST_TOO_DEEP = "ast-nesting-too-deep"
+AST_TOO_DEEP_REASON = (
+    "ast.parse raised RecursionError: expression nesting is too deep for "
+    "CPython's AST builder on this interpreter and stack. No flag raises this "
+    "ceiling -- it is the C stack, not --max-file-bytes, --max-line-chars or "
+    "sys.setrecursionlimit, and it moves between platforms. The AST pass did "
+    "NOT run on this file."
+)
+AST_TOO_DEEP_LOST = (
+    "exact test-block boundaries; the regex scanner ran instead, inferring "
+    "blocks from indentation, so a per-block rule (no-assertion, weak-oracle, "
+    "shared-mutable-state) may have been applied to the wrong span or to no "
+    "span at all"
+)
+
+
+def python_blocks_ast_detailed(source: str) -> tuple[list[Block] | None, str | None]:
+    """(blocks, why_not) -- blocks is None when Python's own parser refused it.
+
+    `why_not` exists because those refusals are not one thing. A SyntaxError is
+    an ordinary, expected state: the file is half-written, the regex path is
+    the right answer and saying so every time would be noise. A RecursionError
+    is not: nothing about the file is wrong, the limit is the interpreter's C
+    stack (see AST_TOO_DEEP above), it differs per platform, and the caller
+    MUST be able to tell the reader that the AST pass did not run. Falling back
+    silently in that case is the whole defect class this gate exists to catch.
+
+    This function never raises. The docstring used to promise that while the
+    code only caught SyntaxError and ValueError, so a deeply nested expression
+    killed the entire run from inside scan_paths().
+    """
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
-        return None
+        return None, "syntax-error"
+    except RecursionError:
+        # Caught here and NOT re-raised, but the caller is handed the reason so
+        # it can put the file in unparsed_files. Catch-and-continue on its own
+        # would be silence wearing a fix's clothes.
+        return None, AST_TOO_DEEP
     blocks: list[Block] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -988,7 +1077,15 @@ def python_blocks_ast(source: str) -> list[Block] | None:
         decl = min([node.lineno] + [d.lineno for d in node.decorator_list])
         blocks.append(Block(node.name, decl, start, end))
     blocks.sort(key=lambda b: b.decl)
-    return blocks
+    return blocks, None
+
+
+def python_blocks_ast(source: str) -> list[Block] | None:
+    """Back-compatible wrapper: blocks only. Prefer
+    python_blocks_ast_detailed(), which also hands back WHY the parser refused
+    -- a caller that cannot tell "half-written" from "too deeply nested"
+    cannot report the second one."""
+    return python_blocks_ast_detailed(source)[0]
 
 
 def _brace_blocks(code: list[str], patterns: list[tuple[re.Pattern, int]]) -> list[Block]:
@@ -1104,10 +1201,16 @@ class FileScan:
         self.code, self.strings, self.comments = scrub(raw, lang)
         self.has_seed = any(SEED_RE.search(c) for c in self.code)
         self.ast_used = False
+        # None unless the AST pass was attempted and the interpreter refused
+        # the file for depth. "Not attempted" (Java, use_ast=False) and
+        # "attempted and failed" must not look alike downstream.
+        self.ast_unavailable: str | None = None
         blocks = None
         if lang == "python" and use_ast:
-            blocks = python_blocks_ast("".join(raw))
+            blocks, why = python_blocks_ast_detailed("".join(raw))
             self.ast_used = blocks is not None
+            if why == AST_TOO_DEEP:
+                self.ast_unavailable = why
         self.blocks = blocks if blocks is not None else find_blocks(self.code, lang)
         self.findings: list[dict] = []
         self.suppressed = 0
@@ -1561,6 +1664,7 @@ def scan_paths(paths: list[str], use_ast: bool = True, *,
     files: list[dict] = []
     skipped: list[dict] = []
     truncated_lines: list[dict] = []
+    unparsed_files: list[dict] = []
     by_rule: dict[str, int] = {}
     counts = {"block": 0, "warn": 0, "info": 0}
     categories = {"flake": 0, "meaningless": 0}
@@ -1597,12 +1701,32 @@ def scan_paths(paths: list[str], use_ast: bool = True, *,
             counts[f["severity"]] += 1
             categories[f["category"]] += 1
             by_rule[f["rule"]] = by_rule.get(f["rule"], 0) + 1
-        files.append({
+        entry = {
             "path": path,
             "language": lang,
             "parsed_with": "ast" if scan.ast_used else "regex",
             "findings": scan.findings,
-        })
+        }
+        if scan.ast_unavailable:
+            # `parsed_with: "regex"` is also what a Java file and a
+            # use_ast=False run say, so it cannot carry this on its own. A
+            # separate key, named for what happened, so "regex because that is
+            # the right tool here" and "regex because the AST pass could not
+            # run" stay distinguishable.
+            entry["ast_unavailable"] = scan.ast_unavailable
+            # The file WAS read and WAS scanned -- so it is not in
+            # skipped_files and it does count in files_scanned -- but it was
+            # scanned by the weaker of the two block finders. Saying which,
+            # and what that costs, is the difference between a partial
+            # analysis and a partial analysis reported as complete.
+            unparsed_files.append({
+                "file": path,
+                "stage": "ast",
+                "reason": AST_TOO_DEEP_REASON,
+                "fell_back_to": "regex",
+                "not_analysed": AST_TOO_DEEP_LOST,
+            })
+        files.append(entry)
 
     total = sum(counts.values())
     # "not a test file" is a decision, not a failure. `skipped_files` carries
@@ -1620,10 +1744,18 @@ def scan_paths(paths: list[str], use_ast: bool = True, *,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "skipped_files": unread,
         "truncated_lines": truncated_lines,
+        # A third state again, one level sideways: the file was read in full
+        # and scanned in full, but by the regex block finder, because the AST
+        # pass could not run on it. Never a finding -- deeply nested generated
+        # code is legitimate, and a check that fires on it would be switched
+        # off inside a week, taking the rest of the gate with it. So it stays
+        # out of by_severity, out of the counts and out of --fail-on's path.
+        "unparsed_files": unparsed_files,
         "files": files,
         "summary": {
             "files_scanned": len(files),
             "files_skipped": len(skipped),
+            "files_ast_unparsed": len(unparsed_files),
             "skipped": skipped,
             "lines_truncated": len(truncated_lines),
             "files_with_truncated_lines": len({t["file"] for t in truncated_lines}),
@@ -1672,6 +1804,19 @@ def render_text(result: dict) -> str:
                        "analysed, the rest NOT examined")
         if len(cut) > 5:
             out.append(f"  ... and {len(cut) - 5} more")
+    # And the state between the two: fully read, fully scanned, but with the
+    # AST pass missing. Out loud in the terminal as well as in the JSON,
+    # because the terminal is where a developer decides the gate went fine.
+    deep = result.get("unparsed_files") or []
+    if deep:
+        out.append(f"{len(deep)} file(s) scanned WITHOUT the AST pass "
+                   "(see unparsed_files):")
+        for d in deep[:5]:
+            out.append(f"  not parsed {d['file']}: expression nesting too "
+                       f"deep for ast.parse; fell back to {d['fell_back_to']}, "
+                       "so exact test-block boundaries were NOT used")
+        if len(deep) > 5:
+            out.append(f"  ... and {len(deep) - 5} more")
     return "\n".join(out)
 
 
@@ -1724,6 +1869,10 @@ def main(argv: list[str] | None = None) -> int:
         for t in result["truncated_lines"]:
             print(f"warning: only partly scanned: {t['file']}:{t['line']}: "
                   f"{t['reason']}", file=sys.stderr)
+        for d in result["unparsed_files"]:
+            print(f"warning: scanned without the AST pass: {d['file']}: "
+                  f"{d['reason']} Fell back to {d['fell_back_to']}; "
+                  f"NOT analysed: {d['not_analysed']}.", file=sys.stderr)
     except OSError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
