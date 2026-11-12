@@ -1477,6 +1477,15 @@ def iter_paths(paths: list[str]):
 # characters wide -- a line that is, is minified or generated -- so scanning is
 # capped there. Line numbers and the file's line count are unchanged, so every
 # finding still points where it did.
+#
+# The cap is NOT silent. Until this was fixed the tail past 2,000 characters
+# was dropped with nothing said, so a 1.9MB single-line test file -- under the
+# file ceiling, therefore "scanned" -- came back files_scanned=1, findings=0,
+# skipped_files=[]: a clean verdict about 1,898,000 characters nobody looked
+# at, which is exactly the shape of the worst defect in this build. Measured
+# before the fix: 0.002s and zero findings on that file. Every truncated line
+# now appears in `truncated_lines`, is counted in summary.lines_truncated, is
+# printed by render_text() and is warned about on stderr.
 MAX_LINE_CHARS = 2000
 
 # The line cap above bounds the work per line; this bounds the work per FILE,
@@ -1491,34 +1500,67 @@ MAX_LINE_CHARS = 2000
 MAX_FILE_BYTES = 2 * 1024 * 1024
 
 
-def read_lines(path: str, *, max_bytes: int = MAX_FILE_BYTES) -> list[str] | None:
-    """None when the file is unreadable, binary or over `max_bytes`. A
+def read_lines_bounded(path: str, *, max_bytes: int = MAX_FILE_BYTES,
+                       max_line_chars: int = MAX_LINE_CHARS
+                       ) -> tuple[list[str] | None, list[dict]]:
+    """(lines, truncated) -- lines is None when the file is unreadable, binary
+    or over `max_bytes`; `truncated` lists every line whose tail was NOT
+    scanned.
+
+    The second element is the whole point. A gate that shortens its own input
+    and says nothing reports "nothing found" about text it never read, so the
+    caller is given what it would have to lie about otherwise. A
     generated-test gate that crashes on one odd file blocks the whole
-    pipeline, so this never raises."""
+    pipeline, so this never raises.
+    """
     try:
         if os.path.getsize(path) > max_bytes:
-            return None
+            return None, []
         with open(path, "rb") as fh:
             blob = fh.read()
     except OSError:
-        return None
+        return None, []
     if b"\x00" in blob[:8000]:
-        return None
+        return None, []
     try:
         text = blob.decode("utf-8")
     except UnicodeDecodeError:
         try:
             text = blob.decode("latin-1")
         except Exception:
-            return None
-    return [line if len(line) <= MAX_LINE_CHARS else line[:MAX_LINE_CHARS]
-            for line in text.splitlines(keepends=True)]
+            return None, []
+
+    lines: list[str] = []
+    truncated: list[dict] = []
+    for n, line in enumerate(text.splitlines(keepends=True), start=1):
+        if len(line) > max_line_chars:
+            truncated.append({
+                "file": path,
+                "line": n,
+                "chars": len(line),
+                "scanned_chars": max_line_chars,
+                "reason": (f"line is {len(line)} characters, over the "
+                           f"{max_line_chars}-character line ceiling; only "
+                           f"the first {max_line_chars} were analysed and "
+                           "the rest was NOT examined"),
+            })
+            line = line[:max_line_chars]
+        lines.append(line)
+    return lines, truncated
+
+
+def read_lines(path: str, *, max_bytes: int = MAX_FILE_BYTES) -> list[str] | None:
+    """Back-compatible wrapper: lines only. Prefer read_lines_bounded(), which
+    also hands back what it had to shorten."""
+    return read_lines_bounded(path, max_bytes=max_bytes)[0]
 
 
 def scan_paths(paths: list[str], use_ast: bool = True, *,
-               max_bytes: int = MAX_FILE_BYTES) -> dict:
+               max_bytes: int = MAX_FILE_BYTES,
+               max_line_chars: int = MAX_LINE_CHARS) -> dict:
     files: list[dict] = []
     skipped: list[dict] = []
+    truncated_lines: list[dict] = []
     by_rule: dict[str, int] = {}
     counts = {"block": 0, "warn": 0, "info": 0}
     categories = {"flake": 0, "meaningless": 0}
@@ -1532,7 +1574,9 @@ def scan_paths(paths: list[str], use_ast: bool = True, *,
             # code is not a smell.
             skipped.append({"path": path, "reason": "not a test file"})
             continue
-        raw = read_lines(path, max_bytes=max_bytes)
+        raw, cut = read_lines_bounded(path, max_bytes=max_bytes,
+                                      max_line_chars=max_line_chars)
+        truncated_lines.extend(cut)
         if raw is None:
             # Name the ceiling when that is what happened: "unreadable" and
             # "too big to look at" need different reactions from the reader.
@@ -1566,15 +1610,23 @@ def scan_paths(paths: list[str], use_ast: bool = True, *,
     # ones whose silence would otherwise be mistaken for a clean result.
     unread = [{"file": s["path"], "reason": s["reason"]} for s in skipped
               if s["reason"] != "not a test file"]
+    # A truncated line is a *third* state, and it has to stay distinguishable
+    # from both of the other two: the file was read (so it is not in
+    # skipped_files) and it was scanned (so files_scanned counts it), but part
+    # of it was not looked at. Reported per line, with the real character
+    # count, so "nothing found here" can never be read as "nothing is here".
     return {
         "schema": SCHEMA,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "skipped_files": unread,
+        "truncated_lines": truncated_lines,
         "files": files,
         "summary": {
             "files_scanned": len(files),
             "files_skipped": len(skipped),
             "skipped": skipped,
+            "lines_truncated": len(truncated_lines),
+            "files_with_truncated_lines": len({t["file"] for t in truncated_lines}),
             "findings": total,
             "by_severity": counts,
             "by_category": categories,
@@ -1608,6 +1660,18 @@ def render_text(result: dict) -> str:
             out.append(f"  skipped {s['file']}: {s['reason']}")
         if len(unread) > 5:
             out.append(f"  ... and {len(unread) - 5} more")
+    # Same reasoning one level down: a line that was shortened was partly not
+    # read, and a count of zero findings on it says nothing about the tail.
+    cut = result.get("truncated_lines") or []
+    if cut:
+        out.append(f"{len(cut)} line(s) only PARTLY scanned "
+                   "(see truncated_lines):")
+        for t in cut[:5]:
+            out.append(f"  truncated {t['file']}:{t['line']}: "
+                       f"{t['chars']} chars, first {t['scanned_chars']} "
+                       "analysed, the rest NOT examined")
+        if len(cut) > 5:
+            out.append(f"  ... and {len(cut) - 5} more")
     return "\n".join(out)
 
 
@@ -1631,6 +1695,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="skip test files larger than this "
                          f"(default {MAX_FILE_BYTES}, i.e. 2MB); skipped files "
                          "are reported in skipped_files, never ignored")
+    ap.add_argument("--max-line-chars", type=int, default=MAX_LINE_CHARS,
+                    help="analyse only the first N characters of a line "
+                         f"(default {MAX_LINE_CHARS}); every line past it is "
+                         "reported in truncated_lines, never silently cut")
     args = ap.parse_args(argv)
 
     missing = [p for p in args.paths if not os.path.exists(p)]
@@ -1639,7 +1707,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        result = scan_paths(args.paths, max_bytes=args.max_file_bytes)
+        result = scan_paths(args.paths, max_bytes=args.max_file_bytes,
+                            max_line_chars=args.max_line_chars)
         payload = (json.dumps(result, indent=2) if args.format == "json"
                    else render_text(result))
         if args.out:
@@ -1652,6 +1721,9 @@ def main(argv: list[str] | None = None) -> int:
         for s in result["skipped_files"]:
             print(f"warning: not scanned: {s['file']}: {s['reason']}",
                   file=sys.stderr)
+        for t in result["truncated_lines"]:
+            print(f"warning: only partly scanned: {t['file']}:{t['line']}: "
+                  f"{t['reason']}", file=sys.stderr)
     except OSError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

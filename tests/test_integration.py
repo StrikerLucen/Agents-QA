@@ -37,6 +37,7 @@ Standard library only, unittest, Python 3.9 compatible.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -149,10 +150,92 @@ def git(repo, *args):
                           capture_output=True, text=True)
 
 
+# --------------------------------------------------------------------------
+# fixture availability: FAIL by default, skip only under an explicit opt-in
+# --------------------------------------------------------------------------
+#
+# `TESTSQUAD_ALLOW_MISSING_FIXTURES=1` restores the old behaviour, in which a
+# missing or malformed fixture skipped the test instead of failing it. It
+# exists for ONE situation: local concurrent work, where a second agent really
+# is mid-landing a fixture and you want the rest of the suite's signal in the
+# meantime. **It must never be set in CI.** In CI there is no other agent, so
+# an absent fixture is not a race, it is a hard error.
+#
+# The default is FAIL because the skip hid a real defect for an unknown length
+# of time. `examples/fixtures/node-ts/.env` -- MANIFEST item NODE-CONFIG-01,
+# the file whose entire purpose is to make `env_safety_check.py` return UNSAFE
+# -- had never been committed, so every clone was missing it and the scanner
+# returned SAFE for it. The suite said "skipped", which reads as "fine". A
+# skip is silence, and silence must never look like success.
+#
+# When the override IS set, the skip reason names the variable, so an
+# overridden skip can be told apart from an ordinary one at a glance.
+ALLOW_MISSING_FIXTURES = "TESTSQUAD_ALLOW_MISSING_FIXTURES"
+
+
+def allowing_missing_fixtures():
+    """True when the documented local-only escape hatch is engaged."""
+    return os.environ.get(ALLOW_MISSING_FIXTURES) == "1"
+
+
+def fixture_rel(path):
+    """A path a human can paste into an editor, relative to the repo root."""
+    try:
+        return os.path.relpath(path, ROOT).replace(os.sep, "/")
+    except ValueError:                                  # different drive
+        return path
+
+
+def fixture_unavailable(case, summary):
+    """A fixture is missing or malformed: fail loudly, or skip loudly.
+
+    `summary` must name the thing and its path, so the first line of the
+    failure is "examples/fixtures/node-ts/.env is missing (...)" rather than a
+    puzzle about which input went away.
+    """
+    if allowing_missing_fixtures():
+        case.skipTest(
+            "{0}=1 is set, so a fixture failure was downgraded to a skip: {1} "
+            "This override exists for local concurrent work only and must "
+            "never be set in CI.".format(ALLOW_MISSING_FIXTURES, summary))
+    case.fail(
+        "{0} The fixtures in examples/fixtures/ are ground truth; without "
+        "this one the test that needed it measures nothing, and would "
+        "otherwise pass by saying nothing. Restore it (see examples/fixtures/MANIFEST.json "
+        "and examples/fixtures/regen_git_history.sh). If another agent is "
+        "genuinely still landing it, set {1}=1 for your local run -- never "
+        "in CI.".format(summary, ALLOW_MISSING_FIXTURES))
+
+
 def require(case, path, what):
+    """Fail (or, under the opt-in, skip) when a fixture path is not there."""
     if not os.path.exists(path):
-        case.skipTest("{0} is absent ({1}); another agent may still be "
-                      "landing it".format(what, path))
+        fixture_unavailable(
+            case, "{0} is missing ({1}).".format(fixture_rel(path), what))
+    elif os.path.isfile(path) and os.path.getsize(path) == 0:
+        fixture_unavailable(
+            case, "{0} is malformed: it is an empty file ({1})."
+            .format(fixture_rel(path), what))
+
+
+# Files inside a fixture repository that this suite cannot run without, over
+# and above the repository directory itself. A present directory with the
+# load-bearing file deleted out of it is exactly the shape of the defect this
+# machinery exists to catch, so the directory check alone is not enough.
+REQUIRED_FIXTURE_FILES = {
+    "node-ts": (
+        (".env",
+         "MANIFEST item NODE-CONFIG-01, the planted production secrets that "
+         "make env_safety_check.py return UNSAFE for this fixture"),
+    ),
+}
+
+
+def require_repo(case, repo):
+    """Require a fixture repository *and* its load-bearing files."""
+    require(case, os.path.join(FIXTURES, repo), "fixture repository " + repo)
+    for relpath, what in REQUIRED_FIXTURE_FILES.get(repo, ()):
+        require(case, os.path.join(FIXTURES, repo, relpath), what)
 
 
 class ChainCase(unittest.TestCase):
@@ -163,13 +246,24 @@ class ChainCase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def manifest(self):
+        """The ground truth, or a loud failure -- never a quiet skip.
+
+        Both branches used to skip. An absent manifest is the missing-fixture
+        case; a schema mismatch is worse, because it means the ground truth on
+        disk is not the ground truth these tests read, and whispering that as
+        a skip turns a loud problem into silence.
+        """
         data = load_manifest()
         if data is None:
-            self.skipTest("examples/fixtures/MANIFEST.json is absent or "
-                          "unreadable; cannot check against ground truth")
+            fixture_unavailable(
+                self, "{0} is missing or unreadable (the fixtures' ground "
+                      "truth; nothing here can be checked against it)."
+                      .format(fixture_rel(MANIFEST_PATH)))
         if data.get("schema") != "testsquad.fixtures/1":
-            self.skipTest("MANIFEST.json is schema {0!r}, these tests read "
-                          "testsquad.fixtures/1".format(data.get("schema")))
+            fixture_unavailable(
+                self, "{0} is malformed: schema is {1!r}, these tests read "
+                      "'testsquad.fixtures/1'."
+                      .format(fixture_rel(MANIFEST_PATH), data.get("schema")))
         return data
 
     def write(self, relpath, text):
@@ -204,7 +298,7 @@ class SafetyGateTest(ChainCase):
     }
 
     def scan(self, repo):
-        require(self, os.path.join(FIXTURES, repo), "fixture " + repo)
+        require_repo(self, repo)
         subject = copy_repo(repo, self.tmp)
         proc = run_script("env_safety_check.py", subject)
         self.assertNotEqual(2, proc.returncode,
@@ -230,6 +324,82 @@ class SafetyGateTest(ChainCase):
             self.assertGreater(finding["line"], 0)
             self.assertTrue(finding["why"],
                             "a refusal with no rationale cannot be acted on")
+
+    # What MANIFEST.json's NODE-CONFIG-01 promises this fixture produces, in
+    # the manifest's own words: "3 CRITICAL: stripe_live_key,
+    # remote_database_url, external_hostname". Written out by hand rather than
+    # captured from a run, so a regression changes the result and not the
+    # expectation.
+    NODE_CRITICAL_DETECTORS = (
+        "external_hostname",
+        "remote_database_url",
+        "stripe_live_key",
+    )
+
+    def test_node_ts_produces_exactly_the_three_declared_critical_findings(self):
+        """The count *and* the identities, because `UNSAFE` is not the claim.
+
+        The assertions above are satisfied by any non-empty findings list whose
+        length equals `counts["CRITICAL"]` -- they check that the gate is
+        self-consistent, never that it found the three specific things this
+        fixture exists to contain. That gap was demonstrated, not theorised:
+        inserting `xxx` into the fixture's Stripe key (the mask pattern
+        MANIFEST.json explicitly warns maintainers about) dropped the detector
+        count from 3 to 2 and the suite stayed green. One of the three
+        detectors had stopped firing and nothing said so.
+
+        So: exactly three CRITICAL findings, carrying exactly the three
+        detector names the manifest declares, one each. Not a superset, not a
+        subset, and not three findings from the same detector.
+        """
+        _, result = self.scan("node-ts")
+        detectors = sorted(f["detector"] for f in result["findings"])
+        self.assertEqual(
+            list(self.NODE_CRITICAL_DETECTORS), detectors,
+            "node-ts must produce exactly the three CRITICAL findings "
+            "MANIFEST.json (NODE-CONFIG-01) declares. Expected {0}, got {1}. "
+            "A detector that stops firing here is a fixture that has silently "
+            "stopped testing what it was planted to test -- check the .env "
+            "for an accidental mask (3+ x's, 8+ zeros), which "
+            "env_safety_check.py suppresses by design."
+            .format(list(self.NODE_CRITICAL_DETECTORS), detectors))
+        self.assertEqual(
+            3, result["counts"]["CRITICAL"],
+            "counts.CRITICAL must agree with the three declared findings")
+        for severity in ("HIGH", "MEDIUM", "LOW"):
+            self.assertEqual(
+                0, result["counts"].get(severity, 0),
+                "NODE-CONFIG-01 declares CRITICAL findings only; a {0} "
+                "finding here is undeclared ground truth".format(severity))
+
+    def test_the_manifest_still_declares_the_three_detectors_this_asserts(self):
+        """Guards the hand-written expectation above against manifest drift.
+
+        If NODE-CONFIG-01 is ever rewritten to expect different detectors, the
+        test above would keep asserting the old ones and would read as passing
+        ground truth while disagreeing with the ground truth. Fails rather than
+        skips when the manifest is unreadable: this is a check *about* the
+        manifest, and `tests/test_fixture_manifest.py` makes an absent manifest
+        loud on its own.
+        """
+        manifest = load_manifest()
+        self.assertIsNotNone(
+            manifest, "examples/fixtures/MANIFEST.json is absent or "
+                      "unreadable; the expectation in this class cannot be "
+                      "cross-checked against ground truth")
+        declared = [item for item in manifest.get("items", [])
+                    if item.get("id") == "NODE-CONFIG-01"]
+        self.assertEqual(
+            1, len(declared),
+            "MANIFEST.json must carry exactly one NODE-CONFIG-01 item, "
+            "found {0}".format(len(declared)))
+        why = declared[0].get("why", "")
+        missing = [d for d in self.NODE_CRITICAL_DETECTORS if d not in why]
+        self.assertEqual(
+            [], missing,
+            "NODE-CONFIG-01 no longer names {0}. Either the manifest or this "
+            "test is stale -- reconcile them, do not assume which."
+            .format(missing))
 
     def test_python_pkg_is_safe(self):
         """python-pkg's .env.test points at localhost. Flagging it would be a
@@ -287,11 +457,14 @@ class RiskMapPrioritisationTest(ChainCase):
     """
 
     def build(self, repo, since=""):
-        require(self, os.path.join(FIXTURES, repo), "fixture " + repo)
+        require_repo(self, repo)
         subject = copy_repo(repo, self.tmp)
         if not os.path.isdir(os.path.join(subject, ".git")):
-            self.skipTest("fixture {0} has no git history; regenerate with "
-                          "examples/fixtures/regen_git_history.sh".format(repo))
+            fixture_unavailable(
+                self, "examples/fixtures/{0}/.git is missing (the fixture's "
+                      "git history is part of the fixture -- risk_map.py is "
+                      "scored against it -- and is rebuilt by "
+                      "examples/fixtures/regen_git_history.sh).".format(repo))
         proc = run_script("risk_map.py", subject, "--since", since)
         self.assertEqual(0, proc.returncode, proc.stderr)
         return json.loads(proc.stdout)
@@ -306,8 +479,11 @@ class RiskMapPrioritisationTest(ChainCase):
         for repo in REPOS:
             expected = (repos.get(repo) or {}).get("riskiest_file_expected")
             if not expected:
-                self.skipTest("MANIFEST.json has no riskiest_file_expected "
-                              "for " + repo)
+                fixture_unavailable(
+                    self, "examples/fixtures/MANIFEST.json is malformed: "
+                          "repos.{0} has no riskiest_file_expected, so the "
+                          "ranking this test exists to check has no ground "
+                          "truth.".format(repo))
             with self.subTest(repo=repo):
                 result = self.build(repo)
                 self.assertTrue(result["files"],
@@ -605,13 +781,16 @@ class FlakeSmellsManifestTest(ChainCase):
         return out
 
     def scan(self, repo, relpaths):
-        require(self, os.path.join(FIXTURES, repo), "fixture " + repo)
+        require_repo(self, repo)
         subject = copy_repo(repo, self.tmp, name=repo)
         paths = []
         for rel in relpaths:
             full = os.path.join(subject, rel)
             if not os.path.exists(full):
-                self.skipTest("{0}/{1} is absent".format(repo, rel))
+                fixture_unavailable(
+                    self, "examples/fixtures/{0}/{1} is missing (MANIFEST.json "
+                          "declares it, so the fixture and the ground truth "
+                          "disagree).".format(repo, rel))
             paths.append(full)
         proc = run_script("flake_smells.py", *paths)
         self.assertNotEqual(2, proc.returncode, proc.stderr)
@@ -634,7 +813,11 @@ class FlakeSmellsManifestTest(ChainCase):
         for repo in REPOS:
             expectations = self.expectations(repo)
             if not expectations:
-                self.skipTest("no weak-test items for " + repo)
+                fixture_unavailable(
+                    self, "examples/fixtures/MANIFEST.json declares no "
+                          "weak-test items for {0}, so this test would pass "
+                          "without checking a single planted defect."
+                          .format(repo))
             files = sorted({e[1] for e in expectations})
             _, found = self.scan(repo, files)
             for item_id, relfile, line, rule, severity in expectations:
@@ -672,7 +855,11 @@ class FlakeSmellsManifestTest(ChainCase):
                            if i.get("repo") == repo
                            and i.get("kind") == "good-test"})
             if not good:
-                self.skipTest("no good-test items for " + repo)
+                fixture_unavailable(
+                    self, "examples/fixtures/MANIFEST.json declares no "
+                          "good-test items for {0}, so the false-alarm half "
+                          "of this check has nothing to measure."
+                          .format(repo))
             with self.subTest(repo=repo):
                 result, found = self.scan(repo, good)
                 self.assertEqual(
@@ -692,7 +879,11 @@ class FlakeSmellsManifestTest(ChainCase):
         for repo in REPOS:
             expectations = self.expectations(repo)
             if not expectations:
-                self.skipTest("no weak-test items for " + repo)
+                fixture_unavailable(
+                    self, "examples/fixtures/MANIFEST.json declares no "
+                          "weak-test items for {0}, so this test would pass "
+                          "without checking a single planted defect."
+                          .format(repo))
             blocking = sorted({e[1] for e in expectations if e[4] == "block"})
             if not blocking:
                 continue
@@ -724,7 +915,10 @@ class FlakeSmellsManifestTest(ChainCase):
         expectations = [e for e in self.expectations("java-min")
                         if e[3] == "no-assertion"]
         if not expectations:
-            self.skipTest("no java no-assertion item in the manifest")
+            fixture_unavailable(
+                self, "examples/fixtures/MANIFEST.json declares no java-min "
+                      "no-assertion weak-test item, which is the ground truth "
+                      "this test is written against.")
         item_id, relfile, line, rule, _severity = expectations[0]
         _, found = self.scan("java-min", [relfile])
         lines = [f[0] for f in found.get(relfile, []) if f[1] == rule]
@@ -952,7 +1146,10 @@ class SessionContextBudgetTest(ChainCase):
                 shutil.copy(src, os.path.join(testing, name))
                 copied += 1
         if not copied:
-            self.skipTest("no knowledge templates to seed from")
+            fixture_unavailable(
+                self, "templates/knowledge/ is missing conventions.md and "
+                      "known-issues.md, the exact text a freshly started "
+                      "repository gets.")
         with open(os.path.join(testing, "profile.json"), "w",
                   encoding="utf-8") as fh:
             json.dump({"stack": "TypeScript / Vitest"}, fh)
@@ -1004,9 +1201,13 @@ class SchemaCompatibilityTest(ChainCase):
             with self.subTest(module=module_name):
                 try:
                     module = __import__(module_name)
-                except ImportError:
-                    self.skipTest("scripts/{0}.py is absent"
-                                  .format(module_name))
+                except ImportError as exc:
+                    self.fail(
+                        "scripts/{0}.py could not be imported ({1}). This is "
+                        "production code, not a fixture: a consumer keyed on "
+                        "its schema string has nothing to read, and skipping "
+                        "here would report that as a clean run."
+                        .format(module_name, exc))
                 self.assertEqual(
                     expected, getattr(module, "SCHEMA", None),
                     "{0}.SCHEMA changed; every consumer keyed on the old "
@@ -1017,8 +1218,7 @@ class SchemaCompatibilityTest(ChainCase):
         """A constant in the module is worth nothing if the builder forgets to
         put it in the payload. These are real runs, over real inputs, checked
         on the serialized bytes."""
-        require(self, os.path.join(FIXTURES, "python-pkg"),
-                "fixture python-pkg")
+        require_repo(self, "python-pkg")
         subject = copy_repo("python-pkg", self.tmp)
         out = os.path.join(self.tmp, "out")
         os.makedirs(out)
@@ -1034,8 +1234,8 @@ class SchemaCompatibilityTest(ChainCase):
              "testsquad.aridnodes/1"),
         )
         for script, args, expected in runs:
-            if not os.path.exists(os.path.join(SCRIPTS, script)):
-                continue
+            require(self, os.path.join(SCRIPTS, script),
+                    "the production script this chain step runs")
             with self.subTest(script=script):
                 proc = run_script(script, *args)
                 self.assertNotEqual(2, proc.returncode, proc.stderr)
@@ -1080,11 +1280,12 @@ class WholeChainTest(ChainCase):
 
     def setUp(self):
         super().setUp()
-        require(self, os.path.join(FIXTURES, "python-pkg"),
-                "fixture python-pkg")
+        require_repo(self, "python-pkg")
         self.repo = copy_repo("python-pkg", self.tmp)
         if not os.path.isdir(os.path.join(self.repo, ".git")):
-            self.skipTest("fixture python-pkg has no git history")
+            fixture_unavailable(
+                self, "examples/fixtures/python-pkg/.git is missing (rebuild "
+                      "it with examples/fixtures/regen_git_history.sh).")
         self.out = os.path.join(self.tmp, "artifacts")
         os.makedirs(self.out)
 
@@ -1182,10 +1383,71 @@ class WholeChainTest(ChainCase):
                   encoding="utf-8") as fh:
             json.dump({"stack": "Python / pytest",
                        "commands": {"test": "pytest -q"}}, fh)
-        context = run_script("session_context.py", home)
+        #    The consent record is the last link in the chain and it lives
+        #    OUTSIDE the repository, so it has to be seeded here exactly the
+        #    way /testsquad:start seeds it. Without it the hook is correctly
+        #    silent -- which is what this step used to be asserting against,
+        #    reading a working consent gate as a broken health fixture.
+        context = run_script("session_context.py", home, env=onboard(home))
         self.assertEqual(0, context.returncode, context.stderr)
         self.assertIn("AMBER", context.stdout)
         self.assertLessEqual(len(context.stdout), 2000)
+        self.assertEqual(
+            "", context.stderr,
+            "the hook read everything it was given; it must not also be "
+            "complaining on stderr")
+
+        # 6b. The same call without the consent record. The preamble is
+        #     withheld, and that is correct -- but an empty stdout alone is
+        #     indistinguishable from "this repo is fine", which is how the
+        #     failure above was misdiagnosed for a whole handoff. The reason
+        #     must be on stderr.
+        ungated = run_script("session_context.py", home)
+        self.assertEqual(0, ungated.returncode,
+                         "a hook that breaks session start is worse than a "
+                         "quiet one; the exit code stays 0")
+        self.assertEqual("", ungated.stdout,
+                         "the consent gate must still withhold the preamble")
+        self.assertNotEqual(
+            "", ungated.stderr,
+            "silent stdout AND silent stderr makes a withheld preamble look "
+            "exactly like a repo with nothing to report")
+        self.assertIn("onboard", ungated.stderr.lower())
+
+        # 6c. And the case the whole gate exists to keep honest: the health
+        #     baseline is there and unreadable. Saying nothing about it would
+        #     render exactly like a suite with no problems.
+        with open(os.path.join(testing, "health-baseline.json"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("{ truncated mid-write")
+        broken = run_script("session_context.py", home, env=onboard(home))
+        self.assertEqual(0, broken.returncode, broken.stderr)
+        self.assertNotEqual("", broken.stdout,
+                            "an unreadable health baseline must not silence "
+                            "the whole preamble")
+        self.assertIn("could not be read", broken.stdout)
+        self.assertNotIn("AMBER", broken.stdout,
+                         "it must not report a verdict it could not read")
+        self.assertIn("health-baseline.json", broken.stderr)
+
+        # 6d. And the sharpest case of all: the hook crashes. It must still
+        #     exit 0 -- a hook that breaks session start is worse than a quiet
+        #     one -- but exit 0 with nothing on either stream is a crash
+        #     wearing the costume of a clean repo. A profile.json holding a
+        #     JSON array is a real, documented way to make build() raise.
+        with open(os.path.join(testing, "profile.json"), "w",
+                  encoding="utf-8") as fh:
+            fh.write('["python"]')
+        crashed = run_script("session_context.py", home, env=onboard(home))
+        self.assertEqual(0, crashed.returncode,
+                         "the session must still start")
+        self.assertEqual("", crashed.stdout)
+        self.assertNotEqual(
+            "", crashed.stderr,
+            "a crash that prints nothing at all is indistinguishable from a "
+            "repo with nothing to report")
+        self.assertIn("AttributeError", crashed.stderr,
+                      "the stderr note must name what actually went wrong")
 
     def test_the_repository_is_unchanged_after_the_whole_chain(self):
         """Nothing in this chain may dirty a user's repository: not an
@@ -1205,8 +1467,8 @@ class WholeChainTest(ChainCase):
             ("arid_nodes.py", (os.path.join(self.repo, "shop"),)),
             ("session_context.py", (self.repo,)),
         ):
-            if not os.path.exists(os.path.join(SCRIPTS, script)):
-                continue
+            require(self, os.path.join(SCRIPTS, script),
+                    "the production script this chain step runs")
             proc = run_script(script, *args, cwd=self.repo)
             self.assertNotEqual(2, proc.returncode,
                                 "{0} failed: {1}".format(script, proc.stderr))
@@ -1226,13 +1488,273 @@ class WholeChainTest(ChainCase):
         than in a confusing eval failure days later."""
         for repo in REPOS:
             path = os.path.join(FIXTURES, repo)
-            if not os.path.isdir(os.path.join(path, ".git")):
-                continue
+            require(self, os.path.join(path, ".git"),
+                    "the fixture's git history, rebuilt by "
+                    "examples/fixtures/regen_git_history.sh")
             with self.subTest(repo=repo):
                 self.assertEqual(
                     "", git(path, "status", "--porcelain").stdout,
                     "examples/fixtures/{0} is dirty -- a test wrote to the "
                     "real fixture instead of a copy".format(repo))
+
+
+# --------------------------------------------------------------------------
+# chain 9 -- the policy itself: a missing fixture must never read as success
+# --------------------------------------------------------------------------
+
+def probe_case():
+    """A throwaway TestCase to point the fixture helpers at.
+
+    The helpers end the *calling* case, so they cannot be called on `self` --
+    the test would die of the thing it is trying to observe. The probe absorbs
+    the failure and lets us read the message.
+
+    `unittest.TestCase("run")` rather than a subclass of our own: a subclass
+    carrying a `runTest` method is collected by the loader as a test that
+    asserts nothing and can never fail, which is precisely the thing this
+    project exists to stop shipping.
+    """
+    return unittest.TestCase("run")
+
+
+class FixtureAvailabilityPolicyTest(unittest.TestCase):
+    """`require()` and `manifest()` used to call `skipTest()` when a fixture
+    was absent. That is how `examples/fixtures/node-ts/.env` -- the file whose
+    entire purpose is to make the safety gate say UNSAFE -- stayed missing
+    from every clone while this suite reported success.
+
+    These tests pin the replacement policy in both directions: FAIL by
+    default, and skip *audibly* under the documented opt-in. Without them the
+    old behaviour could come back as a one-word edit, and the symptom would
+    again be a quiet green run.
+    """
+
+    def setUp(self):
+        self.probe = probe_case()
+        self.override(None)
+
+    def override(self, value):
+        """Set (or clear) the escape hatch for this test only."""
+        previous = os.environ.get(ALLOW_MISSING_FIXTURES)
+
+        def restore():
+            if previous is None:
+                os.environ.pop(ALLOW_MISSING_FIXTURES, None)
+            else:
+                os.environ[ALLOW_MISSING_FIXTURES] = previous
+
+        self.addCleanup(restore)
+        if value is None:
+            os.environ.pop(ALLOW_MISSING_FIXTURES, None)
+        else:
+            os.environ[ALLOW_MISSING_FIXTURES] = value
+
+    def expect_failure(self, call, *args):
+        """Call a helper that must FAIL, and hand back the failure message.
+
+        `assertRaises(AssertionError)` is not enough here. If the helper
+        *skips* instead of failing, the SkipTest escapes the context manager
+        and unittest records this very test as skipped -- the regression test
+        for an unwanted skip, disappearing into a skip. That is not a
+        theory: reverting `case.fail(...)` to `case.skipTest(...)` in
+        `fixture_unavailable()` left this class reporting "OK (skipped=10)".
+        """
+        label = getattr(call, "__name__", str(call))
+        try:
+            call(*args)
+        except unittest.SkipTest as exc:
+            self.fail("{0}() skipped instead of failing with the opt-in "
+                      "unset. A skip is silence: {1}".format(label, exc))
+        except AssertionError as exc:
+            return str(exc)
+        self.fail("{0}() neither failed nor skipped on an unavailable "
+                  "fixture".format(label))
+
+    def absent(self):
+        return os.path.join(self.probe_dir(), "node-ts", ".env")
+
+    def probe_dir(self):
+        root = tempfile.mkdtemp(prefix="testsquad-policy-")
+        self.addCleanup(shutil.rmtree, root, True)
+        os.makedirs(os.path.join(root, "node-ts"))
+        return root
+
+    # -- fail by default ---------------------------------------------------
+
+    def test_a_missing_fixture_fails_and_names_the_path(self):
+        """The whole point. A reader must get the path, not a puzzle."""
+        # A path under the real fixtures tree that is not there, so the
+        # message is rendered exactly as a reader would see it for a genuinely
+        # absent .env -- repo-relative, not an absolute temp path.
+        missing = os.path.join(FIXTURES, "node-ts", ".env.absent-in-this-test")
+        message = self.expect_failure(
+            require, self.probe, missing, "MANIFEST item NODE-CONFIG-01")
+        self.assertIn(
+            "examples/fixtures/node-ts/.env.absent-in-this-test is missing",
+            message, "the failure must name the path verbatim, relative to "
+                     "the repository root")
+        self.assertIn("NODE-CONFIG-01", message,
+                      "the failure must name the manifest item")
+
+    def test_a_missing_fixture_points_at_the_escape_hatch(self):
+        """A hard failure with no way forward gets worked around badly. The
+        message has to say the hatch exists *and* that CI may not use it."""
+        message = self.expect_failure(
+            require, self.probe, self.absent(), "the planted .env")
+        self.assertIn(ALLOW_MISSING_FIXTURES, message)
+        self.assertIn("never", message.lower())
+        self.assertIn("CI", message)
+
+    def test_an_empty_fixture_file_is_malformed_and_fails(self):
+        """Present but empty is the same defect wearing a filename: the
+        scanner reads it, finds nothing, and reports a clean bill of health."""
+        path = os.path.join(self.probe_dir(), "node-ts", ".env")
+        with open(path, "w", encoding="utf-8"):
+            pass
+        message = self.expect_failure(
+            require, self.probe, path, "the planted .env")
+        self.assertIn("is malformed", message)
+        self.assertIn("node-ts/.env", message)
+
+    def test_the_node_env_is_a_declared_requirement_of_its_repository(self):
+        """`require_repo` must check the file, not just the directory. The
+        directory was always there; the .env was the thing that was not."""
+        required = [rel for rel, _ in REQUIRED_FIXTURE_FILES.get("node-ts", ())]
+        self.assertIn(".env", required,
+                      "node-ts/.env (NODE-CONFIG-01) must be required "
+                      "explicitly, or a fixture repository missing it reads "
+                      "as available")
+
+    def test_require_repo_fails_when_only_the_declared_file_is_missing(self):
+        """End to end through the wiring an integration test actually calls,
+        with a fixtures root whose node-ts/ exists but is empty."""
+        fake_root = self.probe_dir()
+        real_fixtures = globals()["FIXTURES"]
+        globals()["FIXTURES"] = fake_root
+        self.addCleanup(globals().__setitem__, "FIXTURES", real_fixtures)
+        message = self.expect_failure(require_repo, self.probe, "node-ts")
+        self.assertIn("node-ts/.env is missing", message)
+
+    def test_a_malformed_manifest_schema_fails_rather_than_whispering(self):
+        """A schema mismatch means the ground truth on disk is not the ground
+        truth these tests read. That is a loud problem; it used to skip."""
+        path = os.path.join(self.probe_dir(), "MANIFEST.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"schema": "testsquad.fixtures/99", "items": []}, fh)
+        real = globals()["MANIFEST_PATH"]
+        globals()["MANIFEST_PATH"] = path
+        self.addCleanup(globals().__setitem__, "MANIFEST_PATH", real)
+        message = self.expect_failure(ChainCase("run").manifest)
+        self.assertIn("is malformed", message)
+        self.assertIn("testsquad.fixtures/99", message)
+
+    # -- the escape hatch --------------------------------------------------
+
+    def test_the_override_restores_the_skip(self):
+        self.override("1")
+        with self.assertRaises(unittest.SkipTest):
+            require(self.probe, self.absent(), "the planted .env")
+
+    def test_an_overridden_skip_names_the_variable_and_the_fixture(self):
+        """A silent skip under an override is the same defect wearing a
+        permission slip. The reason has to be distinguishable from an
+        ordinary skip at a glance."""
+        self.override("1")
+        with self.assertRaises(unittest.SkipTest) as caught:
+            require(self.probe, self.absent(), "MANIFEST item NODE-CONFIG-01")
+        reason = str(caught.exception)
+        self.assertIn(ALLOW_MISSING_FIXTURES, reason,
+                      "an overridden skip must name the variable that caused "
+                      "it, or it reads as an ordinary skip")
+        self.assertIn("node-ts/.env is missing", reason,
+                      "an overridden skip must still name what is missing")
+        self.assertIn("never be set in CI", reason)
+
+    def test_only_the_documented_value_engages_the_override(self):
+        """Fail closed. Anything other than the documented `1` -- including
+        the unset case, `0`, and an empty string -- leaves the gate on."""
+        for value in (None, "", "0", "no", "false"):
+            with self.subTest(value=value):
+                self.override(value)
+                self.assertFalse(
+                    allowing_missing_fixtures(),
+                    "{0}={1!r} must not disable the fixture gate"
+                    .format(ALLOW_MISSING_FIXTURES, value))
+                self.expect_failure(
+                    require, self.probe, self.absent(), "the planted .env")
+
+    # -- it cannot quietly revert ------------------------------------------
+
+    def test_every_skip_in_this_module_goes_through_the_opt_in(self):
+        """Source-level guard. One `self.skipTest("fixture absent")` added
+        back anywhere in this file would restore the exact silence that hid
+        NODE-CONFIG-01, and no behavioural test would notice."""
+        source = read_text(os.path.abspath(__file__))
+        tree = ast.parse(source)
+        allowed = None
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.FunctionDef)
+                    and node.name == "fixture_unavailable"):
+                allowed = (node.lineno, node.end_lineno)
+        self.assertIsNotNone(
+            allowed, "fixture_unavailable() is gone; the fixture policy is "
+                     "no longer enforced anywhere in this module")
+        offenders = []
+        for node in ast.walk(tree):
+            name = None
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Attribute):
+                    name = func.attr
+                elif isinstance(func, ast.Name):
+                    name = func.id
+            elif isinstance(node, ast.Raise) and node.exc is not None:
+                exc = node.exc
+                target = exc.func if isinstance(exc, ast.Call) else exc
+                if isinstance(target, ast.Attribute):
+                    name = target.attr
+                elif isinstance(target, ast.Name):
+                    name = target.id
+            if name in ("skipTest", "SkipTest", "skip", "skipIf",
+                        "skipUnless"):
+                if not allowed[0] <= node.lineno <= allowed[1]:
+                    offenders.append("line {0}: {1}".format(node.lineno, name))
+        self.assertEqual(
+            [], offenders,
+            "a skip outside fixture_unavailable() is silence that looks like "
+            "success; route it through the helper so it fails by default and "
+            "says {0} when it does not: {1}"
+            .format(ALLOW_MISSING_FIXTURES, offenders))
+
+    def test_no_ci_workflow_sets_the_override(self):
+        """The hatch is for a human running the suite next to another agent.
+        A CI job that sets it turns every missing fixture back into a green
+        run -- which is the failure mode this whole policy exists to end.
+
+        Both locations are checked because the workflow is parked at
+        `templates/ci/github-ci.yml` and moves to `.github/workflows/`.
+        """
+        candidates = []
+        for directory in (os.path.join(ROOT, "templates", "ci"),
+                          os.path.join(ROOT, ".github", "workflows")):
+            if not os.path.isdir(directory):
+                continue
+            for name in sorted(os.listdir(directory)):
+                if name.endswith((".yml", ".yaml")):
+                    candidates.append(os.path.join(directory, name))
+        self.assertTrue(
+            candidates,
+            "no CI workflow found in templates/ci/ or .github/workflows/; "
+            "this check cannot confirm the override is unset, and reporting "
+            "that as a pass would be the silence this module exists to end")
+        for path in candidates:
+            with self.subTest(workflow=fixture_rel(path)):
+                self.assertNotIn(
+                    ALLOW_MISSING_FIXTURES, read_text(path),
+                    "{0} mentions {1}. CI must never set it: in CI there is "
+                    "no other agent landing a fixture, so an absent fixture "
+                    "is a hard error, not a race."
+                    .format(fixture_rel(path), ALLOW_MISSING_FIXTURES))
 
 
 if __name__ == "__main__":

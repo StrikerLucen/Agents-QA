@@ -50,9 +50,22 @@ These are not style preferences. Each one exists because its absence caused a re
 defect in this repo, and most were caught by the project's own tools.
 
 - **Prove the test can fail.** After it passes, break the production code it covers,
-  confirm it goes red, restore. Use **absolute paths and verify the restore** — one
-  agent's entire mutation run was silently invalidated by a failed `cp`. Tests that
-  passed while being unable to fail have been found here repeatedly.
+  confirm it goes red, restore. The order is **purge bytecode → mutate → run →
+  restore → verify by SHA-256**, using absolute paths throughout. All three steps
+  exist because skipping one has silently invalidated a mutation run here:
+  - a failed `cp` left the mutant in place, and nobody checked;
+  - a stale `__pycache__` served the *pre-mutation* bytecode, so the mutant reported
+    GREEN while SHA-256 said the restore was byte-perfect. Three agents hit this
+    independently in one session. One mutant had an identical file size and was
+    restored inside the same clock second, so the `.pyc` mtime+size validity check
+    passed and the test went on running the mutant. **Hash-verifying the restore is
+    necessary but not sufficient** — `rm -rf scripts/__pycache__ tests/__pycache__`
+    before *every* invocation, and pass `-B`.
+  - **Include a control mutant**: a comment-only edit that changes the file's hash
+    and nothing else. It must stay GREEN. Without it you cannot distinguish a blind
+    test from a mutation that did nothing, and a no-op mutant reads exactly like a
+    coverage gap. One was nearly misdiagnosed as a blind test for this reason.
+  Tests that passed while being unable to fail have been found here repeatedly.
 - **Never state a number you did not measure.** `null` / "not measured" is a valid
   answer; `0` is not. Several of the worst bugs found here were a malformed input
   rendering as a confident, wrong number.

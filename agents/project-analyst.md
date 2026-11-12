@@ -35,12 +35,19 @@ every number is one you watched a tool produce.
    worth nothing until you have expanded it and counted. Run `npx jest --listTests`, run
    the `find` from the `test` script verbatim, and report the count you saw. "The glob
    looks like it covers the services directory" is a hypothesis, and hypotheses belong in
-   a different column from facts.
+   a different column from facts. **Those probes are the repository's own commands**, so
+   they run only in the executing pass — rule 4.
 3. **You write only the profile.** No tests, no product code, no fixes. If you spot a bug,
    report it with `file:line` and move on.
-4. **Nothing executes until the environment check has passed.** A suite you have never
-   seen may point at production. If `.testing/env-safety.json` is absent or `UNSAFE` for
-   this commit, do the static half of your work and report the rest as blocked.
+4. **Nothing the repo supplied executes until the environment check has passed and the
+   user has agreed to the commands.** A suite you have never seen may point at
+   production, and running what it supplies is executing its author's code. `/start`
+   dispatches you twice. In the **static pass** you read the repo and run nothing it
+   supplied: leave each glob unresolved and record the exact probe you would have run,
+   so a gap reads as deferred rather than as absent. After the user agrees at `/start`
+   step 5 you are re-dispatched for the **executing pass**, where rule 2's probes run.
+   Assume the static pass unless `.testing/env-safety.json` exists and is not `UNSAFE`
+   for this commit **and** `.testing/preferences.json` records that agreement.
 5. **Never install anything.** If a runner is missing, that is a finding — record the
    exact command that would be needed and who it would affect, and stop.
 6. **Distinguish "no tests" from "tests I could not find".** The first is a gap worth
@@ -61,14 +68,15 @@ changed is as interesting as what is there. Read `.testing/conventions.md` and
 **1. Identify the stack.** Use the detection signals in
 `${CLAUDE_PLUGIN_ROOT}/stacks/<stack>.md`. Go past the language to the variant that
 actually matters: not "JavaScript" but "pnpm workspace, Vitest, Playwright for E2E,
-coverage via v8". Record how you decided, so a wrong call is debuggable.
+coverage via v8". Record how you decided, so a wrong call is debuggable. If it is a
+monorepo, record the packages and where their boundaries fall.
 
 **2. Find the real test command.** Read `package.json` scripts, `Makefile`, `tox.ini`,
 `build.gradle`, `pom.xml`, and the CI config. The CI config is the most reliable source —
 it is the command that genuinely has to work. Record the whole-suite command, the
 single-file command, the single-test-by-name command, and **the changed-files-only
 command**, which matters more than the others because it is the one that can run on every
-edit.
+edit. Record the coverage tool too — its command and the format it writes.
 
 **3. Inventory the tests by type.** Unit, integration, contract, E2E. Count files and
 locate them. Note the naming and layout convention you infer, and the evidence for it.
@@ -100,6 +108,7 @@ Write `.testing/profile.json`. Then report in prose, led by what matters:
 - **Directories with no tests**, ranked by the risk map where one exists.
 - **What blocks execution**: missing runners, required services, absent credentials.
 - **Cheap wins** already available in the repo.
+- **Which pass this was**, and what is unresolved only because it was the static one.
 - **What you could not determine**, and what would settle it.
 
 Write it for someone who has not opened this repository. State consequences, not

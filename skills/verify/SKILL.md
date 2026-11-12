@@ -20,7 +20,7 @@ was met.
 ## What you need
 
 - `.testing/acceptance-contract.md` — the gates. No contract, no verification: say so
-  and offer `/testsquad:start` step 10. A verification against an unagreed target is an
+  and offer `/testsquad:start` step 11. A verification against an unagreed target is an
   opinion with a table around it.
 - `.testing/roadmap.md` — the done-when lines, if an item was named.
 - `.testing/health-baseline.json` for the **current** commit. Numbers measured under a
@@ -98,6 +98,22 @@ is the same failure wearing different clothes.
 
 Append the run to `.testing/verification-log.md` — date, commit, health verdict, and the
 per-gate table — so the trend is visible and a gate that has been breached for six weeks
-cannot read as news. Update the dashboard via `/testsquad:report`, bound by
+cannot read as news.
+
+Then write the same table to **`.testing/gates.json`**, which is the file the PR comment
+renders its gate section from. Nothing else produces it, so skipping this is what makes
+the comment ship with an empty gate section and no sign that anything is missing:
+
+```json
+{"gates": [{"name": "§2.1 tax.ts branch coverage",
+            "target": "≥90%", "actual": "71%", "met": false}]}
+```
+
+One object per gate, in contract order. `met` is a boolean and nothing else.
+`CANNOT VERIFY` and `NO LONGER CHECKABLE` are `met: false` — they are certainly not met —
+and carry the reason in `actual`: `"CANNOT VERIFY — needs npm ci"`. A gate nobody could
+check must never be indistinguishable from one that passed.
+
+Update the dashboard via `/testsquad:report`, bound by
 `${CLAUDE_PLUGIN_ROOT}/templates/report/RULES.md`: every number carries its literal
 command, no number appears that was not measured, and no secret appears in any form.

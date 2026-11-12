@@ -23,12 +23,13 @@ finding must be actionable, its reasoning obvious, and it must arrive in the wor
 ## Binding
 
 `${CLAUDE_PLUGIN_ROOT}/templates/report/STYLE.md` is binding, not advisory. Its 13-point
-review checklist runs against your draft **before publishing**, and a `no` on any line
-blocks publication. Do not reproduce its rules here; read them and comply. The ones most
-often broken: one verdict sentence of ≤25 words at the very top, symptom headlines with
-no file paths or exception names, ≤10 items in the top section, emphasis on no more than
-`max(2, floor(0.30 × rows))` of the rows, a literal command under every number, and
-bugs (product) separated from issues (testing) in two lists with two counts.
+review checklist runs against the draft **before publishing**, and a `no` on any line
+blocks publication. The `reporter` agent reads it and complies; you check the result
+before it ships. The lines most often broken: one verdict sentence of ≤25 words at the
+very top, symptom headlines with no file paths or exception names, ≤10 items in the top
+section, emphasis on no more than `max(2, floor(0.30 × rows))` of the rows, a literal
+command under every number, and bugs (product) separated from issues (testing) in two
+lists with two counts.
 
 ## `--pr` — the PR comment, which is deterministic
 
@@ -37,8 +38,8 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pr_comment.py" \
   --testing-dir .testing --out .testing/reports/pr-comment.md
 ```
 
-**No LLM runs in this path.** The comment is rendered by that script, standard library
-only, from files on disk — so the same inputs always produce the same comment. A comment
+**No LLM runs in this path, and the `reporter` agent is not dispatched on it.** The
+comment is rendered by that script, standard library only, from files on disk — so the same inputs always produce the same comment. A comment
 whose contents depend on a model call is not reproducible, cannot be diffed between
 pushes, and cannot be trusted as a gate. It is also the only version that is safe on
 forks: a pull request from a fork must never be able to make a model read
@@ -46,12 +47,17 @@ attacker-controlled text with repository credentials in scope.
 
 It contains exactly four things:
 
-| Section | Source | Shape |
+| Section | File it reads, and what writes it | Shape |
 |---|---|---|
-| Contract gates | `.testing/verification-log.md` | One line per gate: pass / fail, value vs target |
-| Coverage delta on **changed files only** | `.testing/coverage-raw.json`, current vs base | `src/billing/tax.ts 71% → 83% (+12)` |
-| New **REPRODUCED** findings | the run's findings | Count plus severity breakdown. ✅ and 👁 only |
-| Health verdict | `.testing/health-baseline.json` | GREEN / AMBER / RED, with its commit |
+| Contract gates | `.testing/gates.json` — `/testsquad:verify` | One row per gate: name, target, actual, met |
+| Coverage delta on **changed lines only** | `.testing/coverage-diff.json` — `/testsquad:diagnose` | `Lines 83.0% / base 71.0% / +12.0 pts` |
+| New **REPRODUCED** findings | `.testing/findings.json` — `/testsquad:test` or `:debug` | Count plus severity breakdown. ✅ and 👁 only |
+| Health verdict | `.testing/health-baseline.json` — `/testsquad:health` | GREEN / AMBER / RED, with its commit |
+
+Those four filenames are the script's, not a convention you may restyle: it opens exactly
+them under `--testing-dir`. A file it cannot find is named in the comment as missing,
+with the command that produces it — so an incomplete run says so instead of looking
+clean. If you find yourself about to explain a blank section, write the missing file.
 
 And nothing else. Specifically **never**:
 
@@ -86,7 +92,14 @@ did not ask you to comment on.
 
 ## Default — the dashboard
 
-Render `.testing/reports/dashboard-<date>.html` from
+**Dispatch the `reporter` agent.** Assembling the dashboard is its whole job: it is bound
+to `STYLE.md`, it separates reproduced bugs from unreproduced issues, it clusters by root
+cause, and it tracks which checks produce findings nobody acts on. Hand it the run's
+findings and the paths under `.testing/` they came from. Keep for yourself anything that
+needs the user — it cannot prompt, and it has no `Bash`, so it measures nothing and
+publishes nothing.
+
+It renders `.testing/reports/dashboard-<date>.html` from
 `${CLAUDE_PLUGIN_ROOT}/templates/report/dashboard.html`, in the fixed section order:
 verdict, what changed since the last report, top actions, the capped findings queue,
 coverage and health, exploratory charters, collapsed appendix.

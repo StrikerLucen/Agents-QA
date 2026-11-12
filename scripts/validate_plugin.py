@@ -40,6 +40,11 @@ class Report:
     def __init__(self) -> None:
         self.errors: list[str] = []
         self.warnings: list[str] = []
+        # Components we have no verdict about. "I could not read it" is not
+        # the same statement as "it is wrong", and neither is the same as
+        # "it is fine" -- a validator that blurs those three has told you
+        # nothing while sounding like it told you something.
+        self.unvalidated: list[str] = []
         self.checked = 0
 
     def error(self, where: str, message: str) -> None:
@@ -47,6 +52,26 @@ class Report:
 
     def warn(self, where: str, message: str) -> None:
         self.warnings.append(f"{where}: {message}")
+
+    def cannot_validate(self, where: str, message: str) -> None:
+        """No verdict for this component, and that is itself a failure.
+
+        Recorded in errors as well, so the run fails exactly as hard as it
+        would for a component known to be broken: an unknown verdict that
+        exits 0 is how a broken component ships.
+        """
+        entry = f"{where}: {message}"
+        self.unvalidated.append(entry)
+        self.errors.append(entry)
+
+
+class Unreadable(Exception):
+    """The bytes of a component could not be obtained at all.
+
+    Distinct from "the bytes were obtained and are wrong": raised only by the
+    open() in read_text(), and always turned into a per-component
+    cannot_validate() by whoever asked for the file.
+    """
 
 
 def read_text(path: str) -> str:
@@ -58,9 +83,18 @@ def read_text(path: str) -> str:
     the components that were fine. utf-8-sig drops a BOM, errors="replace"
     keeps the undecodable bytes visible as U+FFFD, and whatever is wrong with
     the file then shows up as an error about that file alone.
+
+    The open() itself is the other half. A component that is a directory, a
+    broken symlink, a symlink loop or simply mode 000 raised OSError straight
+    out of whichever check asked for it -- and for check_context_budget() that
+    one file cost every other component its budget verdict. Callers catch
+    Unreadable per file and carry on to the next one.
     """
-    with open(path, "rb") as fh:
-        raw = fh.read()
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        raise Unreadable(str(exc)) from exc
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         text = raw.decode("utf-16", errors="replace")
     else:
@@ -190,12 +224,19 @@ def check_marketplace(root: str, plugin_name: str | None, r: Report) -> None:
         where = f"marketplace.json plugins[{i}]"
         if not isinstance(entry, dict):
             r.error(where, "entry is not an object"); continue
-        if not entry.get("name"):
+        entry_name = entry.get("name")
+        if not entry_name:
             r.error(where, "'name' is required")
-        elif entry["name"] in seen:
-            r.error(where, f"duplicate plugin name {entry['name']!r}")
+        elif not isinstance(entry_name, str):
+            # `entry["name"] in seen` raised TypeError on an unhashable name
+            # (a JSON array or object), and that one entry cost every later
+            # entry its check. The field is simply the wrong type; say so.
+            r.error(where, f"'name' must be a string, not a "
+                           f"{type(entry_name).__name__}: {entry_name!r}")
+        elif entry_name in seen:
+            r.error(where, f"duplicate plugin name {entry_name!r}")
         else:
-            seen.add(entry["name"])
+            seen.add(entry_name)
 
         source = entry.get("source")
         if source is None:
@@ -219,7 +260,18 @@ def check_marketplace(root: str, plugin_name: str | None, r: Report) -> None:
 
 
 def check_markdown_component(path: str, expected_name: str, kind: str, r: Report) -> None:
-    text = read_text(path)
+    try:
+        text = read_text(path)
+    except Unreadable as exc:
+        r.cannot_validate(path, f"could not be read ({exc}); this component has "
+                                "no verdict — every other component was still checked")
+        return
+    if "\ufffd" in text:
+        # errors="replace" is what keeps one stray byte from costing the whole
+        # file, but a silent substitution is a file validated as something
+        # other than what is on disk. The loader will read the real bytes.
+        r.error(path, "contains bytes that are not valid UTF-8 (shown as U+FFFD); "
+                      "it was checked as the replaced text, not as written")
     parts = split_frontmatter(text)
     if parts is None:
         r.error(path, "missing or unterminated YAML frontmatter")
@@ -265,6 +317,12 @@ def check_hooks(root: str, r: Report) -> None:
             data = json.loads(fh.read().decode("utf-8-sig"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         r.error("hooks/hooks.json", f"malformed: {exc}")
+        return
+    except OSError as exc:
+        # Unreadable, or a directory of that name: the file exists as far as
+        # os.path.exists is concerned, so this is reached in a real checkout.
+        r.cannot_validate("hooks/hooks.json",
+                          f"could not be read ({exc}); the hooks have no verdict")
         return
     r.checked += 1
     # A hooks FILE needs the top-level "hooks" wrapper; only an inline object
@@ -332,11 +390,22 @@ EXEMPT = {
 
 
 def estimate_tokens(path: str) -> int:
-    return os.path.getsize(path) // 4
+    try:
+        return os.path.getsize(path) // 4
+    except OSError as exc:
+        # A broken symlink or a symlink loop in templates/ raised out of the
+        # budget check and took the budgets of all 26 components with it.
+        raise Unreadable(str(exc)) from exc
 
 
 def check_context_budget(root: str, r: Report) -> None:
-    """Flag any loadable file that has grown past its ceiling."""
+    """Flag any loadable file that has grown past its ceiling.
+
+    Every loop below continues past a file it cannot read. The point of this
+    check is the *set* of components that are over budget; losing the set
+    because one entry is a dangling symlink is the failure this exists to
+    avoid.
+    """
     checks = [
         (os.path.join(root, "agents", "*.md"), BUDGETS["agents"], "agent"),
         (os.path.join(root, "skills", "*", "SKILL.md"), BUDGETS["skills"], "skill"),
@@ -350,7 +419,12 @@ def check_context_budget(root: str, r: Report) -> None:
             rel = os.path.relpath(path, root)
             if rel in EXEMPT:
                 continue
-            tokens = estimate_tokens(path)
+            try:
+                tokens = estimate_tokens(path)
+            except Unreadable as exc:
+                r.cannot_validate(rel, f"its size could not be read ({exc}); "
+                                       f"this {label} has no context-budget verdict")
+                continue
             if tokens > ceiling:
                 r.warn(rel, f"~{tokens:,} tokens of context for a {label}, "
                             f"over the {ceiling:,} budget -- trim it or move the "
@@ -364,8 +438,15 @@ def check_context_budget(root: str, r: Report) -> None:
         name = os.path.basename(path)
         if name == "project-analyst.md":
             continue
-        if "stacks/" in read_text(path):
-            r.warn(os.path.relpath(path, root),
+        rel = os.path.relpath(path, root)
+        try:
+            text = read_text(path)
+        except Unreadable as exc:
+            r.cannot_validate(rel, f"could not be read ({exc}); whether it reads a "
+                                   "stack playbook at task time is unknown")
+            continue
+        if "stacks/" in text:
+            r.warn(rel,
                    "reads a stack playbook at task time; it should read "
                    ".testing/profile.json, which /start already distilled")
 
@@ -381,9 +462,28 @@ def guarded(where: str, r: Report, fn, *args) -> object:
     try:
         return fn(*args)
     except Exception as exc:  # noqa: BLE001 - deliberately broad; see above
-        r.error(where, f"could not be checked ({type(exc).__name__}: {exc}); "
-                       "the rest of the plugin was still validated")
+        r.cannot_validate(where, f"could not be checked ({type(exc).__name__}: "
+                                 f"{exc}); the rest of the plugin was still validated")
         return None
+
+
+def check_skill_directories(root: str, r: Report) -> None:
+    """A skills/<name>/ with no SKILL.md matches no glob and so is invisible.
+
+    The run then passes while a skill the author believes they shipped will
+    never load. Not finding a component is a finding, not a non-event.
+    """
+    skills_dir = os.path.join(root, "skills")
+    if not os.path.isdir(skills_dir):
+        return
+    for entry in sorted(os.listdir(skills_dir)):
+        sub = os.path.join(skills_dir, entry)
+        if not os.path.isdir(sub) or entry.startswith("."):
+            continue
+        if not os.path.isfile(os.path.join(sub, "SKILL.md")):
+            r.error(f"skills/{entry}",
+                    "has no SKILL.md, so it will not load as a skill and no "
+                    "other check in this run looked at it")
 
 
 def validate(root: str) -> Report:
@@ -393,6 +493,7 @@ def validate(root: str) -> Report:
     guarded("hooks/hooks.json", r, check_hooks, root, r)
     guarded("layout", r, check_layout, root, r)
     guarded("context budget", r, check_context_budget, root, r)
+    guarded("skills layout", r, check_skill_directories, root, r)
 
     for path in sorted(glob.glob(os.path.join(root, "agents", "*.md"))):
         guarded(path, r, check_markdown_component,
@@ -418,20 +519,33 @@ def main(argv: list[str] | None = None) -> int:
     r = validate(args.root)
     for warning in r.warnings:
         print(f"warning: {warning}", file=sys.stderr)
+    # The components with no verdict are listed apart from the ones judged
+    # and found wrong. Folded into the error list they read as "this
+    # component is broken", when what happened is that nobody looked at it.
+    unknown = set(r.unvalidated)
     for error in r.errors:
-        print(f"error:   {error}", file=sys.stderr)
+        if error not in unknown:
+            print(f"error:   {error}", file=sys.stderr)
+    for item in r.unvalidated:
+        print(f"UNKNOWN: {item}", file=sys.stderr)
 
     if r.errors:
-        print(f"\nValidation failed: {len(r.errors)} error(s), "
+        judged_wrong = len(r.errors) - len(r.unvalidated)
+        print(f"\nValidation failed: {judged_wrong} error(s), "
+              f"{len(r.unvalidated)} component(s) could not be validated, "
               f"{len(r.warnings)} warning(s), {r.checked} component(s) checked.",
               file=sys.stderr)
         return 1
     if r.warnings and args.strict:
-        print(f"\nValidation failed under --strict: {len(r.warnings)} warning(s).",
+        print(f"\nValidation failed under --strict: {len(r.warnings)} warning(s), "
+              f"{len(r.unvalidated)} component(s) could not be validated.",
               file=sys.stderr)
         return 1
+    # The zero is said out loud on purpose: "nothing could not be validated"
+    # and "nothing was validated" must not both render as silence.
     print(f"Validation passed: {r.checked} component(s) checked, "
-          f"{len(r.warnings)} warning(s).")
+          f"{len(r.warnings)} warning(s), "
+          f"{len(r.unvalidated)} could not be validated.")
     return 0
 
 

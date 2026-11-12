@@ -388,10 +388,18 @@ Healthy: StrykerJS (v10.1.1), Stryker.NET (5.1.0), mutmut (3.8.0), cosmic-ray
 
 **Qodo Cover-Agent is abandoned.** The README carries *"This repository is no longer
 maintained"*, dated **2025-06-15**; last release v0.3.10, 2025-05-21; ~5.7k stars, AGPL-3.0.
-There is no canonical successor fork. The parent company raised a
-[$70M Series B on 30 March 2026](https://siliconangle.com/2026/03/30/ai-generated-code-verification-startup-qodo-raises-70m/)
-and pivoted to agentic code review — so popularity and funding say nothing about whether a
-tool is maintained. Read it as a reference implementation; do not depend on it.
+There is no canonical successor fork. The parent company raised a **$70M Series B on
+30 March 2026** — [Qodo's own announcement](https://www.qodo.ai/blog/qodo-70m-series-b-shift-to-artificial-wisdom/)
+is the primary source ("Today, we are thrilled to announce that Qodo has raised $70
+million in Series B funding, bringing total capital raised to $120 million"; led by
+Qumra Capital), corroborated independently by
+[TechCrunch](https://www.techcrunch.com/2026/03/30/qodo-bets-on-code-verification-as-ai-coding-scales-raises-70m/),
+[Globes](https://en.globes.co.il/en/article-1001538970) and
+[SiliconANGLE](https://siliconangle.com/2026/03/30/ai-generated-code-verification-startup-qodo-raises-70m/)
+— and pivoted to agentic code review, so popularity and funding say nothing about whether
+a tool is maintained. Read it as a reference implementation; do not depend on it.
+*Both halves re-verified against the repository README and the primary announcement on
+2026-11-12.*
 
 **Dead or dying — do not adopt:** `mutatest` (Python, last release 2022),
 `go-mutesting` (last commit 2021), and `gremlins` (Go, last commit 2026-03-30,

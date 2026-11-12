@@ -162,8 +162,26 @@ us uk ca de fr es mx br au jp cn eu nl it se no fi pl ru za ar cl pe ve
 gov edu mil
 """.split())
 
+# The bound on the outer group is load-bearing, not tidiness. `(label\.)+tld`
+# is a repeated group that can only fail at its very end, so on a dotted run
+# with no usable TLD the engine retries from every label and each retry walks
+# the rest of the run: cost grows with the SQUARE of the run length. Measured
+# on the unbounded version, at the MAX_HOST_SCAN_CHARS window it is capped to:
+# 1k chars 0.005s, 2k 0.022s, 4k 0.087s -- 4x per doubling. That 0.087s is
+# paid per LINE, and nothing bounds lines or files: an 800KB .env of such
+# lines measured 17.6s, a 2MB one extrapolates to ~45s, and ten of them to
+# minutes. This gate runs BEFORE the test command, so that is not a slow
+# failure, it is a hang -- and a hang is indistinguishable from working.
+# Python 3.9 has no possessive quantifiers, so the bound goes on the
+# quantifier. 126 is not a guess: RFC 1035 caps a hostname at 253 octets and
+# the shortest label costs two ("a."), so no resolvable name carries more
+# than 126 labels ahead of its TLD. Nothing a resolver would accept can reach
+# the bound, so the bound drops no host -- only the retry chain.
+MAX_HOST_LABELS = 126
+
 BARE_HOST_RE = re.compile(
-    r"\b((?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+([a-zA-Z]{2,24}))\b"
+    r"\b((?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)"
+    r"{1,%d}([a-zA-Z]{2,24}))\b" % MAX_HOST_LABELS
 )
 
 # The lookbehind is the whole point. Without it the engine retries the match
@@ -179,6 +197,33 @@ EMAIL_RE = re.compile(
     r"(?<![A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+"
     r"(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}"
 )
+
+# A ceiling that shortens its own input is only honest if it says so, and
+# MAX_HOST_LABELS is a ceiling. A dotted run with more components than
+# BARE_HOST_RE can span is matched from its LEFT edge, so the component the
+# engine lands on as the TLD is not the run's last one -- and when that
+# component is not a known TLD the whole run falls out of the report. "No
+# host here" and "I ran out of pattern" must not render the same. Nothing
+# resolvable can reach this (RFC 1035 again: 253 octets, so at most 126
+# two-octet labels before the TLD), so a hit is a generated blob rather than
+# a server -- but a generated blob is something this gate says out loud, not
+# something it swallows.
+#
+# The lookbehind is the guard EMAIL_RE uses, for the same reason: without it
+# `[A-Za-z0-9\-]+(?:\.[...]+)+` restarts at every offset of a dot-free run
+# and each restart walks the rest of it. Measured unanchored: 1k chars
+# 0.006s, 2k 0.025s, 4k 0.098s, 8k 0.427s -- 4x per doubling. Anchored to
+# run starts: 0.0003s on 16k, 0.0012s on 64k, i.e. linear.
+MAX_HOST_COMPONENTS = MAX_HOST_LABELS + 1  # labels plus the TLD
+
+DOTTED_RUN_RE = re.compile(r"(?<![A-Za-z0-9\-])[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+")
+
+
+def deepest_dotted_run(text: str) -> int:
+    """Components in the longest dot-separated run; 0 when there is none."""
+    return max((m.group().count(".") + 1 for m in DOTTED_RUN_RE.finditer(text)),
+               default=0)
+
 
 # Host matching (and only host matching) stops after this many characters of
 # a single value. A hostname is at most 253 characters by RFC 1035, so a value
@@ -622,6 +667,17 @@ def scan_value(key: str, value: str, *, file: str, line: int,
                 "so only its first "
                 f"{MAX_HOST_SCAN_CHARS} were checked for hostnames -- the rest "
                 "was NOT examined and may name a production server")
+        if deepest_dotted_run(stripped[:MAX_HOST_SCAN_CHARS]) > MAX_HOST_COMPONENTS:
+            # Same tiering, and the same reasoning, as host_scan_truncated
+            # above: not evidence of production, but not evidence of safety
+            # either, so it may not leave the verdict at SAFE.
+            add("HIGH" if context == "config" else "MEDIUM",
+                "host_labels_truncated",
+                f"this value holds a dotted run of more than "
+                f"{MAX_HOST_COMPONENTS} components, which is deeper than the "
+                "hostname matcher spans, so any name inside it was NOT fully "
+                "checked -- no resolvable hostname is this deep, but nothing "
+                "here can tell you what it is instead")
         prod = [h for h in hosts if is_prod_host(h)]
         if prod:
             add("CRITICAL", "production_hostname",

@@ -27,6 +27,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -734,10 +735,20 @@ class TestRobustness(unittest.TestCase):
         self.assertEqual(result["skipped_files"], [])
 
     def test_binary_file_is_skipped_not_crashed_on(self):
+        # Skipped is not clean. A .env the gate could not decode is exactly
+        # where a production target hides, so the skip raises a finding of
+        # its own rather than leaving the file out of the report in silence.
         result = scan_files({".env.bin": b"\x00\x01\x02binary\x00junk"})
-        self.assertEqual(result["findings"], [])
         self.assertEqual([s["file"] for s in result["skipped_files"]], [".env.bin"])
         self.assertNotIn(".env.bin", result["scanned_files"])
+        self.assertEqual(detectors(result), {"unreadable_config"})
+        unread = result["findings"][0]
+        self.assertEqual(unread["file"], ".env.bin")
+        self.assertEqual(unread["severity"], "HIGH")
+        self.assertIn("NOT checked", unread["why"])
+        # HIGH, so the verdict cannot come back SAFE on a file nobody read.
+        self.assertEqual(result["verdict"], "CAUTION")
+        self.assertTrue(esc.breaches(result, "high"))
 
     def test_skipped_files_are_reported_not_silently_counted_as_clean(self):
         # A .env the scanner could not read is exactly where the danger is.
@@ -747,6 +758,12 @@ class TestRobustness(unittest.TestCase):
     def test_oversized_file_is_skipped(self):
         result = scan_files({".env.huge": "A=1\n" * 600_000})
         self.assertEqual([s["file"] for s in result["skipped_files"]], [".env.huge"])
+        # A size ceiling that drops a file quietly is a cost control that has
+        # become a blind spot. Too big to read has to leave the report as
+        # "unknown", loudly -- never as SAFE.
+        self.assertEqual(detectors(result), {"unreadable_config"})
+        self.assertNotEqual(result["verdict"], "SAFE")
+        self.assertIn("ceiling", result["findings"][0]["why"])
 
     @unittest.skipIf(os.geteuid() == 0, "root can read anything")
     def test_unreadable_file_is_skipped_gracefully(self):
@@ -818,6 +835,150 @@ class TestRobustness(unittest.TestCase):
     def test_output_is_json_serializable_and_stable(self):
         result = scan_files({".env": f"STRIPE_SECRET_KEY={SECRET_STRIPE}\n"})
         self.assertEqual(json.loads(json.dumps(result)), result)
+
+
+# --------------------------------------------------------------------------
+# catastrophic backtracking
+# --------------------------------------------------------------------------
+
+def _seconds(call) -> float:
+    """Wall-clock cost of one call.
+
+    The clock is read here and nowhere near an assertion, and `started` is
+    never named in one, so this stays a measurement rather than the
+    `real-clock` smell our own flake gate blocks on.
+    """
+    started = time.perf_counter()
+    call()
+    return time.perf_counter() - started
+
+
+class TestPathologicalInputCannotHangTheGate(unittest.TestCase):
+    """Growth-curve regressions for the two superlinear regexes.
+
+    This gate runs BEFORE the test command, so a regex that goes quadratic
+    does not fail the run -- it stalls it, and a stall is indistinguishable
+    from "still working". That makes these timing assertions, which are
+    normally a smell, the only oracle that can see the defect at all.
+
+    The ceilings are deliberately far from both sides of the measured range
+    rather than tight, because a timing assertion with narrow headroom is a
+    flake, and a check that cries wolf gets switched off. Each one carries
+    the numbers it was set from. All measured on the machine of record,
+    2026-11-12, Python 3.14, best of three.
+    """
+
+    # "a.a.a....a_" -- a dotted run that can never end in a usable TLD, so
+    # every retry walks the whole remaining run. 32,769 characters.
+    HOST_PAYLOAD = "a." * 16384 + "_"
+    # A run of local-part characters with no "@" anywhere in it.
+    EMAIL_PAYLOAD = "a" * 65536
+
+    def test_email_stripping_does_not_backtrack_quadratically(self):
+        # EMAIL_RE without its leading lookbehind restarts at every offset of
+        # a local-part run and each restart scans to the end of it.
+        # Measured: fixed 0.0005s, unanchored 3.24s -- a 6,000x spread. The
+        # 1.0s ceiling sits ~2,000x above the fixed cost and ~3x below the
+        # broken one, so only the quadratic shape can reach it.
+        self.assertLess(
+            _seconds(lambda: esc.EMAIL_RE.sub(" ", self.EMAIL_PAYLOAD)), 1.0,
+            "EMAIL_RE has gone superlinear again -- check the lookbehind")
+
+    def test_bare_host_matching_does_not_backtrack_quadratically(self):
+        # BARE_HOST_RE is `(label\.)+tld`: a repeated group that can only
+        # fail at its very end, so an unbounded `+` retries from every label.
+        # Measured: fixed 0.084s, unbounded 5.88s -- a 70x spread. The 1.5s
+        # ceiling is ~18x above the fixed cost and ~4x below the broken one.
+        self.assertLess(
+            _seconds(lambda: esc.BARE_HOST_RE.findall(self.HOST_PAYLOAD)), 1.5,
+            "BARE_HOST_RE has gone superlinear again -- check MAX_HOST_LABELS")
+
+    def test_depth_counting_does_not_backtrack_quadratically(self):
+        # DOTTED_RUN_RE was added to keep the label bound honest, so it must
+        # not reintroduce the defect it reports on. Without its lookbehind it
+        # restarts at every offset of a dot-free run: measured 0.006s on 1k,
+        # 0.098s on 4k, 0.427s on 8k -- 4x per doubling, so ~1.7s on the
+        # 16,384-character payload below, against 0.0003s anchored. The 0.5s
+        # ceiling sits well inside that gap from both sides.
+        dot_free = "a" * 16384
+        self.assertLess(
+            _seconds(lambda: esc.deepest_dotted_run(dot_free)), 0.5,
+            "DOTTED_RUN_RE has gone superlinear -- check its lookbehind")
+        self.assertEqual(esc.deepest_dotted_run(dot_free), 0)
+
+    def test_a_file_of_pathological_lines_finishes_and_stays_loud(self):
+        # The per-line cost is what the bound actually buys: nothing caps how
+        # many lines a 2MB file holds, so a constant per line is the whole
+        # defence. Measured: 40 such lines 0.52s fixed, ~3.5s unbounded.
+        # The ceiling here is a hang detector, not a curve detector -- the two
+        # tests above own the curve -- so it is loose on purpose.
+        payload = "\n".join(f"A{i}=" + "a." * 2048 + "_" for i in range(40))
+        out = {}
+        with make_repo({".env": payload + "\n"}) as path:
+            elapsed = _seconds(lambda: out.__setitem__("result", esc.scan(path)))
+        result = out["result"]
+        self.assertLess(elapsed, 10.0, "the gate stalled on a pathological config")
+        # And it must not have gone quiet to get there: every one of the 40
+        # lines says, in the report, which part of it was never examined.
+        self.assertEqual(detectors(result),
+                         {"host_scan_truncated", "host_labels_truncated"})
+        self.assertEqual(len(result["findings"]), 80)
+        self.assertNotEqual(result["verdict"], "SAFE")
+
+    def test_a_value_past_the_host_scan_ceiling_is_reported_not_dropped(self):
+        # The tail nobody matched against is not a tail with no production
+        # host in it, and this is the case that proves it: the host is real,
+        # it is past the ceiling, and the report still refuses to say SAFE.
+        padding = "z" * (esc.MAX_HOST_SCAN_CHARS + 10)
+        result = scan_files({".env": f"BLOB={padding} api.prod.acme.com\n"})
+        self.assertIn("host_scan_truncated", detectors(result))
+        self.assertNotEqual(result["verdict"], "SAFE")
+        finding = [f for f in result["findings"]
+                   if f["detector"] == "host_scan_truncated"][0]
+        self.assertEqual(finding["severity"], "HIGH")
+        self.assertIn("NOT examined", finding["why"])
+
+    def test_the_label_bound_is_above_anything_dns_can_resolve(self):
+        # RFC 1035 caps a hostname at 253 octets and the shortest label costs
+        # two of them, so 126 labels is the ceiling of what a resolver will
+        # accept. The bound has to sit at or above that, or it would be
+        # shortening real hostnames rather than only the retry chain.
+        self.assertGreaterEqual(esc.MAX_HOST_LABELS, 126)
+        # Exactly at the bound: 126 labels and then the TLD.
+        deep = ".".join(["a"] * (esc.MAX_HOST_LABELS - 2) + ["prod", "acme", "com"])
+        self.assertEqual(deep.count(".") + 1, esc.MAX_HOST_COMPONENTS)
+        hosts, truncated = esc.real_hosts_in(deep, bare=True)
+        self.assertFalse(truncated)
+        self.assertEqual(hosts, [deep])
+        self.assertTrue(esc.is_prod_host(deep))
+        self.assertEqual(esc.deepest_dotted_run(deep), esc.MAX_HOST_COMPONENTS)
+
+    def test_a_run_too_deep_for_the_matcher_is_announced_not_dropped(self):
+        # Past the bound the matcher lands on a "TLD" that is not the run's
+        # last component, so the run can drop out of the host list entirely.
+        # That is the one thing a cost control may never do quietly.
+        too_deep = ".".join(["a"] * (esc.MAX_HOST_COMPONENTS + 4))
+        self.assertEqual(esc.real_hosts_in(too_deep, bare=True)[0], [])
+        result = scan_files({".env": f"BLOB={too_deep}\n"})
+        self.assertIn("host_labels_truncated", detectors(result))
+        self.assertNotEqual(result["verdict"], "SAFE")
+        finding = [f for f in result["findings"]
+                   if f["detector"] == "host_labels_truncated"][0]
+        self.assertEqual(finding["severity"], "HIGH")
+        self.assertIn("NOT fully", finding["why"])
+
+    def test_an_ordinary_hostname_never_trips_the_depth_report(self):
+        # The depth report is only tolerable because nothing real reaches it.
+        for value in ("api.prod.acme.com", "a.b.c.svc.cluster.local",
+                      "email-smtp.us-east-1.amazonaws.com", "localhost",
+                      "1.2.3.4", "db.internal.corp.example.co.uk"):
+            self.assertLessEqual(esc.deepest_dotted_run(value),
+                                 esc.MAX_HOST_COMPONENTS, value)
+
+    def test_a_deep_hostname_still_reaches_the_report(self):
+        deep = ".".join(["sub"] * 30 + ["prod", "acme", "com"])
+        result = scan_files({".env": f"API_URL=https://{deep}/v1\n"})
+        self.assertIn("production_hostname", detectors(result))
 
 
 if __name__ == "__main__":

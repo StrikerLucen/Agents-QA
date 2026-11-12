@@ -104,14 +104,55 @@ SCHEMA = "testsquad.aridnodes/1"
 # ceiling the file is REPORTED in skipped_files, never quietly dropped.
 MAX_FILE_BYTES = 2 * 1024 * 1024
 
+# The file ceiling above bounds nothing *within* a file, and this script had no
+# per-line bound at all. Measured on this machine before the cap, with the
+# whole file comfortably under MAX_FILE_BYTES:
+#
+#   one line of "x = a + a + a + ..."   100,000 chars   0.080s
+#                                       400,000 chars   RecursionError
+#                                                       (ast.parse, uncaught,
+#                                                        kills the whole run)
+#   one line of spaces inside assert    400,000 chars   0.113s
+#
+# Same number as flake_smells.MAX_LINE_CHARS, and for the same reason: no
+# hand-written source line is 2,000 characters wide, so a line that is, is
+# minified, generated or vendored -- and a mutation planner has nothing useful
+# to say about any of those. Line numbers and the file's line count are
+# unchanged, so every planned mutant still points where it did, and every
+# shortened line is REPORTED in truncated_lines. A planner that quietly
+# shortens its input would report "no mutants here" about code it never read,
+# which is indistinguishable from a genuinely unmutable file.
+MAX_LINE_CHARS = 2000
+
 
 # --------------------------------------------------------------------------
 # operators
 # --------------------------------------------------------------------------
 # Five operators, chosen because Google measured them, not because they are
-# elegant. `weight` is the selection weight when several apply to one line;
+# elegant. `weight` is the selection weight when several apply to one line.
+#
 # `productive` is the share of mutants of that kind developers judged worth
-# seeing, and is what the weights are derived from.
+# seeing. It is a MEASUREMENT, and it exists for exactly two of the five:
+# ROR (0.841) and UOI (0.745), from Petrovic et al., TSE 2021, which reports
+# productivity for those two operators and no others. docs/RESEARCH.md S20 is
+# honest about this -- the other three cells read "--".
+#
+# SBR, AOR and LCR therefore carry `productive=None`, meaning NOT MEASURED.
+# They previously carried 0.80, 0.79 and 0.78, which no study produced; they
+# sat between the two real endpoints in descending order of the weights beside
+# them, which is what interpolation looks like, and they read as measurements
+# because they sat next to measurements. None is the honest value here: this
+# project's rule is that "not measured" is a valid answer and a confident
+# wrong number is not.
+#
+# The weights are NOT derived from this column, and the old comment claiming
+# they were could not have been true -- SBR, AOR and LCR share weight=3.0
+# while the three deleted values were all different. The weights are a design
+# choice: ROR highest because it is the best-measured of the five, UOI lowest
+# because it is the worst, and the remaining three level in the middle
+# because there is no measurement to rank them by. Nothing reads this column
+# (the weighted draw in choose_operator() reads `weight` only), so the three
+# values never reached a user and changing them changes no behaviour.
 
 OPERATORS: dict[str, dict] = {
     "ROR": dict(
@@ -122,20 +163,20 @@ OPERATORS: dict[str, dict] = {
             "best of the five, so ties go here.",
     ),
     "SBR": dict(
-        weight=3.0, productive=0.80,
+        weight=3.0, productive=None,  # not measured; see note above
         what="delete the statement",
         why="Statement removal is ~68% of Google's generated mutants: it asks "
             "the bluntest useful question, 'does any test notice if this line "
             "never runs?'",
     ),
     "AOR": dict(
-        weight=3.0, productive=0.79,
+        weight=3.0, productive=None,  # not measured; see note above
         what="replace an arithmetic operator (+ with -, * with /)",
         why="Arithmetic mutants are cheap to understand and land directly on "
             "the calculations people care about most.",
     ),
     "LCR": dict(
-        weight=3.0, productive=0.78,
+        weight=3.0, productive=None,  # not measured; see note above
         what="replace a logical connector (and with or)",
         why="A flipped connector is how authorization and validation rules "
             "silently widen, and a test that cannot see it is a real gap.",
@@ -1326,11 +1367,28 @@ def _body_text(scan: FileScan, func: Func, line: int) -> str:
 
 
 def _single_statement_body(scan: FileScan, func: Func) -> int | None:
-    """The line number when the function's body is exactly one statement."""
-    body = [n for n in func.body
-            if n <= len(scan.code) and scan.code[n - 1].strip()
-            and scan.code[n - 1].strip() not in STRUCTURAL]
-    return body[0] if len(body) == 1 else None
+    """The line number when the function's body is exactly one statement.
+
+    Stops at the second statement rather than materialising the whole body.
+    It was a list comprehension over every line of the enclosing function,
+    called twice for every candidate line in that function, so one function
+    cost O(body^2): measured on a file well under MAX_FILE_BYTES, 8,005 lines
+    inside one function took 12.2s and 4,005 lines took 3.5s -- 2x the lines
+    for 3.5x the time. Extrapolated to a 2MB file of that shape, the file
+    ceiling permits roughly an hour and a half of work, so the ceiling was not
+    actually bounding anything. Same answer, O(body).
+    """
+    found: int | None = None
+    for n in func.body:
+        if n > len(scan.code):
+            continue
+        stripped = scan.code[n - 1].strip()
+        if not stripped or stripped in STRUCTURAL:
+            continue
+        if found is not None:
+            return None          # a second statement: not a one-liner
+        found = n
+    return found
 
 
 ACCESSOR_RETURN_RE = re.compile(
@@ -1584,35 +1642,67 @@ def iter_paths(paths: list[str]):
             yield p
 
 
-def read_lines(path: str, *, max_bytes: int = MAX_FILE_BYTES) -> list[str] | None:
-    """None for an unreadable, binary or oversized file. A mutation planner
-    that crashes on one odd file blocks the whole run, so this never raises."""
+def read_lines_bounded(path: str, *, max_bytes: int = MAX_FILE_BYTES,
+                       max_line_chars: int = MAX_LINE_CHARS
+                       ) -> tuple[list[str] | None, list[dict]]:
+    """(lines, truncated) -- lines is None for an unreadable, binary or
+    oversized file; `truncated` lists every line whose tail was NOT read.
+
+    The second element exists so the caller cannot report silence about text
+    it shortened. A mutation planner that crashes on one odd file blocks the
+    whole run, so this never raises.
+    """
     try:
         if os.path.getsize(path) > max_bytes:
-            return None
+            return None, []
         with open(path, "rb") as fh:
             blob = fh.read()
     except OSError:
-        return None
+        return None, []
     if b"\x00" in blob[:8000]:
-        return None
+        return None, []
     try:
         text = blob.decode("utf-8")
     except UnicodeDecodeError:
         try:
             text = blob.decode("latin-1")
         except Exception:
-            return None
-    return text.splitlines(keepends=True)
+            return None, []
+
+    lines: list[str] = []
+    truncated: list[dict] = []
+    for n, line in enumerate(text.splitlines(keepends=True), start=1):
+        if len(line) > max_line_chars:
+            truncated.append({
+                "file": path,
+                "line": n,
+                "chars": len(line),
+                "read_chars": max_line_chars,
+                "reason": (f"line is {len(line)} characters, over the "
+                           f"{max_line_chars}-character line ceiling; only "
+                           f"the first {max_line_chars} were considered for "
+                           "mutation and the rest was NOT read"),
+            })
+            line = line[:max_line_chars]
+        lines.append(line)
+    return lines, truncated
+
+
+def read_lines(path: str, *, max_bytes: int = MAX_FILE_BYTES) -> list[str] | None:
+    """Back-compatible wrapper: lines only. Prefer read_lines_bounded(), which
+    also hands back what it had to shorten."""
+    return read_lines_bounded(path, max_bytes=max_bytes)[0]
 
 
 def plan(paths: list[str], *, seed: int = 0, max_per_file: int = 7,
          feedback: Feedback | None = None,
          diff: dict[str, set[int]] | None = None,
-         use_ast: bool = True, max_bytes: int = MAX_FILE_BYTES) -> dict:
+         use_ast: bool = True, max_bytes: int = MAX_FILE_BYTES,
+         max_line_chars: int = MAX_LINE_CHARS) -> dict:
     feedback = feedback or Feedback()
     files: list[dict] = []
     skipped_files: list[dict] = []
+    truncated_lines: list[dict] = []
     by_rule: dict[str, int] = {}
     considered = 0
     capped = 0
@@ -1630,7 +1720,9 @@ def plan(paths: list[str], *, seed: int = 0, max_per_file: int = 7,
                 # Not in the diff. Silence, not a finding: a mutation gate
                 # scoped to a change has nothing to say about untouched files.
                 continue
-        raw = read_lines(path, max_bytes=max_bytes)
+        raw, cut = read_lines_bounded(path, max_bytes=max_bytes,
+                                      max_line_chars=max_line_chars)
+        truncated_lines.extend(cut)
         if raw is None:
             # A file with no mutants and a file nobody opened produce the same
             # empty result, so the second one has to say so.
@@ -1674,10 +1766,17 @@ def plan(paths: list[str], *, seed: int = 0, max_per_file: int = 7,
             else None,
         },
         "skipped_files": skipped_files,
+        # A truncated line is a third state, distinct from both "file not
+        # read" and "file read, no mutants": the file WAS read and WAS
+        # planned, but part of a line was not looked at, so "no mutants on
+        # this line" is a statement about its head only.
+        "truncated_lines": truncated_lines,
         "files": files,
         "summary": {
             "files": len(files),
             "files_skipped": len(skipped_files),
+            "lines_truncated": len(truncated_lines),
+            "files_with_truncated_lines": len({t["file"] for t in truncated_lines}),
             "lines_considered": considered,
             "suppressed_by_rule": dict(sorted(by_rule.items())),
             "suppressed_by_cap": capped,
@@ -1713,6 +1812,18 @@ def render_text(result: dict) -> str:
             out.append(f"  skipped {entry['file']}: {entry['reason']}")
         if len(unread) > 5:
             out.append(f"  ... and {len(unread) - 5} more")
+    # Same distinction one level down: part of this line was never read, so
+    # "no mutant here" is a claim about its first MAX_LINE_CHARS only.
+    cut = result.get("truncated_lines") or []
+    if cut:
+        out.append(f"{len(cut)} line(s) only PARTLY read "
+                   "(see truncated_lines):")
+        for entry in cut[:5]:
+            out.append(f"  truncated {entry['file']}:{entry['line']}: "
+                       f"{entry['chars']} chars, first {entry['read_chars']} "
+                       "considered, the rest NOT read")
+        if len(cut) > 5:
+            out.append(f"  ... and {len(cut) - 5} more")
     return "\n".join(out)
 
 
@@ -1736,6 +1847,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="skip source files larger than this "
                          f"(default {MAX_FILE_BYTES}, i.e. 2MB); skipped files "
                          "are reported in skipped_files, never ignored")
+    ap.add_argument("--max-line-chars", type=int, default=MAX_LINE_CHARS,
+                    help="consider only the first N characters of a line "
+                         f"(default {MAX_LINE_CHARS}); every line past it is "
+                         "reported in truncated_lines, never silently cut")
     args = ap.parse_args(argv)
 
     missing = [p for p in args.paths if not os.path.exists(p)]
@@ -1751,7 +1866,8 @@ def main(argv: list[str] | None = None) -> int:
         feedback = load_feedback(args.feedback) if args.feedback else None
         result = plan(args.paths, seed=args.seed, max_per_file=args.max_per_file,
                       feedback=feedback, diff=diff,
-                      max_bytes=args.max_file_bytes)
+                      max_bytes=args.max_file_bytes,
+                      max_line_chars=args.max_line_chars)
         payload = (json.dumps(result, indent=2) if args.format == "json"
                    else render_text(result))
         if args.out:
@@ -1763,6 +1879,9 @@ def main(argv: list[str] | None = None) -> int:
         for entry in result["skipped_files"]:
             print(f"warning: not planned: {entry['file']}: {entry['reason']}",
                   file=sys.stderr)
+        for entry in result["truncated_lines"]:
+            print(f"warning: only partly read: {entry['file']}:"
+                  f"{entry['line']}: {entry['reason']}", file=sys.stderr)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

@@ -6,6 +6,7 @@ captured from a previous run. A test that records whatever the code happened
 to produce proves only that the code is deterministic.
 """
 
+import io
 import json
 import os
 import sys
@@ -424,6 +425,119 @@ class TestMalformedJacoco(unittest.TestCase):
                           result["totals"]["lines_hit"]), (8, 2))
         self.assertEqual(result["totals"]["line_pct"], 25.0)
         self.assertEqual(result["totals"]["branches_found"], 0)
+
+
+class TestImpossiblePercentages(unittest.TestCase):
+    """A percentage above 100 is not a measurement, it is a contradiction.
+
+    Each fixture below is a report that disagrees with itself -- more hits than
+    there were things to hit. Emitting 200% or 450% is the same defect class as
+    emitting 0% for an unparseable file: a malformed input rendering as a
+    confident number. The only honest answer is null, said out loud.
+    """
+
+    def _capture(self, text, fmt):
+        """Return (result, stderr). The warning is half the fix: a null that
+        nobody is told about is still a report that lost a measurement."""
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            result = nc.normalize(text, fmt)
+        return result, buf.getvalue()
+
+    def test_jacoco_negative_missed_is_not_two_hundred_percent(self):
+        # missed="-5" covered="10" computed found = -5 + 10 = 5 against 10
+        # hit, and printed line_pct 200.0 without a word of complaint.
+        xml = ('<report><package name="p"><sourcefile name="A.java">'
+               '<counter type="LINE" missed="-5" covered="10"/>'
+               '</sourcefile></package></report>')
+        result, err = self._capture(xml, "jacoco")
+        self.assertIsNone(result["totals"]["line_pct"])
+        self.assertEqual(result["totals"]["lines_found"], 0)
+        self.assertTrue(err.strip(), "a dropped counter must be said out loud")
+        self.assertTrue(result["warnings"],
+                        "the warning must reach the JSON, not only stderr")
+
+    def test_jacoco_counter_that_is_not_a_number_is_reported_not_dropped(self):
+        # int("oops") raised ValueError and the handler did a bare `continue`:
+        # the counter vanished and the report said nothing at all.
+        xml = ('<report><package name="p"><sourcefile name="A.java">'
+               '<counter type="LINE" missed="oops" covered="10"/>'
+               '<counter type="BRANCH" missed="0" covered="4"/>'
+               '</sourcefile></package></report>')
+        result, err = self._capture(xml, "jacoco")
+        self.assertIsNone(result["totals"]["line_pct"])
+        self.assertIn("A.java", err)
+        self.assertTrue(any("A.java" in w for w in result["warnings"]))
+        # The counter that was well-formed still counts: 4 of 4 branches.
+        self.assertEqual(result["totals"]["branch_pct"], 100.0)
+
+    def test_cobertura_condition_coverage_hits_above_total_is_null(self):
+        # '(5/2)' is 5 branches taken out of 2 that exist. That is not 250%.
+        xml = ('<coverage><packages><package><classes>'
+               '<class filename="a.py"><lines>'
+               '<line number="1" hits="1" branch="true" '
+               'condition-coverage="250% (5/2)"/>'
+               '</lines></class></classes></package></packages></coverage>')
+        result, err = self._capture(xml, "cobertura")
+        self.assertIsNone(result["totals"]["branch_pct"])
+        self.assertTrue(any("a.py" in w for w in result["warnings"]))
+
+    def test_coveragepy_covered_lines_above_statements_is_null(self):
+        # 9 covered of 2 statements printed line_pct 450.0.
+        text = '{"files": {"a.py": {"summary": ' \
+               '{"num_statements": 2, "covered_lines": 9}}}}'
+        result, err = self._capture(text, "coveragepy")
+        self.assertIsNone(result["totals"]["line_pct"])
+        self.assertIsNone(result["files"][0]["line_pct"])
+        self.assertTrue(any("a.py" in w for w in result["warnings"]))
+
+    def test_a_consistent_report_carries_no_warnings(self):
+        # The guard must stay silent on the normal case, or it becomes the
+        # noise that gets the whole validator ignored.
+        result, err = self._capture(LCOV, "lcov")
+        self.assertEqual(result["warnings"], [])
+        self.assertEqual(err, "")
+        self.assertEqual(result["totals"]["line_pct"], 83.33)
+
+
+class TestStdinEncoding(unittest.TestCase):
+    """`-` is a documented input. It went through sys.stdin, which decodes as
+    UTF-8 and nothing else, so the UTF-16 fix never reached this path."""
+
+    SCRIPT = os.path.join(os.path.dirname(__file__), "..", "scripts",
+                          "normalize_coverage.py")
+
+    def _run(self, raw, args=()):
+        import subprocess
+        return subprocess.run([sys.executable, self.SCRIPT, "-", *args],
+                              input=raw, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+
+    def test_utf16_on_stdin_is_a_clean_error_not_a_traceback(self):
+        proc = self._run(LCOV.encode("utf-16"))
+        err = proc.stderr.decode("utf-8", "replace")
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("UnicodeDecodeError", err)
+        self.assertEqual(proc.returncode, 0, err)
+        data = json.loads(proc.stdout.decode("utf-8"))
+        # Decoded, it is the same report the file path produces: 6 lines, 5 hit.
+        self.assertEqual((data["totals"]["lines_found"],
+                          data["totals"]["lines_hit"]), (6, 5))
+
+    def test_utf8_bom_on_stdin_matches_the_file_path(self):
+        proc = self._run(b"\xef\xbb\xbf" + LCOV.encode("utf-8"))
+        err = proc.stderr.decode("utf-8", "replace")
+        self.assertEqual(proc.returncode, 0, err)
+        data = json.loads(proc.stdout.decode("utf-8"))
+        self.assertEqual(data["totals"]["files"], 2)
+
+    def test_undecodable_stdin_still_yields_the_report(self):
+        proc = self._run(b"SF:src/caf\xe9.js\nDA:1,1\nend_of_record\n")
+        self.assertEqual(proc.returncode, 0,
+                         proc.stderr.decode("utf-8", "replace"))
+        data = json.loads(proc.stdout.decode("utf-8"))
+        self.assertEqual(data["totals"]["lines_found"], 1)
 
 
 class TestMalformedCoveragePy(unittest.TestCase):

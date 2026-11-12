@@ -32,99 +32,144 @@ floor. Everything is stdlib — nothing to install.
 
 ## 1. Where this stands
 
+**Measured 2026-11-12 on a quiet tree, after a full day of work. These numbers were
+produced by running the commands above, not by recollection.**
+
 | | |
 |---|---|
-| Tests | **717**, of which **3 fail** (named below) |
-| Plugin validation | **passes**, 26 components, 0 warnings |
-| Own flake gate on own code | **0 block findings** |
+| Tests | **814, all passing** (1 skip, 1 expected failure) |
+| Plugin validation | **passes**, 26 components, 0 warnings, 0 could not be validated |
+| Own flake gate on own code | **exit 0** |
 | Agents / skills / stacks | 7 / 16 / 10 |
 | Eval cases | 27, with 81 graders, over 11 claims |
 | Evals ever run | **No.** `evals/SCORECARD.md` is still a template |
 
-**Built and measured**: the deterministic core — ~5,900 lines of stdlib Python across
-nine scripts, each mutation-tested (production code broken deliberately, test confirmed
-red, restored).
+**Built and measured**: the deterministic core — stdlib Python across nine scripts,
+each mutation-tested under the protocol in §5.
 
 **Written but not measured**: the seven agents and sixteen commands are prompts. The
 eleven claims in `evals/` are falsifiable but have never been scored. Until
 `SCORECARD.md` has numbers, every behavioural claim is **design intent, not evidence**.
 
-## 2. The three failing tests
+### What changed, and why the previous handoff misdirected a day of work
 
-None is a broken feature. Each is a test that outlived the behaviour it asserted,
-because an agent was stopped mid-change.
+The file you are reading replaced one that was wrong in eight confirmed places. Each
+error cost real time, so they are recorded rather than quietly fixed:
 
-| Test | Why | Fix |
-|---|---|---|
-| `test_binary_file_is_skipped_not_crashed_on` *(env_safety_check)* | A skipped sensitive file now raises its own finding, by design. The test still asserts `findings == []` | Assert the `unreadable-sensitive-file` detector instead |
-| `test_single_ten_megabyte_line` *(robustness)* | Size ceilings partly landed; this test documents the unbounded behaviour | Finish the ceiling work in `flake_smells.py` / `arid_nodes.py`, then update |
-| `test_the_chain_runs_in_order_and_each_link_feeds_the_next` *(integration)* | The end-to-end chain reaches `session_context.py` and gets empty output. The consent gate is working; the test's AMBER health fixture is not reaching the child process | Trace the `onboard()` helper in `test_integration.py` — the marker is written but the health file may not be seeded for that case |
+| It said | Measured reality |
+|---|---|
+| 3 failing tests | 5 broken items; one was an *error*, not a failure |
+| AMBER health fixture never reached the child process | It always did. One call site omitted `env=onboard(...)`, so no consent record existed |
+| `EMAIL_RE` ReDoS, ~20 min on a 2MB line | Already fixed. The live quadratic was `BARE_HOST_RE`, and the cost was per *line*, not per file |
+| 5 HIGH prompt findings open | 4 were already closed |
+| 9 unsourced claims needing owner decisions | 0 of them. All 7 enumerated were in `docs/RESEARCH.md` §15/§20 the whole time |
+| 0 block findings on own code | 9, on a pristine clone, all false positives from our own gate |
+| detector `unreadable-sensitive-file` | No such detector. It is `unreadable_config` |
+| Python 3.9 unverifiable here | 3.9.6 is installed; everything was re-verified on it |
 
-## 3. Next, in priority order
+**The lesson is the one §5 already states: re-measure before trusting this file.** It
+applies to this version too.
 
-1. **Fix the three tests above.** Half an hour, and the suite goes green.
-2. **Finish the three interrupted hardening tasks** — each was verified partially landed:
-   - *Coverage + validator*: UTF-16 lcov silently reporting zero coverage; a JaCoCo
-     counter missing `missed` reporting 100%; BOM handling; five crashes in
-     `validate_plugin.py` that abort the whole run on one bad component.
-   - *Atomic writes*: `scripts/atomic_io.py` landed. **Check which callers were
-     converted** — `skills/start/SKILL.md` promises atomic writes, so the claim is only
-     true once every `--out` writer uses it. Then the size ceilings, then the quadratic
-     `EMAIL_RE` ReDoS in `env_safety_check.py` (a 2MB line extrapolates to ~20 minutes,
-     and this gate runs *before* the test command, so hanging it does not fail safe).
-   - *Prompts*: 5 HIGH findings in `docs/PROMPT-REVIEW.md`. The sharpest: **nothing
-     dispatches `project-analyst`, `tech-scout` or `reporter`** — three of seven agents
-     are unreachable.
-3. **Run the evals.** `cd evals && claude plugin eval`, then fill in `SCORECARD.md`.
-   This is the only thing that converts the README's claims from intent into evidence.
-4. **Run `claude plugin validate --strict`.** Never done — the CLI was not on the
-   machine this was built on. `scripts/validate_plugin.py` is a stand-in, not a substitute.
-5. **Enable CI — one command, and it needs you, not an agent.** The workflow is
-   written but parked at `templates/ci/github-ci.yml`, because pushing to
-   `.github/workflows/` requires a token with `workflow` scope and the session that
-   built this did not have one. On your machine:
+## 2. Failing tests
 
-   ```bash
-   mkdir -p .github/workflows
-   git mv templates/ci/github-ci.yml .github/workflows/ci.yml
-   git commit -m "Enable CI" && git push
-   ```
+**None.** 814 pass. The three named in the previous handoff are fixed, and the two it
+did not know about are too.
 
-   It runs the suite on Python 3.9/3.11/3.12, the plugin validator, and the project's
-   own flake gate against its own code. **Expect it red on the first run** — the three
-   failing tests in §2 are real. A red CI that tells the truth is the point; do not
-   add `continue-on-error`.
+## 3. What was closed today
 
-   Issue templates and the PR template are already in `.github/` and pushed.
+- **The missing fixture.** `examples/fixtures/node-ts/.env` is MANIFEST ground truth
+  (`NODE-CONFIG-01`) that had never been committed. Every clone was missing it, so
+  `env_safety_check.py` returned **SAFE** for the fixture that exists to be UNSAFE.
+  Restored, now tracked, and `tests/test_fixture_manifest.py` asserts all 71 MANIFEST
+  items resolve on disk.
+- **Fixture absence now fails, loudly.** `require()` used to *skip*, which is how the
+  above rotted unnoticed. It now fails and names the path; set
+  `TESTSQUAD_ALLOW_MISSING_FIXTURES=1` for local concurrent work, never in CI.
+- **Four silent-success defects**, the class this project exists to catch, found in its
+  own code: `session_context.py` exiting 0 with both streams empty; `pr_comment.py`
+  printing "No new findings on this change." when nothing ran; `flake_smells.py`
+  truncating a 1.9MB line and reporting a clean scan of 1,898,000 characters it never
+  read; `validate_plugin.py` losing a whole check's verdict for all 26 components when
+  one was unreadable.
+- **Two real DoS paths**, both measured: `BARE_HOST_RE` (17.6s → 2.2s on an 800KB
+  `.env`) and a quadratic in `arid_nodes._single_statement_body` (12.2s → 0.15s at
+  8,005 lines, inside a ceiling that was supposed to bound it).
+- **Coverage honesty.** UTF-16 via stdin, negative JaCoCo counters, and `hit > found`
+  now yield `null` with a named warning instead of 0%, 100%, 200% or 450%.
+- **All 7 `--out` writers are atomic**, so `skills/start/SKILL.md`'s promise is kept.
+  `atomic_io` itself had been narrowing every destination to 0600.
+- **All 7 agents are reachable.** `project-analyst`, `tech-scout` and `reporter` were
+  dispatched by nothing.
+- **S2-3, the consent gate** (was §4, now done). `/start` step 5 shows the verbatim
+  commands and says plainly that agreeing runs the repo author's code as you, on this
+  machine. Step 4 profiles statically first, so nothing from the repo executes before
+  the gate.
 
-## 4. Decisions that are yours, not an agent's
+## 4. Next, in priority order
 
-From `docs/SECURITY-REVIEW.md` (609 lines — **read this before publishing**):
-
-- **S2-3, the reviewer's single recommendation before going public.** `/start` should
-  show the verbatim test command it discovered and get agreement before the first run.
-  Written into `skills/start/SKILL.md` step 4b, never exercised. A malicious `test`
-  script currently passes the gate as a *hermeticity* note at CAUTION, which `/start`
-  treats as "report it, proceed". Running a repo's tests is executing a stranger's code;
-  no `curl | sh` detector list will ever be complete.
-- **S3-2.** Only `tech-scout` treats input as untrusted. The other six agents read repo
-  content with no equivalent rule.
-
-From `docs/CITATION-AUDIT.md`: **9 unsourced claims remain** (was 17; 8 were hedged).
-The 9 are load-bearing research figures — mutation-operator productivity, the
-qodo-cover/$70M claim, "200+ function families". They need **sourcing decisions, not
-hedging**: either add the citation to `docs/RESEARCH.md` or restate them as design
-choices. Do not invent a source.
+1. **Run the evals.** `cd evals && claude plugin eval`, then fill in `SCORECARD.md`.
+   This is still the only thing that converts the README's claims from intent into
+   evidence. **Blocked:** the `claude` CLI is not installed on this machine.
+2. **Run `claude plugin validate --strict`.** Never done. `scripts/validate_plugin.py`
+   is a stand-in, not a substitute. Same blocker.
+3. **Decisions that are yours, not an agent's** — each was deliberately left:
+   - **`RecursionError` escapes `ast.parse`** in `arid_nodes.py:614` and
+     `flake_smells.py:976`, killing the run, though both docstrings promise they never
+     raise. Latent, not live: the new line ceilings cover the known input, but a deeply
+     nested *multi-line* expression has short lines and no ceiling touches it. A bare
+     `except` that falls back to the regex scanner silently would be the same
+     silence-looks-like-success defect in new clothes — it needs a decision about what
+     to **report**.
+   - **`flake_smells`'s `no-assertion` rule cannot see an assertion delegated to a
+     same-file helper.** 9 of 9 findings on this repo were false positives: a **100%
+     rate** against the project's own ~10% switch-off threshold. The fix is intra-file
+     helper resolution — a real feature.
+   - **`flake_smells` emits the path as `"path"` in `summary["skipped"]` and `"file"`
+     in `skipped_files`.** It crashed a consumer today. Unifying is a schema change to
+     `testsquad.flakesmells/1`.
+   - **S3-2.** Only `tech-scout` treats repo content as untrusted. The other six agents
+     have no equivalent rule.
+   - **`docs/RESEARCH.md` §20 misapplies its own citation.** "Exotic operator sets buy
+     ≤13%" applies Gopinath et al.'s bound on operator *reduction* to operator
+     *addition*, which that paper explicitly exempts ("no limit to the improvement that
+     can be made by addition of new mutation operators"). A reviewer who opens the
+     citation finds it saying the opposite — worse than no citation. One sentence.
+   - **The consent record has no pinned key.** Both `skills/start/SKILL.md` and
+     `agents/project-analyst.md` say the agreement is "recorded in
+     `.testing/preferences.json`", and the analyst's static-vs-executing decision
+     depends on reading it, but no key name is specified and no script validates it.
+     Pin it before this is exercised, or the analyst will guess.
+4. **Smaller, well-specified cleanups** — each found and reported today, none urgent:
+   - `test_robustness.py:386/529/553/1279/1483` skip when `arid_nodes.py` is absent.
+     Those are missing-*production-code* skips, not platform guards, and should fail
+     like the fixture ones now do.
+   - `pr_comment.py`: a `--data` file holding a valid but empty `{}` exits 2 saying
+     "could not read" — conflating unreadable with empty, one layer up from the bug
+     fixed today. And an input that is a readable object missing its key (e.g.
+     `gates.json` as `{"name": ...}`) still counts as "ran, found nothing".
+   - `docs/SECURITY-REVIEW.md` S2-3's "Where:" line numbers are stale after the
+     reorder, and its fix 3 says "step 4", now step 5.
+   - `docs/PROMPT-REVIEW.md:516` quotes the old `Validation passed:` string.
+   - A mode-000 file in `templates/agents/*.tmpl` still passes validation; a UTF-16
+     agent `.md` validates clean. The second needs the real CLI to judge, not a guess.
+   - `M13`/`M14`/`M15`/`M17` in `docs/PROMPT-REVIEW.md` remain open. M15's CI half:
+     the workflow writes `.testing/pr-comment.md`, outside the gitignored
+     `.testing/reports/`, so its artifact is commit-eligible.
 
 ## 5. How work is done here
 
 Not style preferences. Each exists because its absence caused a real defect in this
 repo, and most were caught by the project's own tools.
 
-- **Prove the test can fail.** Break the production code, confirm red, restore. Use
-  **absolute paths and verify the restore** — one agent's entire mutation run was
-  silently invalidated by a failed `cp`, and a later agent caught it by comparing
-  SHA-256 against a pristine copy. Do that.
+- **Prove the test can fail.** Break the production code, confirm red, restore.
+  **Purge bytecode → mutate → run → restore → verify by SHA-256**, absolute paths
+  throughout. A failed `cp` once silently invalidated an entire mutation run; a later
+  agent caught it by comparing SHA-256 against a pristine copy. Then three agents in
+  one session hit the next layer: a stale `__pycache__` serves the pre-mutation
+  bytecode, so the mutant reports GREEN *while the hash check passes*. Clear
+  `scripts/__pycache__` and `tests/__pycache__` before every invocation and pass `-B`.
+  Add a **control mutant** (comment-only, hash changes, behaviour does not) that must
+  stay GREEN — otherwise a no-op mutation is indistinguishable from a blind test.
 - **Never state a number you did not measure.** `null` / "not measured" is valid; `0`
   is not. Most of the worst bugs found here were a malformed input rendering as a
   confident wrong number.

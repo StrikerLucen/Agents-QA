@@ -48,6 +48,21 @@ def assert_no_secret(case, body, secret, label=""):
             f"(offset {i}) survived redaction")
 
 
+def headline(body):
+    """The first line under the heading -- the one a reader acts on.
+
+    Asserting on the whole body is exactly what let the worst defect in this
+    file live: the `missing_inputs` blockquote reported the truth while the
+    headline above it said "No new findings on this change.", and a body-wide
+    assertion found both strings and was happy. The headline is the claim.
+    """
+    lines = [line for line in body.splitlines() if line.strip()]
+    for i, line in enumerate(lines):
+        if line.strip() == "## testsquad":
+            return lines[i + 1].strip() if i + 1 < len(lines) else ""
+    raise AssertionError("the comment has no `## testsquad` heading")
+
+
 def table_rows(body):
     """Every markdown table row in the body, split into its cells.
 
@@ -78,8 +93,12 @@ class RenderNeverRaises(unittest.TestCase):
     # -- defect 1: a data file that is not an object ------------------------
 
     def test_top_level_list_renders_an_empty_report(self):
+        """An empty report, but never a clean one: the data file is itself an
+        input, and one nobody could parse is 'nobody looked', not 'nothing
+        found'. This test asserted the opposite until the headline was fixed."""
         body = self.body([1, 2, 3])
-        self.assertIn("No new findings", body)
+        self.assertNotIn("No new findings", body)
+        self.assertIn("Nothing was measured", headline(body))
         self.assertIn(MALFORMED_NOTICE, body)
 
     def test_top_level_scalars_render(self):
@@ -518,6 +537,10 @@ class ExistingBehaviourStillHolds(unittest.TestCase):
             with open(out, encoding="utf-8") as fh:
                 body = fh.read()
         self.assertIn(prc.MARKER, body)
+        # The assertion this test was named for, and did not make: a comment
+        # is still rendered, but its headline says nothing was measured.
+        self.assertNotIn("No new findings", headline(body))
+        self.assertIn("Nothing was measured", headline(body))
 
     def test_unmeasured_coverage_is_words_not_a_number(self):
         body = prc.render({"coverage": {"line_pct": None, "branch_pct": None}})
@@ -565,6 +588,255 @@ class ExistingBehaviourStillHolds(unittest.TestCase):
         first = prc.render(json.loads(json.dumps(data)))
         for _ in range(5):
             self.assertEqual(first, prc.render(json.loads(json.dumps(data))))
+
+
+CLEAN_HEADLINE = "No new findings on this change."
+
+VALID_INPUTS = {
+    "health-baseline.json": {"verdict": "GREEN"},
+    "coverage-diff.json": {"line_pct": 81.0, "base_line_pct": 80.0},
+    "gates.json": {"gates": [{"name": "coverage", "target": "80%",
+                              "actual": "81%", "met": True}]},
+    "findings.json": {"findings": []},
+}
+
+
+class TheHeadlineNeverClaimsAnAllClear(unittest.TestCase):
+    """The defect this class exists for: `verdict_line()` could not see
+    `missing_inputs`, so a run where **nothing ran** produced the bold first
+    line "No new findings on this change." The body said one thing and the
+    headline said the opposite, and the headline is the part people read.
+
+    Three states must be distinguishable, which is the house rule stated as a
+    test: "I could not read it", "nobody ran this" and "there is nothing
+    wrong" must never render the same. Every assertion below is on the
+    headline specifically -- a body that merely mentions the missing file
+    somewhere is what the defect already did.
+    """
+
+    # -- fixtures ----------------------------------------------------------
+
+    def make_testing(self, tmp, drop=(), corrupt=None):
+        """A .testing/ with the four real inputs, minus `drop`, with every
+        name in `corrupt` overwritten by that unreadable text."""
+        testing = os.path.join(tmp, ".testing")
+        os.makedirs(testing)
+        for name, blob in VALID_INPUTS.items():
+            if name in drop:
+                continue
+            with open(os.path.join(testing, name), "w", encoding="utf-8") as fh:
+                if corrupt and name in corrupt:
+                    fh.write(corrupt[name])
+                else:
+                    json.dump(blob, fh)
+        return testing
+
+    def run_main(self, testing, expect_rc=0):
+        with tempfile.TemporaryDirectory() as out_dir:
+            out = os.path.join(out_dir, "pr-comment.md")
+            self.assertEqual(expect_rc, prc.main(
+                ["--testing-dir", testing, "--out", out]))
+            if expect_rc != 0:
+                return None
+            with open(out, encoding="utf-8") as fh:
+                return fh.read()
+
+    def assert_not_an_all_clear(self, line, why=""):
+        self.assertNotEqual(CLEAN_HEADLINE, line, why)
+        self.assertNotIn("No new findings", line, why)
+        lowered = line.lower()
+        self.assertTrue(
+            "not everything ran" in lowered or "nothing was measured" in lowered,
+            f"the headline does not flag the incomplete run: {line!r}")
+
+    # -- state 1: everything ran, nothing found ----------------------------
+
+    def test_all_inputs_present_and_clean_keeps_the_unchanged_headline(self):
+        """The string that must survive the fix verbatim. If this drifts, the
+        notice below stops meaning anything, because it fires on every run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body = self.run_main(self.make_testing(tmp))
+        self.assertEqual(CLEAN_HEADLINE, headline(body))
+        self.assertNotIn("Not everything ran", body)
+        self.assertNotIn(MALFORMED_NOTICE, body)
+
+    # -- state 2: everything ran, findings exist ---------------------------
+
+    def test_a_complete_run_with_findings_is_unchanged(self):
+        for data, expected in (
+            ({"findings": [{"evidence": "reproduced", "severity": "S1",
+                            "title": "boom"}]}, "**S1: boom**"),
+            ({"findings": [{"evidence": "observed", "severity": "S3",
+                            "title": "meh"}]},
+             "No blocking issues. Some findings worth a look below."),
+            ({"gates": [{"name": "coverage", "met": False}]},
+             "**1 quality gate(s) not met:** coverage"),
+            ({"health": {"verdict": "RED"}},
+             "**The test suite is not healthy.** Coverage figures are withheld "
+             "because they would not mean anything until it runs clean."),
+        ):
+            with self.subTest(data=data):
+                self.assertEqual(expected, headline(prc.render(data)))
+
+    # -- state 3a: nothing ran at all --------------------------------------
+
+    def test_no_inputs_at_all_through_main_is_a_refusal_not_a_comment(self):
+        """Documented behaviour, re-asserted here because it is the other half
+        of the same promise: an absent .testing/ exits 2 and writes nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "c.md")
+            self.assertEqual(2, prc.main(
+                ["--testing-dir", os.path.join(tmp, "nope"), "--out", out]))
+            self.assertFalse(os.path.exists(out))
+
+    def test_every_input_present_but_unreadable_says_nothing_was_measured(self):
+        """The worst case the script's own comment names: four files on disk,
+        none of them parseable, and -- before the fix -- a comment reading
+        "No new findings on this change." with no notice of any kind."""
+        with tempfile.TemporaryDirectory() as tmp:
+            testing = self.make_testing(tmp, corrupt={
+                name: "{not json" for name in VALID_INPUTS})
+            body = self.run_main(testing)
+        line = headline(body)
+        self.assert_not_an_all_clear(line)
+        self.assertIn("Nothing was measured", line)
+        self.assertIn("not an all-clear", line)
+        for name in VALID_INPUTS:
+            self.assertIn(name, body, "the unreadable file must be named")
+
+    def test_nothing_ran_is_reachable_through_render_alone(self):
+        line = headline(prc.render({"missing_inputs": ["gates.json"],
+                                    "inputs_read": 0}))
+        self.assertIn("Nothing was measured", line)
+
+    # -- state 3b: each input missing in isolation -------------------------
+
+    def test_each_single_missing_input_denies_the_all_clear(self):
+        for name in VALID_INPUTS:
+            with self.subTest(missing=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    body = self.run_main(self.make_testing(tmp, drop=(name,)))
+                self.assert_not_an_all_clear(
+                    headline(body),
+                    f"{name} was absent and the headline still read clean")
+                self.assertIn(name, body)
+
+    def test_each_single_unreadable_input_denies_the_all_clear(self):
+        """Two ways to be unreadable, and the second is the quiet one: a file
+        whose JSON parses fine but whose top level is a list. `load()` returns
+        {} for both, which is indistinguishable from 'ran, found nothing'
+        unless main() keeps them apart."""
+        for text, label in (("{not json", "malformed JSON"),
+                            ("[1, 2, 3]", "a top-level list"),
+                            ('"a string"', "a top-level string"),
+                            ("", "an empty file")):
+            for name in VALID_INPUTS:
+                with self.subTest(shape=label, input=name):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        testing = self.make_testing(tmp, corrupt={name: text})
+                        body = self.run_main(testing)
+                    self.assert_not_an_all_clear(
+                        headline(body),
+                        f"{name} held {label} and the headline read clean")
+                    self.assertIn("unreadable", body)
+                    self.assertIn(name, body)
+
+    # -- state 3c: partial runs, and what outranks what --------------------
+
+    def test_gates_all_passing_with_findings_missing_is_not_an_all_clear(self):
+        """The partial case that is easiest to get wrong: everything that ran
+        came back green, so every branch of the old verdict_line fell through
+        to the clean headline -- while the one input that finds bugs was the
+        one that never ran."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body = self.run_main(self.make_testing(tmp, drop=("findings.json",)))
+        line = headline(body)
+        self.assert_not_an_all_clear(line)
+        self.assertIn("did run found nothing", line)
+        self.assertIn("1 input(s)", line)
+
+    def test_a_real_problem_still_leads_but_the_gap_is_still_flagged(self):
+        """Precedence: a true, actionable problem keeps the headline, because
+        burying an S1 behind a bookkeeping notice would be its own defect. The
+        incompleteness is appended, never dropped."""
+        for data, lead in (
+            ({"health": {"verdict": "RED"}}, "**The test suite is not healthy.**"),
+            ({"findings": [{"evidence": "reproduced", "severity": "S1",
+                            "title": "boom"}]}, "**S1: boom**"),
+            ({"gates": [{"name": "coverage", "met": False}]},
+             "**1 quality gate(s) not met:**"),
+        ):
+            with self.subTest(lead=lead):
+                blob = dict(data, missing_inputs=["findings.json (run x)",
+                                                  "gates.json (run y)"])
+                line = headline(prc.render(blob))
+                self.assertTrue(line.startswith(lead),
+                                f"the real problem lost the headline: {line!r}")
+                self.assertIn("Not everything ran: 2 input(s)", line,
+                              "the incomplete run was not flagged at all")
+
+    def test_a_partial_run_with_non_blocking_findings_says_both(self):
+        line = headline(prc.render({
+            "findings": [{"evidence": "observed", "severity": "S3",
+                          "title": "meh"}],
+            "missing_inputs": ["gates.json (run /testsquad:verify)"]}))
+        self.assert_not_an_all_clear(line)
+        self.assertIn("findings worth a look below", line)
+
+    def test_a_missing_input_given_as_a_bare_string_still_counts(self):
+        """A hand-written data file spells a one-item list as a string. The
+        headline must not fall back to the all-clear because of a type."""
+        self.assert_not_an_all_clear(
+            headline(prc.render({"missing_inputs": "gates.json"})))
+
+    def test_the_headline_and_the_body_never_disagree(self):
+        """The defect in one sentence. Whenever the body carries the "Not
+        everything ran" notice, the headline must not read as an all-clear --
+        and whenever it does not, the clean headline is allowed."""
+        cases = [
+            {},
+            {"missing_inputs": ["a"]},
+            {"missing_inputs": ["a", "b"], "health": {"verdict": "GREEN"}},
+            {"missing_inputs": ["a"], "gates": [{"name": "g", "met": True}]},
+            {"missing_inputs": ["a"], "gates": [{"name": "g", "met": False}]},
+            {"missing_inputs": ["a"], "findings": [
+                {"evidence": "reproduced", "severity": "S2", "title": "t"}]},
+            {"health": {"verdict": "GREEN"}},
+        ]
+        for data in cases:
+            with self.subTest(data=data):
+                body = prc.render(data)
+                if "Not everything ran." in body.split("## testsquad")[1]:
+                    self.assert_not_an_all_clear(headline(body))
+                else:
+                    self.assertNotIn("Not everything ran", headline(body))
+
+    # -- the --out writer --------------------------------------------------
+
+    def test_an_unwritable_out_path_exits_2_rather_than_raising(self):
+        """`.testing/reports/` is what the skill passes and nothing guarantees
+        it exists. Every other --out writer in scripts/ answers OSError with a
+        message and exit 2 (risk_map.py, env_safety_check.py); this one let
+        FileNotFoundError out as a traceback and exited 1."""
+        with tempfile.TemporaryDirectory() as tmp:
+            testing = self.make_testing(tmp)
+            for label, out in (
+                ("a parent directory that does not exist",
+                 os.path.join(tmp, "reports", "pr-comment.md")),
+                ("a path that is a directory", tmp),
+            ):
+                with self.subTest(case=label):
+                    self.assertEqual(2, prc.main(
+                        ["--testing-dir", testing, "--out", out]))
+
+    def test_a_writable_out_path_still_exits_0_and_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            testing = self.make_testing(tmp)
+            out = os.path.join(tmp, "pr-comment.md")
+            self.assertEqual(0, prc.main(
+                ["--testing-dir", testing, "--out", out]))
+            with open(out, encoding="utf-8") as fh:
+                self.assertIn(prc.MARKER, fh.read())
 
 
 if __name__ == "__main__":

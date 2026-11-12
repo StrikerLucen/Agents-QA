@@ -28,6 +28,10 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+if __package__ in (None, ""):  # run as a script: scripts/ is already sys.path[0]
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from atomic_io import write_text_atomic  # noqa: E402
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # A file bigger than this is generated, vendored or binary -- not somewhere a
@@ -575,10 +579,10 @@ def main(argv: "list[str] | None" = None) -> int:
 
     if args.out:
         try:
-            directory = os.path.dirname(os.path.abspath(args.out))
-            os.makedirs(directory, exist_ok=True)
-            with open(args.out, "w", encoding="utf-8") as fh:
-                fh.write(text + "\n")
+            # No os.makedirs() here: write_text_atomic() already creates
+            # the parent directory, which is why .testing/ not existing
+            # yet is still not an error for this writer.
+            write_text_atomic(args.out, text + "\n")
         except OSError as exc:
             print(f"error: cannot write {args.out}: {exc}", file=sys.stderr)
             return 2

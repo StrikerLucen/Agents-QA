@@ -2,3 +2,20 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# --- fixture env files: these must never be ignored ------------------------
+# examples/fixtures/node-ts/.env is declared ground truth (MANIFEST.json item
+# NODE-CONFIG-01). It exists so scripts/env_safety_check.py returns UNSAFE for
+# a repository whose whole purpose is to be unsafe. It once went missing from
+# every clone, and the only symptom was the scanner cheerfully reporting SAFE.
+# Adding the conventional `.env` line to this file would do that again, with
+# no error anywhere.
+#
+# Keep these two lines LAST, and add any `.env` rule ABOVE them. Measured:
+# git applies the *last* matching pattern, so a `.env` rule placed BELOW these
+# wins and the fixtures disappear again; placed above, the negations hold.
+# A negation also cannot rescue a file whose parent directory is excluded, so
+# never add a blanket `examples/` or `examples/fixtures/` ignore.
+# tests/test_fixture_manifest.py fails loudly if either file goes missing.
+!examples/fixtures/**/.env
+!examples/fixtures/**/.env.test

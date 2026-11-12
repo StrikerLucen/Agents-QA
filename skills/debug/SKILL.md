@@ -15,6 +15,10 @@ You are orchestration, not investigation. The investigation belongs to `ts-debug
 which is built for it. Your job is to hand that agent a well-formed problem, a budget it
 cannot quietly exceed, and a definition of done it cannot talk its way around.
 
+`ts-debugger` exists only after `/testsquad:start` has run here. **If it is absent,
+dispatch the plugin's `debugger` agent** and say in your report that you did — it carries
+the same method but none of this repo's commands.
+
 ## Before dispatch
 
 Check `.testing/env-safety.json` for this commit — `UNSAFE` means nothing runs, and a
@@ -121,3 +125,19 @@ findings. Per `${CLAUDE_PLUGIN_ROOT}/templates/report/RULES.md`:
 
 Anything unresolved goes to `.testing/known-issues.md`, dated, with a review date and
 what was already tried — so the next person starts where you stopped.
+
+Then write the findings to **`.testing/findings.json`**, the only input the PR comment
+has for its findings section. Without it the comment renders no findings at all, and
+reads exactly like a run that found nothing:
+
+```json
+{"findings": [{"severity": "S2", "title": "Visit sync reports success without saving",
+               "file": "src/sync/visit.ts", "line": 88, "evidence": "reproduced",
+               "count": 3, "repro": "npx jest visit.spec.ts -t 'offline save'"}]}
+```
+
+One object per **root cause**, matching the main list above — `count` is how many
+symptoms clustered under it, not a second finding. `evidence` is `reproduced` or
+`observed`; anything weaker is written out with that badge and the renderer withholds it
+by count, which is the behaviour you want — do not drop it silently and do not promote it.
+`repro` is a command, so it goes through the same redaction as everything else.

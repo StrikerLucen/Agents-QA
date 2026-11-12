@@ -424,10 +424,45 @@ class StructureTests(TempMixin, unittest.TestCase):
         with timed(self, "flake_smells on a 10MB single line", budget=10.0):
             result = fsm.scan_paths([self.tmp])
         self.assertEqual(result["summary"]["files_scanned"], 0)
-        skipped = result["summary"]["skipped"]
-        self.assertEqual([s["file"] for s in skipped],
+        # `skipped_files` is the list that matters, and it is NOT
+        # summary["skipped"]: that one is the full disposition log and
+        # includes "not a test file", which is a decision rather than a
+        # failure. The key is "file" here, matching arid_nodes.py,
+        # risk_map.py and env_safety_check.py; summary["skipped"] keys the
+        # same thing as "path", which is what made this test ERROR with a
+        # KeyError rather than fail. Reported, not papered over.
+        unread = result["skipped_files"]
+        self.assertEqual([s["file"] for s in unread],
                          [self.path("test_huge.py")])
-        self.assertIn("ceiling", skipped[0]["reason"])
+        self.assertIn("ceiling", unread[0]["reason"])
+        # The point of the whole exercise: a reader must be able to tell this
+        # apart from a clean scan. A clean scan has an EMPTY skipped_files,
+        # so a non-empty one is the signal, and the reason names the ceiling.
+        self.assertIn("2MB", unread[0]["reason"])
+        self.assertIn("--max-file-bytes", unread[0]["reason"])
+        # ... and it reaches the human-readable output too, not only the JSON.
+        self.assertIn("NOT scanned", fsm.render_text(result))
+
+    def test_a_clean_scan_and_an_unread_file_do_not_look_alike(self):
+        # The ceiling's whole value is this contrast. Both runs report zero
+        # findings; only one of them actually looked at the file. If these two
+        # results were indistinguishable the gate would be returning a clean
+        # verdict about a file it never opened, which is the worst defect this
+        # build produced.
+        self.write("test_clean.py", "def test_a():\n    assert f(1) == 2\n")
+        clean = fsm.scan_paths([self.tmp])
+        os.remove(self.path("test_clean.py"))
+        self.write("test_huge.py", "x = '" + "a" * 10_000_000 + "'\n")
+        unread = fsm.scan_paths([self.tmp])
+
+        self.assertEqual(clean["summary"]["findings"], 0)
+        self.assertEqual(unread["summary"]["findings"], 0)
+        self.assertEqual(clean["skipped_files"], [])
+        self.assertNotEqual(unread["skipped_files"], [])
+        self.assertEqual(clean["summary"]["files_scanned"], 1)
+        self.assertEqual(unread["summary"]["files_scanned"], 0)
+        self.assertNotIn("NOT scanned", fsm.render_text(clean))
+        self.assertIn("NOT scanned", fsm.render_text(unread))
 
     def test_single_ten_megabyte_line_is_scanned_when_the_ceiling_is_raised(self):
         # The ceiling is a default, not a verdict: --max-file-bytes raises it,
@@ -437,7 +472,117 @@ class StructureTests(TempMixin, unittest.TestCase):
                    budget=20.0):
             result = fsm.scan_paths([self.tmp], max_bytes=64 * 1024 * 1024)
         self.assertEqual(result["summary"]["files_scanned"], 1)
-        self.assertEqual(result["summary"]["skipped"], [])
+        self.assertEqual(result["skipped_files"], [])
+        # Raising the FILE ceiling does not remove the LINE ceiling, and the
+        # line ceiling is what keeps this run fast. Scanning 2,000 of
+        # 10,000,006 characters and reporting zero findings would be the same
+        # silent lie one level down, so the truncation is reported.
+        self.assertEqual(result["summary"]["lines_truncated"], 1)
+        cut = result["truncated_lines"][0]
+        self.assertEqual(cut["file"], self.path("test_huge.py"))
+        self.assertEqual(cut["line"], 1)
+        # 5 ("x = '") + 10,000,000 + 2 ("'\n"). Spelled out so a change in
+        # what gets counted (bytes vs characters, newline in or out) fails
+        # here rather than drifting quietly.
+        self.assertEqual(cut["chars"], 10_000_007)
+        self.assertEqual(cut["scanned_chars"], fsm.MAX_LINE_CHARS)
+        self.assertIn("NOT examined", cut["reason"])
+        self.assertIn("PARTLY scanned", fsm.render_text(result))
+
+    def test_a_long_line_under_the_file_ceiling_is_not_silently_shortened(self):
+        """REGRESSION. A 1.9MB single-line test file is UNDER the 2MB file
+        ceiling, so it is read and counted as scanned. flake_smells then cut
+        every line to MAX_LINE_CHARS and said nothing, so the report read
+        files_scanned=1, findings=0, skipped_files=[] -- a clean verdict about
+        1,898,000 characters nobody looked at. Measured before the fix: 0.002s
+        and zero findings, with no trace of the truncation anywhere in the
+        output.
+        """
+        body = "    assert foo('" + "x" * 1_900_000 + "') == 1\n"
+        self.write("test_oneline.py", "def test_x():\n" + body)
+        self.assertLess(os.path.getsize(self.path("test_oneline.py")),
+                        fsm.MAX_FILE_BYTES)
+        with timed(self, "flake_smells on a 1.9MB single line", budget=10.0):
+            result = fsm.scan_paths([self.tmp])
+        # Read, therefore NOT in skipped_files -- these are different states.
+        self.assertEqual(result["summary"]["files_scanned"], 1)
+        self.assertEqual(result["skipped_files"], [])
+        # But partly unread, and that has to be said.
+        self.assertEqual(result["summary"]["lines_truncated"], 1)
+        self.assertEqual(result["summary"]["files_with_truncated_lines"], 1)
+        cut = result["truncated_lines"][0]
+        self.assertEqual(cut["file"], self.path("test_oneline.py"))
+        self.assertEqual(cut["line"], 2)
+        self.assertEqual(cut["chars"], len(body))
+        self.assertIn("NOT examined", cut["reason"])
+
+    def test_a_short_file_reports_no_truncation_at_all(self):
+        # The other half of the contrast: an ordinary file must come back with
+        # lines_truncated == 0 and nothing in the text output, or the new
+        # signal is noise that gets ignored like any other false positive.
+        self.write("test_ok.py", "def test_a():\n    assert f(1) == 2\n")
+        result = fsm.scan_paths([self.tmp])
+        self.assertEqual(result["summary"]["lines_truncated"], 0)
+        self.assertEqual(result["truncated_lines"], [])
+        self.assertNotIn("PARTLY scanned", fsm.render_text(result))
+
+    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    def test_arid_nodes_does_not_silently_shorten_a_long_line(self):
+        """REGRESSION. arid_nodes.py had a 2MB file ceiling and no per-line
+        bound at all, so a single long line was planned in full. Measured on
+        this machine before the fix: a 1.9MB single line cost 0.517s, and a
+        400,000-character `a + a + a + ...` line raised an uncaught
+        RecursionError out of ast.parse that aborted the whole run.
+        """
+        body = "    return a + " + " + ".join(["1"] * 20_000) + "\n"
+        self.write("long.py", "def g(a):\n" + body)
+        self.assertLess(os.path.getsize(self.path("long.py")),
+                        arid.MAX_FILE_BYTES)
+        result = arid.plan([self.tmp])
+        self.assertEqual(result["summary"]["files"], 1)
+        self.assertEqual(result["skipped_files"], [])
+        self.assertEqual(result["summary"]["lines_truncated"], 1)
+        cut = result["truncated_lines"][0]
+        self.assertEqual(cut["file"], self.path("long.py"))
+        self.assertEqual(cut["line"], 2)
+        self.assertEqual(cut["chars"], len(body))
+        self.assertEqual(cut["read_chars"], arid.MAX_LINE_CHARS)
+        self.assertIn("NOT read", cut["reason"])
+        self.assertIn("PARTLY read", arid.render_text(result))
+
+    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    def test_arid_nodes_cost_is_linear_in_the_lines_of_one_function(self):
+        """REGRESSION. _single_statement_body() rebuilt the whole enclosing
+        function's body list for every candidate line in it, and was called
+        twice per line, so one long function cost O(body^2). Measured before
+        the fix, on files far under the 2MB ceiling: 2,005 lines 0.824s,
+        4,005 lines 3.533s, 8,005 lines 12.192s -- roughly 4x per doubling.
+        The file ceiling bounded the bytes and not the work.
+
+        Asserted as a ratio rather than a wall time: an absolute budget on a
+        shared CI box is a flake, but a quadratic still doubles its ratio.
+        """
+        def cost(n):
+            shutil.rmtree(self.tmp, ignore_errors=True)
+            os.makedirs(self.tmp)
+            self.write("mod.py",
+                       "def f():\n    x = (\n" + "        a +\n" * n
+                       + "        a\n    )\n    return x\n")
+            start = time.time()
+            arid.plan([self.tmp])
+            return time.time() - start
+
+        small = cost(1000)
+        large = cost(4000)
+        # 4x the lines. Linear predicts ~4x, quadratic predicts ~16x. A
+        # generous 8x still catches the quadratic and tolerates a noisy box.
+        # The floor guards against a timer too coarse to divide by.
+        self.assertGreater(small, 0.0005,
+                           "timer resolution too coarse to compare")
+        self.assertLess(large / small, 8.0,
+                        f"cost grew {large / small:.1f}x for 4x the lines "
+                        f"({small:.3f}s -> {large:.3f}s): that is the "
+                        "quadratic coming back")
 
     def test_multi_megabyte_test_file_is_read_whole_into_memory(self):
         """FIXED: flake_smells.py now has MAX_FILE_BYTES = 2MB.
@@ -977,31 +1122,56 @@ class ConcurrencyTests(TempMixin, unittest.TestCase):
                       encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["totals"]["lines_found"], 2)
 
-    def test_scripts_do_not_write_atomically(self):
-        """GAP, documented: no script uses temp-file-then-rename for --out.
+    # Every script that declares an `--out` flag. Hard-coded rather than
+    # derived so that a new writer joining the tree fails this test until
+    # somebody has looked at how it writes; `atomic_io.py` is deliberately
+    # absent -- it has no --out of its own, only an `open(args.out, "w")`
+    # quoted in its docstring, which is why the scan keys on the flag.
+    OUT_WRITERS = ["arid_nodes.py", "env_safety_check.py", "flake_smells.py",
+                   "normalize_coverage.py", "pr_comment.py",
+                   "project_state.py", "risk_map.py"]
 
-        Every `--out` path in the tree is a plain `open(path, "w")`, which
-        truncates first and writes after. Two scripts told to write the same
-        .testing/ file -- which is exactly what two parallel agents following
-        the skills will do -- can interleave, and any reader that opens the
-        file mid-write sees a truncated JSON document.
-        The skills promise atomicity (skills/start/SKILL.md: "Writes are atomic
-        (temp file, then rename)"); the scripts the skills invoke do not
-        implement it.
-        SHOULD: write to `path + ".tmp"` and os.replace() onto the target.
+    def test_every_out_writer_is_atomic(self):
+        """FIXED: all seven `--out` writers go through atomic_io.
+
+        A plain `open(path, "w")` truncates first and writes after, so two
+        agents told to write the same .testing/ file -- which is what the
+        parallel dispatch in the skills does -- could interleave and both exit
+        0, and a reader opening the file mid-write saw a truncated document.
+        `scripts/atomic_io.write_text_atomic()` writes a temp file in the
+        destination directory and os.replace()s it onto the target, so a
+        reader sees the whole old file or the whole new one. This is what
+        makes skills/start/SKILL.md ("Writes are atomic (temp file, then
+        rename)") true rather than aspirational.
+
+        The previous version of this test asserted `assertNotIn("os.replace",
+        offenders)` against a list of FILENAMES, so it could only have failed
+        for a script literally named `os.replace`; four conversions landed
+        under it with no signal. Both assertions below name the offending
+        script, and the first one guarantees the scan looked at anything at
+        all.
         """
-        offenders = []
+        writers, offenders = [], []
         for name in sorted(os.listdir(SCRIPTS)):
             if not name.endswith(".py"):
                 continue
             with open(os.path.join(SCRIPTS, name), encoding="utf-8") as fh:
                 src = fh.read()
-            if re.search(r'open\(\s*args\.out', src) and "os.replace" not in src:
+            if '"--out"' not in src:
+                continue
+            writers.append(name)
+            # Atomic means both halves: the atomic call is present AND no
+            # plain open() of the same path survives beside it.
+            if (not re.search(r'write_text_atomic\(\s*args\.out', src)
+                    or re.search(r'open\(\s*args\.out', src)):
                 offenders.append(name)
-        self.assertTrue(offenders, "expected at least one --out writer")
-        # Pinned as the current state. When atomic writes land, this list
-        # shrinks and the assertion below is what tells you.
-        self.assertNotIn("os.replace", offenders)
+        self.assertEqual(
+            writers, self.OUT_WRITERS,
+            "the set of --out writers changed; a new one must be atomic "
+            "before it is added here")
+        self.assertEqual(
+            offenders, [],
+            "these --out writers still truncate-then-write: %s" % offenders)
 
     def test_concurrent_writes_to_the_same_output_file_do_not_crash(self):
         # Both processes exit 0; the surviving file is whatever the last writer
@@ -1139,7 +1309,19 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         bait = "HOST=" + "a." * 4000 + "!\n"
         self.write(".env", bait)
         with timed(self, "env_safety_check on dotted-host bait"):
-            esc.scan(self.tmp)
+            result = esc.scan(self.tmp)
+        # The elapsed-time budget inside timed() is this test's point, but on
+        # its own it is satisfied by a scanner that never opened the file --
+        # a ceiling, an unreadable-file path or a classify() change would all
+        # make this "fast" for a reason that has nothing to do with the regex.
+        # So pin that the bait was actually read, and how much of it was
+        # looked at.
+        self.assertEqual(result["scanned_files"], [".env"])
+        self.assertEqual(result["skipped_files"], [])
+        detectors = {f["detector"] for f in result["findings"]}
+        self.assertIn("host_scan_truncated", detectors,
+                      "the value is longer than MAX_HOST_SCAN_CHARS, so the "
+                      "scanner must say it only looked at the head")
 
     def _email_sub_cost(self, n):
         # real_hosts_in() is the hot path; drive it through the public scanner
@@ -1150,7 +1332,7 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         return time.monotonic() - start
 
     def test_env_safety_check_cost_is_linear_in_value_length(self):
-        """FIXED: EMAIL_RE.sub() was quadratic in the length of a config value.
+        r"""FIXED: EMAIL_RE.sub() was quadratic in the length of a config value.
 
         real_hosts_in() calls `EMAIL_RE.sub(" ", remainder)` on every value.
         EMAIL_RE is `[A-Za-z0-9._%+\-]+@...`; on a long run of characters with
@@ -1189,7 +1371,11 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         ]
         self.write(".env", "".join(lines))
         with timed(self, "env_safety_check on hyphen-run bait"):
-            esc.scan(self.tmp)
+            result = esc.scan(self.tmp)
+        self.assertEqual(result["scanned_files"], [".env"])
+        self.assertEqual(result["skipped_files"], [])
+        self.assertIn("host_scan_truncated",
+                      {f["detector"] for f in result["findings"]})
 
     def test_env_safety_check_on_unclosed_interpolation_and_email_bait(self):
         lines = [
@@ -1201,7 +1387,11 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         ]
         self.write(".env", "".join(lines))
         with timed(self, "env_safety_check on interpolation/email bait"):
-            esc.scan(self.tmp)
+            result = esc.scan(self.tmp)
+        self.assertEqual(result["scanned_files"], [".env"])
+        self.assertEqual(result["skipped_files"], [])
+        self.assertIn("host_scan_truncated",
+                      {f["detector"] for f in result["findings"]})
 
     def test_env_safety_check_on_many_pathological_lines(self):
         # 1,000 lines of bait, each under the per-line shapes above. The point
@@ -1209,7 +1399,15 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         body = "".join("K%d=%s\n" % (i, "a." * 100 + "-" * 100) for i in range(1000))
         self.write(".env", body)
         with timed(self, "env_safety_check on 1,000 bait lines"):
-            esc.scan(self.tmp)
+            result = esc.scan(self.tmp)
+        self.assertEqual(result["scanned_files"], [".env"])
+        self.assertEqual(result["skipped_files"], [])
+        # Every value here is ~400 characters, well under
+        # MAX_HOST_SCAN_CHARS, so unlike the three cases above NOTHING was
+        # truncated: all 1,000 lines were matched against in full. That is
+        # what makes this a measurement of per-line cost times line count
+        # rather than of the truncation ceiling.
+        self.assertEqual(result["findings"], [])
 
     def test_flake_smells_on_tautology_backreference_bait(self):
         # Four of the TAUTOLOGY_RES carry a backreference (`([^,()]+?)\s*,\s*\1`).
@@ -1222,7 +1420,20 @@ class ReDoSTests(TempMixin, unittest.TestCase):
             lines.append("    assert " + "a" * n + " == " + "a" * n + "b\n")
         self.write("test_bait.py", "def test_x():\n" + "".join(lines))
         with timed(self, "flake_smells on tautology backreference bait"):
-            fsm.scan_paths([self.tmp])
+            result = fsm.scan_paths([self.tmp])
+        # A time budget alone is satisfied by a scanner that skipped the file.
+        # Pin that it was read, and pin exactly how much of it the regexes
+        # actually saw -- six of these lines are over MAX_LINE_CHARS, so the
+        # default run only feeds them 2,000 characters each.
+        self.assertEqual(result["summary"]["files_scanned"], 1)
+        self.assertEqual(result["skipped_files"], [])
+        self.assertEqual(result["summary"]["lines_truncated"], 6)
+        # ... and the bound has to hold when the whole bait reaches the
+        # regexes, or the only thing being measured is the line ceiling.
+        with timed(self, "flake_smells on tautology bait, line ceiling raised"):
+            full = fsm.scan_paths([self.tmp], max_line_chars=200_000)
+        self.assertEqual(full["summary"]["lines_truncated"], 0)
+        self.assertEqual(full["summary"]["files_scanned"], 1)
 
     def test_flake_smells_on_assertion_and_weak_oracle_bait(self):
         lines = [
@@ -1233,7 +1444,17 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         ]
         self.write("test_bait2.py", "def test_x():\n" + "".join(lines))
         with timed(self, "flake_smells on assertion bait"):
-            fsm.scan_paths([self.tmp])
+            result = fsm.scan_paths([self.tmp])
+        self.assertEqual(result["summary"]["files_scanned"], 1)
+        self.assertEqual(result["skipped_files"], [])
+        self.assertEqual(result["summary"]["lines_truncated"], 4)
+        with timed(self, "flake_smells on assertion bait, line ceiling raised"):
+            full = fsm.scan_paths([self.tmp], max_line_chars=200_000)
+        self.assertEqual(full["summary"]["lines_truncated"], 0)
+        # Fed in full, the weak-oracle rule does fire on
+        # `assert aaa... is not None`. That is the proof the regexes really
+        # ran over the bait rather than over a 2,000-character stub of it.
+        self.assertIn("weak-oracle", full["summary"]["by_rule"])
 
     def test_flake_smells_on_java_method_signature_bait(self):
         # JVM_METHOD_RE is `\w+\([^;]*\)\s*(?:throws\s[\w.,\s]+)?\{\s*$` -- two
@@ -1241,7 +1462,14 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         sig = "void foo(" + "," * 3000 + ") throws " + "a, " * 3000 + "{\n"
         self.write("FooTest.java", "class FooTest {\n    @Test\n    " + sig + "    }\n}\n")
         with timed(self, "flake_smells on JVM signature bait"):
-            fsm.scan_paths([self.tmp])
+            result = fsm.scan_paths([self.tmp])
+        self.assertEqual(result["summary"]["files_scanned"], 1)
+        self.assertEqual(result["skipped_files"], [])
+        self.assertEqual(result["summary"]["lines_truncated"], 1)
+        with timed(self, "flake_smells on JVM bait, line ceiling raised"):
+            full = fsm.scan_paths([self.tmp], max_line_chars=200_000)
+        self.assertEqual(full["summary"]["lines_truncated"], 0)
+        self.assertEqual(full["summary"]["files_scanned"], 1)
 
     def test_flake_smells_on_shared_mutable_state_quadratic_bait(self):
         """The one superlinear shape found: declarations x in-test lines.
@@ -1260,7 +1488,22 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         body += "".join("    other.append(1)\n" for _ in range(2000))
         self.write("test_quad.py", body)
         with timed(self, "flake_smells on shared-mutable-state bait", budget=10.0):
-            fsm.scan_paths([self.tmp])
+            result = fsm.scan_paths([self.tmp])
+        self.assertEqual(result["summary"]["files_scanned"], 1)
+        self.assertEqual(result["skipped_files"], [])
+        # Every line here is short, so nothing was truncated: all 4,000 lines
+        # went through the rule in full. Pinned, because this is the one case
+        # whose cost comes from the LINE COUNT -- if the line ceiling ever
+        # started biting here the measurement would silently become a
+        # measurement of the ceiling instead of of the quadratic.
+        self.assertEqual(result["summary"]["lines_truncated"], 0)
+        # The bait is a deliberate near-miss: it appends to `other`, which is
+        # not one of the 2,000 declared names, so the rule pays the full
+        # declarations x in-test-lines cost and then fires on nothing. The
+        # only finding is `no-assertion` on the generated test_x, and
+        # asserting exactly that is what proves the block body really was
+        # walked rather than the file being skipped or parsed as empty.
+        self.assertEqual(result["summary"]["by_rule"], {"no-assertion": 1})
 
     @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
     def test_arid_nodes_on_regex_bait(self):
@@ -1271,7 +1514,19 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         ]
         self.write("bait.py", "".join(lines))
         with timed(self, "arid_nodes on regex bait"):
-            arid.plan([self.tmp])
+            result = arid.plan([self.tmp])
+        self.assertEqual(result["summary"]["files"], 1)
+        self.assertEqual(result["skipped_files"], [])
+        # Two of the three lines are over MAX_LINE_CHARS. arid_nodes had no
+        # line ceiling at all until this change, so assert both halves: that
+        # the default run says what it shortened, AND that the bound still
+        # holds when the ceiling is raised and the planner sees every
+        # character the way it used to.
+        self.assertEqual(result["summary"]["lines_truncated"], 2)
+        with timed(self, "arid_nodes on regex bait, line ceiling raised"):
+            full = arid.plan([self.tmp], max_line_chars=1_000_000)
+        self.assertEqual(full["summary"]["lines_truncated"], 0)
+        self.assertEqual(full["summary"]["files"], 1)
 
 
 # --------------------------------------------------------------------------

@@ -23,9 +23,9 @@ stage can be re-run on its own afterwards, and you should say so.
 the run proceeds unattended. Re-asking something already answered is a defect — check
 `.testing/preferences.json` before asking anything.
 
-**Never run anything until it is safe to.** No test command, no coverage run, no
-dependency install, until step 3 has passed or the user has said yes. A suite you have
-never seen may point at production.
+**Nothing runs until it is safe and agreed.** No test command, no coverage run, no
+dependency install, until step 3 has passed and step 5 is agreed. A suite you have
+never seen may point at production, and running it is executing its author's code.
 
 ---
 
@@ -67,34 +67,38 @@ Read the verdict.
 This is not ceremony. A test suite that points at a live database deletes real data, and
 a report that leaks a key into a PR comment publishes it.
 
-## Step 4 — Profile the project
+## Step 4 — Profile the project, running none of it
 
-For each target, in parallel where they are independent. Read the matching
-`${CLAUDE_PLUGIN_ROOT}/stacks/<stack>.md` playbook and use its detection signals.
+**Dispatch the `project-analyst` agent** — one per target, in parallel where the targets
+are independent. It holds the method and writes `.testing/profile.json`, and it is the
+only agent permitted to read `${CLAUDE_PLUGIN_ROOT}/stacks/<stack>.md` for its detection
+signals, because everything after onboarding reads the small profile instead.
 
-Record: languages and frameworks; monorepo packages and their boundaries; the test
-runner and its **exact** invocation; how to run tests for changed files only; test files
-by type (unit / integration / contract / E2E); CI configuration and which jobs run
-tests; the coverage tool, its command and output format; the mocking library; where
-fixtures and factories live; services the tests require; static analysis and type
-checking available; and **which directories have no tests at all**.
+**This pass is static**: it reads the repo and runs nothing the repo supplied. Its
+glob-resolving probes (its rule 2) are deferred to step 6.
 
-Write it to `.testing/profile.json`. Every command in there must be one you have seen
-in the repo's own config, not one you assumed.
+Check what comes back: every command traced to its config file, every unmeasurable
+field `null` with a reason.
 
-## Step 4b — Show the test command before you run it, once
+## Step 5 — Agree to execute this repo's code. This is a gate
 
-**Print the exact commands you are about to run and get agreement**, before the first
-execution in a repo: whole-suite, changed-files, and coverage, each with the file you
-found it in. Name what the runner invokes implicitly — npm runs `pretest` before `test`,
-and nobody reads that one.
+Nothing the repository supplied has run yet. **Print those commands verbatim and get
+agreement** before the first one does: whole-suite, changed-files, coverage, and any
+dependency install. Give the file you found each in, and name what the runner invokes
+implicitly: npm runs `pretest` before `test`, and `install` runs `postinstall`.
 
-Running a repo's tests is executing a stranger's code, and the environment check covers
-*where* tests point, not *what* they do. Showing the string is what closes the class.
-Record the answer in `.testing/preferences.json`: asked once, re-asked when the command
-changes.
+Say what is being agreed to: **these run code written by whoever wrote this repository,
+as you, on this machine.** It is not a configuration value being approved. Step 3 covers
+*where* tests point, not *what* they do, so repeat its findings here beside the command.
+Showing the string is what closes the class; a detector list never will.
 
-## Step 5 — Suite health. This is a gate
+Record it in `.testing/preferences.json`: asked once, re-asked when a command changes.
+On a no, every later stage reports "cannot execute" plus the command it would have run.
+
+## Step 6 — Suite health. This is a gate
+
+With that recorded, re-dispatch `project-analyst` for the probes deferred at step 4.
+Then:
 
 ```
 /testsquad:health
@@ -115,7 +119,7 @@ on a foundation that does not hold.
 If dependencies are missing and the user said no to installing, record "cannot execute"
 with the exact command that would be needed. Do not install anything.
 
-## Step 6 — Risk map
+## Step 7 — Risk map
 
 ```
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/risk_map.py" "<repo>" --out .testing/risk-map.json
@@ -128,12 +132,12 @@ git history. It deliberately does not compute risk, because:
 > a repository.** Multiplying two invented ordinals produces a number that looks precise
 > and that nobody can argue with. Keep them separate and visible.
 
-Impact is collected in step 10, from the user.
+Impact is collected in step 11, from the user.
 
 Check `warnings` in the output. An empty risk map means *no data*, not *no risk*, and
 must be reported that way.
 
-## Step 7 — CLAUDE.md
+## Step 8 — CLAUDE.md
 
 If absent, create it. If present, insert or replace **only** the block between
 `<!-- testsquad:start -->` and `<!-- testsquad:end -->`, leaving everything else byte-for-
@@ -147,7 +151,7 @@ a pointer to `.testing/`; it does not hold the knowledge itself.
 
 Re-running `/start` replaces the block and never duplicates it.
 
-## Step 8 — Generate the agents
+## Step 9 — Generate the agents
 
 Write to `<repo>/.claude/agents/ts-*.md`, from the templates in
 `${CLAUDE_PLUGIN_ROOT}/templates/agents/`, filled in from the profile.
@@ -167,13 +171,13 @@ Derive the repo's conventions into `.testing/conventions.md` — a numbered rule
 agents *enforce*. Separating the rules from the enforcer means `/start` can refresh the
 rules without touching an agent.
 
-## Step 9 — Diagnose
+## Step 10 — Diagnose
 
 ```
 /testsquad:diagnose
 ```
 
-Gated on step 5. Coverage, the test-type matrix, and the gaps against the risk map. Every
+Gated on step 6. Coverage, the test-type matrix, and the gaps against the risk map. Every
 figure is labelled with the health verdict it was measured under — a 78% measured under
 AMBER is not the same claim as 78% under GREEN.
 
@@ -184,7 +188,7 @@ Never report coverage as a headline score. Report **which high-risk code is unte
 Coverage is a floor detector: uncovered code is definitely untested, but covered code may
 still be unverified.
 
-## Step 10 — The acceptance contract
+## Step 11 — The acceptance contract
 
 Propose `.testing/acceptance-contract.md` and **get explicit approval before it becomes
 the baseline**. It holds:
@@ -200,7 +204,7 @@ the baseline**. It holds:
 ≥90% and every new test fails under fail-proof"*, never *"tax is well tested"*. Lowering a
 threshold later is recorded in `.testing/decisions.md`, so standards cannot quietly erode.
 
-## Step 11 — The roadmap
+## Step 12 — The roadmap
 
 Rank by leverage: risk reduced ÷ effort. Static analysis and type checking usually rank
 first because they are the cheapest wins on the board.
@@ -210,9 +214,9 @@ Each item carries: what to do, which agent does it, the expected change, and a
 
 Item #0 is a RED health verdict, if there is one.
 
-## Step 12 — Report
+## Step 13 — Report
 
-Write the dashboard to `.testing/reports/diagnostic-<date>.html`, following
+Write the dashboard to `.testing/reports/dashboard-<date>.html`, following
 `${CLAUDE_PLUGIN_ROOT}/templates/report/RULES.md`. Lead with the health verdict and the
 contract scorecard. Offer to install the PR comment Action.
 

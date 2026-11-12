@@ -17,7 +17,7 @@ and the finish line checkable.
 
 - `.testing/acceptance-contract.md` — the targets. You plan toward these, not toward a
   number you think is good. If no contract exists, stop and say so: without agreed
-  targets a roadmap is a list of opinions. Offer `/testsquad:start` step 10.
+  targets a roadmap is a list of opinions. Offer `/testsquad:start` step 11.
 - `.testing/health-baseline.json` — the verdict, and its commit.
 - `.testing/coverage-state.md` and `.testing/risk-map.json` — where the gaps are.
 - `.testing/known-issues.md`, `.testing/decisions.md`, `.testing/preferences.json` —

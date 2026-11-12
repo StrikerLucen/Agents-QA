@@ -39,12 +39,17 @@ Standard library only.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import math
 import os
 import re
 import sys
 from collections import Counter
+
+if __package__ in (None, ""):  # run as a script: scripts/ is already sys.path[0]
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from atomic_io import write_text_atomic  # noqa: E402
 
 MARKER = "<!-- testsquad:pr-comment -->"
 MAX_ROWS = 10
@@ -345,11 +350,61 @@ def _as_rows(value, notes: list[str] | None, what: str) -> list[dict]:
 # rendering
 # --------------------------------------------------------------------------
 
-def verdict_line(health, gates, findings, notes: list[str] | None = None) -> str:
-    """One sentence answering: is anything on fire, and what do I do first?"""
+def _as_missing(value, notes: list[str] | None = None) -> list:
+    """The missing/unreadable input list, in whatever shape it arrived.
+
+    A single string is a list of one -- a hand-written data file spells it
+    that way, and dropping it would be the exact failure this field exists to
+    prevent."""
+    if value is None or value == "" or value == []:
+        return []
+    if isinstance(value, list):
+        return [item for item in value if item is not None and item != ""]
+    return [value]
+
+
+def verdict_line(health, gates, findings, notes: list[str] | None = None,
+                 missing_inputs=None, anything_ran: bool | None = None) -> str:
+    """One sentence answering: is anything on fire, and what do I do first?
+
+    `missing_inputs` is what makes this honest. Without it the function can
+    only see empty containers, and "every check passed" and "no check ran"
+    reach it as the same three empty values -- which is how the headline came
+    to say "No new findings on this change." over a run where nothing ran.
+
+    `anything_ran` is True/False when the caller knows (main() counts the
+    files it actually read), and None when it does not; None falls back to
+    "did any input arrive with content in it".
+
+    Precedence, chosen deliberately:
+
+      0. Nothing readable at all outranks everything. There is no verdict to
+         give, and an all-clear here is the single worst string this tool can
+         emit.
+      1. A real problem found by the inputs that *did* run outranks the
+         incompleteness, because it is true and actionable: RED suite, then a
+         blocking finding, then a failed gate. The incompleteness is appended
+         to that headline, never dropped -- "gates all passed" with
+         findings.json missing is not an all-clear either.
+      2. Any headline that would otherwise read as an all-clear is replaced
+         while an input is missing. A partial run has not earned one.
+    """
     health = _as_dict(health, notes, "health")
     gates = _as_rows(gates, notes, "gates")
     findings = _as_rows(findings, notes, "findings")
+    missing = _as_missing(missing_inputs, notes)
+    if anything_ran is None:
+        anything_ran = bool(health or gates or findings)
+
+    if missing and not anything_ran:
+        return ("**Nothing was measured on this change.** No testsquad input "
+                "could be read, so this is not an all-clear — see below for "
+                "what did not run.")
+
+    incomplete = ""
+    if missing:
+        incomplete = (f" Not everything ran: {len(missing)} input(s) were "
+                      "missing or unreadable, so the picture is incomplete.")
 
     blocking = [f for f in findings if f.get("severity") in ("S1", "S2")]
     failed = [g for g in gates if not g.get("met")]
@@ -357,15 +412,30 @@ def verdict_line(health, gates, findings, notes: list[str] | None = None) -> str
 
     if health_verdict == "RED":
         return ("**The test suite is not healthy.** Coverage figures are withheld "
-                "because they would not mean anything until it runs clean.")
+                "because they would not mean anything until it runs clean."
+                + incomplete)
     if blocking:
         worst = min(blocking, key=lambda f: SEVERITY_ORDER.get(f.get("severity"), 9))
         return (f"**{cell(worst.get('severity'), notes, 'a severity')}: "
-                f"{cell(_or(worst.get('title'), 'see below'), notes, 'a finding title')}**")
+                f"{cell(_or(worst.get('title'), 'see below'), notes, 'a finding title')}**"
+                + incomplete)
     if failed:
         names = ", ".join(cell(_or(g.get("name"), "?"), notes, "a gate name")
                           for g in failed[:2])
-        return f"**{len(failed)} quality gate(s) not met:** {names}"
+        return f"**{len(failed)} quality gate(s) not met:** {names}" + incomplete
+    if missing:
+        # Everything that ran came back clean -- but not everything ran, and
+        # an all-clear from a partial run is the defect this branch exists to
+        # prevent. Report what was found without claiming it is the whole
+        # picture.
+        tail = (f"{len(missing)} input(s) were missing or unreadable — "
+                "see below for which.")
+        if findings:
+            return ("**Not everything ran, so this is not an all-clear.** No "
+                    "blocking issues in the checks that did run, and some "
+                    f"findings worth a look below; {tail}")
+        return ("**Not everything ran, so this is not an all-clear.** The checks "
+                f"that did run found nothing; {tail}")
     if findings:
         return "No blocking issues. Some findings worth a look below."
     return "No new findings on this change."
@@ -377,7 +447,8 @@ def render(data) -> str:
     # The whole file can be the wrong shape -- a JSON array, a string, a
     # number. That is an empty report plus a notice, never a traceback in a
     # CI step on somebody's pull request.
-    if not isinstance(data, dict):
+    unusable_file = not isinstance(data, dict)
+    if unusable_file:
         _note(notes, "the data file was not a JSON object")
         data = {}
 
@@ -396,8 +467,23 @@ def render(data) -> str:
     findings.sort(key=lambda f: (SEVERITY_ORDER.get(f.get("severity"), 9),
                                  -counts[id(f)]))
 
+    missing = _as_missing(data.get("missing_inputs"), notes)
+    if unusable_file:
+        # The data file is itself an input, and an unreadable one. Saying so
+        # here is what stops the headline below asserting an all-clear over a
+        # file nobody could parse.
+        missing.insert(0, "the --data file (not a JSON object)")
+
+    # main() counts the inputs it actually read; `None` when nobody told us,
+    # and verdict_line falls back to inspecting what arrived. Never guessed
+    # into a number -- an absent count stays absent.
+    read = data.get("inputs_read")
+    if isinstance(read, bool) or not isinstance(read, int):
+        read = None
+    anything_ran = None if read is None else read > 0
+
     out = [MARKER, "## testsquad", "",
-           verdict_line(health, gates, findings, notes), ""]
+           verdict_line(health, gates, findings, notes, missing, anything_ran), ""]
 
     if health.get("verdict"):
         bits = [f"Suite health: **{cell(health.get('verdict'), notes, 'the health verdict')}**"]
@@ -490,14 +576,12 @@ def render(data) -> str:
                    "— see the full report._")
         out.append("")
 
-    missing = data.get("missing_inputs")
     if missing:
         # Absence of data is not absence of problems. Say which checks did not
-        # run, so nobody reads a short comment as a clean bill of health.
-        if not isinstance(missing, list):
-            missing = [missing]
-        out.append("> **Not everything ran.** These inputs were missing, so the "
-                   "report above is incomplete:")
+        # run, so nobody reads a short comment as a clean bill of health. The
+        # headline above says the same thing; these two must never disagree.
+        out.append("> **Not everything ran.** These inputs were missing or "
+                   "unreadable, so the report above is incomplete:")
         for item in missing[:MAX_ROWS]:
             out.append(f"> - {cell(item, notes, 'a missing-input name')}")
         out.append("")
@@ -532,18 +616,31 @@ def render(data) -> str:
 # entry point
 # --------------------------------------------------------------------------
 
+def read_object(path: str) -> dict | None:
+    """The parsed object, or **None** when the file could not be read as one.
+
+    The None matters. `load()` flattens "unreadable" and "empty" into the same
+    `{}`, which is precisely the distinction this renderer exists to keep: a
+    file nobody could parse must not be counted as a check that ran and found
+    nothing. Callers that need to tell those apart use this; callers that only
+    need a dict use `load()`.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            blob = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError, RecursionError):
+        return None
+    return blob if isinstance(blob, dict) else None
+
+
 def load(path: str | None) -> dict:
     """Always a dict. A JSON array or scalar at the top level is not data this
     renderer can use, and a truthy non-dict slipping past main()'s guard is
     exactly how a traceback reaches a pull request."""
     if not path or not os.path.exists(path):
         return {}
-    try:
-        with open(path, encoding="utf-8") as fh:
-            blob = json.load(fh)
-    except (OSError, json.JSONDecodeError, ValueError, RecursionError):
-        return {}
-    return blob if isinstance(blob, dict) else {}
+    blob = read_object(path)
+    return {} if blob is None else blob
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -572,28 +669,59 @@ def main(argv: list[str] | None = None) -> int:
             "gates":    ("gates.json",           "/testsquad:verify"),
             "findings": ("findings.json",        "/testsquad:test or :debug"),
         }
-        data, missing = {}, []
+        data, missing, absent, read = {}, [], [], 0
         for key, (filename, producer) in sources.items():
             path = os.path.join(args.testing_dir, filename)
+            empty = [] if key in ("gates", "findings") else {}
             if not os.path.exists(path):
+                absent.append(filename)
                 missing.append(f"{filename} (run {producer})")
-                data[key] = [] if key in ("gates", "findings") else {}
+                data[key] = empty
                 continue
-            blob = load(path)
+            blob = read_object(path)
+            if blob is None:
+                # Present but unreadable is not "ran and found nothing". It
+                # has to be declared exactly as loudly as an absent file, or
+                # four broken files render as a clean bill of health.
+                missing.append(f"{filename} (unreadable — rerun {producer})")
+                data[key] = empty
+                continue
+            read += 1
             data[key] = blob.get(key, []) if key in ("gates", "findings") else blob
 
-        if len(missing) == len(sources):
+        if len(absent) == len(sources):
             print("error: no testsquad data in "
                   f"{args.testing_dir}. Nothing to report.\n  missing: "
                   + "\n           ".join(missing), file=sys.stderr)
             return 2
+        # Counted, not guessed: render() needs to tell "nothing ran" from
+        # "everything ran and found nothing", and only this loop knows.
+        data["inputs_read"] = read
         if missing:
             data["missing_inputs"] = missing
 
     body = render(data)
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as fh:
-            fh.write(body + "\n")
+        # Same contract as every other --out writer in scripts/ (compare
+        # risk_map.py and env_safety_check.py): a write that cannot happen is
+        # a diagnosable exit 2, never a traceback in the CI step that comments
+        # on somebody's pull request. The skill writes to
+        # .testing/reports/pr-comment.md, a directory nothing guarantees
+        # exists.
+        try:
+            # write_text_atomic() creates a missing parent directory; this
+            # writer deliberately does not, so a mistyped --out stays the
+            # diagnosable exit 2 it already was rather than silently
+            # materialising a directory tree nobody asked for. Raised, not
+            # printed inline, so there is still exactly one failure path.
+            parent = os.path.dirname(os.path.abspath(args.out))
+            if not os.path.isdir(parent):
+                raise FileNotFoundError(
+                    errno.ENOENT, os.strerror(errno.ENOENT), args.out)
+            write_text_atomic(args.out, body + "\n")
+        except OSError as exc:
+            print(f"error: cannot write {args.out}: {exc}", file=sys.stderr)
+            return 2
         print(f"wrote {args.out} ({len(body)} bytes)", file=sys.stderr)
     else:
         print(body)
