@@ -18,8 +18,16 @@ Not counted as claims: the project's own eval targets in `evals/README.md` and
 | **SOURCED** — present in RESEARCH.md, same value | 61 |
 | **DRIFTED** — present, but value or attribution changed | 2 (both fixed) |
 | **OVERSTATED** — RESEARCH hedges, the file did not | 2 (both softened) |
-| **UNSOURCED** — asserted nowhere in RESEARCH.md | 17 |
+| **HEDGED** — unsourced tool-performance figures, rewritten qualitatively | 8 (all in `stacks/`) |
+| **UNSOURCED** — asserted nowhere in RESEARCH.md | 9 |
 | **Total** | 82 |
+
+The 8 HEDGED claims were previously counted under UNSOURCED (17 → 9). They were the
+tool-performance folklore in the playbooks — items H1–H8 below. None of them was given a
+citation: the invented precision was removed and the actionable advice kept, with a
+measurement the reader can take in its place. The 9 that remain UNSOURCED (items 1–3)
+are load-bearing research figures outside `stacks/`, and sourcing them is the owner's
+call, not a hedging job.
 
 Plus 7 internal issues inside RESEARCH.md itself (below). No edits were made to
 RESEARCH.md.
@@ -68,44 +76,62 @@ ledger does not hold.
 *To source:* the arid-node section of TSE 2021, or drop to "Google's rule set is large
 and grown from feedback; ours is smaller."
 
-### 4. Spring context cost: "a full-context test is **10–60x** the cost of a `@WebMvcTest`"
-`stacks/jvm.md:163`
+Items 4–7 of this list have been moved to **HEDGED** below.
 
-A 6x-wide range presented as fact, driving the "prefer slice annotations" rule.
-*To source:* a Spring Boot benchmark, or restate as "materially more expensive — measure
-it in your repo with `--debug` context-load logging."
+## HEDGED — rewritten 2026-11-12
 
-### 5. "`build_stubbed` is **10–100x faster** — the biggest single speedup available in most Rails suites"
-`stacks/ruby.md:403`
+Eight tool-performance claims in `stacks/*.md`. Each described how slow a tool feels,
+not what the product promises; none had a source, and none was given one. The rewrite
+keeps the advice, the flag and the command, and replaces the invented figure with a
+measurement the reader can take. `grep` confirms no removed figure survives anywhere in
+the repo.
 
-A 10x-wide range *plus* a superlative ("the biggest single speedup available in most
-Rails suites"), neither measured here.
-*To source:* a published factory_bot benchmark, or cut to "`build_stubbed` avoids the
-database; it is usually the cheapest large win in a Rails suite."
+### H1. Spring context cost — `stacks/jvm.md:163`
 
-### 6. Tool performance multipliers (4 claims)
-- `stacks/go.md:442` — "`-race` costs roughly **2–10x** runtime and **~5–10x** memory"
-- `stacks/rust.md:144` — "`cargo check` … **~5-10x faster** than a test build"
-- `stacks/php.md:206-207` — "**PCOV** fast (~1.2–2x)" / "**Xdebug** slow (~2–10x)"
-- `stacks/dotnet.md:168` — "`FullyQualifiedName~Foo` is the one you want **90% of the time**"
+- **Before:** "A full-context test is **10–60x** the cost of a `@WebMvcTest`, and context reuse breaks whenever …"
+- **After:** "A full-context test is dramatically slower to start than a `@WebMvcTest` — measure the gap in your own repo before deciding (`./gradlew test --profile`, or `logging.level.org.springframework.test.context.cache=DEBUG` to watch the context cache). Context reuse breaks whenever …"
+- The "prefer slice annotations" rule and the `@MockBean`/`@DirtiesContext` grep are unchanged.
 
-Folklore-grade numbers. Low individual damage, but they are the kind of figure the
-project's own RULES.md forbids ("never a number you did not measure"), so they are a
-standards violation even where they happen to be right. The Go `-race` figure is also the
-*only* one with an official upstream number to cite (the Go race-detector docs say 2–20x
-CPU and 5–10x memory), which makes the stated "2–10x runtime" look like a transcription
-slip.
-*To source:* upstream docs for `-race`, `cargo check`, PCOV/Xdebug; delete the dotnet
-"90% of the time" rhetorical figure outright.
+### H2. `build_stubbed` speedup — `stacks/ruby.md:377`
 
-### 7. Container and browser weights (2 claims)
-- "Docker daemon; **2–20s** startup" — `stacks/go.md:331`, `jvm.md:396`, `js-ts.md:317`, `rust.md:418`, `ruby.md:401`, `php.md:442`
-- "Browser download **~1GB**" — `stacks/js-ts.md:314`, `dotnet.md:405`
+- **Before:** "**`build_stubbed` is 10–100x faster** — the biggest single speedup available in most Rails suites"
+- **After:** "**`build_stubbed` avoids the database entirely** — usually the cheapest large win in a Rails suite. Confirm it on yours with `bundle exec rspec --profile` before and after"
+- Both the 10x-wide range and the unmeasured superlative are gone; the ordering advice at `ruby.md:623` (`build_stubbed` > `build` > `create`) needed no change.
 
-Repeated across six and two files respectively, which makes them read as a measured
-house figure. Lowest damage — they are order-of-magnitude orientation, not decision
-inputs — but they should either be sourced once or written as "seconds, not
-milliseconds" / "hundreds of megabytes".
+### H3. Go `-race` multipliers — `stacks/go.md:442`
+
+- **Before:** "`-race` costs roughly **2–10x** runtime and **~5–10x** memory."
+- **After:** "`-race` costs a large multiple of both runtime and memory — the Go race detector's own documentation gives the upstream figures, and `go test -count=1 ./pkg` with and without `-race` gives yours."
+- The upstream numbers were deliberately *not* copied in: a figure enters RESEARCH.md first. The reader is pointed at the authority and at their own measurement.
+
+### H4. `cargo check` speedup — `stacks/rust.md:138`
+
+- **Before:** "`# type-check only; ~5-10x faster than a test build`"
+- **After:** "`# type-check only; far cheaper than a test build (time both once)`"
+
+### H5. PHP coverage drivers — `stacks/php.md:196-197`
+
+- **Before:** "| **PCOV** | fast (**~1.2–2x**) |" / "| **Xdebug** | slow (**~2–10x**) |"
+- **After:** "| **PCOV** | fast — consistently the cheaper driver |" / "| **Xdebug** | slow — consistently the costlier driver |", plus a new line under the table: "Put a number on "fast" and "slow" for *your* suite rather than trusting a generic multiplier: `time vendor/bin/phpunit` with no coverage, then time each of the two commands below."
+- Counted as two claims, one per driver; the branch-coverage column, which is what the table is actually for, is untouched.
+
+### H6. .NET filter rhetoric — `stacks/dotnet.md:163`
+
+- **Before:** "`FullyQualifiedName~Foo` is the one you want **90% of the time**."
+- **After:** "`FullyQualifiedName~Foo` is the one to reach for by default; use the others only when a substring match is ambiguous."
+- Deleted rather than measured, as the audit recommended: there is nothing here to measure.
+
+### H7. Testcontainers startup — `stacks/{go,jvm,js-ts,rust,ruby,php,python}.md`
+
+- **Before:** "Docker daemon required; **2–20s** startup"
+- **After:** "Docker daemon required; container startup costs seconds, not milliseconds — time it in your own suite" (the JVM row reads "real container startup, usually seconds — time it in your own suite", keeping its `testcontainers.reuse.enable=true` advice)
+- **Seven** files, not the six the audit listed: `stacks/python.md:313` carried the same figure and was missed.
+
+### H8. Playwright browser download — `stacks/{js-ts,dotnet,python}.md`
+
+- **Before:** "Browser download **~1GB**"
+- **After:** "Browser download is large — hundreds of megabytes, cache it in CI"
+- **Three** files, not the two the audit listed: `stacks/python.md:317` was missed.
 
 ## DRIFTED — fixed
 
@@ -191,8 +217,9 @@ publication.
 ## How to keep this clean
 
 1. **A number enters RESEARCH.md before it enters any other file.** The two violations
-   that preceded this audit, and most of the 17 above, are the same failure: a figure
-   written straight into an agent or playbook because it sounded settled.
+   that preceded this audit, and all 17 originally listed as UNSOURCED, are the
+   same failure: a figure written straight into an agent or playbook because it
+   sounded settled.
 2. **Carry the section number with the number.** `(RESEARCH §15)` inline costs eight
    characters and makes drift auditable with `grep`. Where that is present, this audit
    found no unsourced claims.

@@ -135,7 +135,7 @@ Make the hook fast and non-blocking:
 ```bash
 cargo test -p acme-cart --lib            # unit tests only — skips integration binaries
 cargo test -p acme-cart --lib --no-fail-fast
-cargo check -p acme-cart                 # type-check only; ~5-10x faster than a test build
+cargo check -p acme-cart                 # type-check only; far cheaper than a test build (time both once)
 ```
 
 `cargo check` first, then `cargo test --lib` on the changed crate, is the
@@ -403,7 +403,7 @@ file**.
 |---|---|---|
 | **`tests/*.rs` integration targets** | The native seam: the crate's public API, one process per file | Each file is a separate binary — compile time scales with file count. Shared helpers must live in `tests/common/mod.rs` |
 | **`wiremock`** (Rust crate) | Async HTTP stubbing against an outbound client | Spins a real local server per test; cheap. The idiomatic choice for `reqwest` clients |
-| **`testcontainers-rs`** | Real Postgres/Redis/Kafka | Docker daemon required; 2–20s startup. Gate with `#[ignore]` + `--ignored` in CI, or a feature flag |
+| **`testcontainers-rs`** | Real Postgres/Redis/Kafka | Docker daemon required; container startup costs seconds, not milliseconds — time it in your own suite. Gate with `#[ignore]` + `--ignored` in CI, or a feature flag |
 | **`sqlx::test`** | Per-test transactional Postgres with automatic rollback | Genuinely excellent if the repo uses sqlx. Needs a live DB and `DATABASE_URL` — see §7 |
 | **`assert_cmd` + `predicates` + `tempfile`** | CLI binaries | The standard trio for `src/bin` crates. `Command::cargo_bin("acme")` |
 | **`insta`** | Snapshot assertions | `cargo insta review` is a deliberate review step; snapshots still rot. Commit `*.snap`, never `*.snap.new` |

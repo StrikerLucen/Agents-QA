@@ -279,10 +279,23 @@ def check_hooks(root: str, r: Report) -> None:
 
 
 def check_layout(root: str, r: Report) -> None:
-    """A CLAUDE.md at the plugin root is not loaded as context and warns."""
+    """A CLAUDE.md at the plugin root is only a mistake in a packaged plugin.
+
+    The same file means two different things depending on who opens the tree.
+    Installed, a plugin's CLAUDE.md is never loaded, so instructions put there
+    reach nobody -- that is the warning. Opened as a development checkout, it
+    IS loaded, and it is how a fresh session picks up how to work on the repo.
+    Warning unconditionally fails --strict for a file doing exactly its job,
+    so the check asks which tree this is: a tests/ or .git/ directory means a
+    checkout somebody develops in. Do not "simplify" this back to a bare
+    os.path.exists -- that is the broken version.
+    """
     if os.path.exists(os.path.join(root, "CLAUDE.md")):
-        r.warn("CLAUDE.md", "at the plugin root this is not loaded as context; "
-                            "put instructions in a skill instead")
+        developed_here = any(os.path.isdir(os.path.join(root, d))
+                             for d in ("tests", ".git"))
+        if not developed_here:
+            r.warn("CLAUDE.md", "at the plugin root this is not loaded as context; "
+                                "put instructions in a skill instead")
     for component in ("agents", "skills"):
         if not os.path.isdir(os.path.join(root, component)):
             r.warn(component, "directory absent")

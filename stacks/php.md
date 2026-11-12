@@ -193,9 +193,14 @@ php -i | grep -E "xdebug.mode|pcov.enabled"
 
 | Driver | Speed | Branch coverage | Use when |
 |---|---|---|---|
-| **PCOV** | fast (~1.2–2x) | **no — line coverage only** | CI coverage runs where you only need line data |
-| **Xdebug** | slow (~2–10x) | **yes**, with `xdebug.mode=coverage` and path/branch collection enabled | when branch data is required, and for debugging |
+| **PCOV** | fast — consistently the cheaper driver | **no — line coverage only** | CI coverage runs where you only need line data |
+| **Xdebug** | slow — consistently the costlier driver | **yes**, with `xdebug.mode=coverage` and path/branch collection enabled | when branch data is required, and for debugging |
 | none | n/a | n/a | `--coverage-*` silently produces nothing useful and PHPUnit warns. **Check first** |
+
+Put a number on "fast" and "slow" for *your* suite rather than trusting a
+generic multiplier: `time vendor/bin/phpunit` with no coverage, then time each
+of the two commands below. The gap is suite-shaped and worth knowing before you
+pick a CI driver.
 
 ```bash
 # The command to use. XDEBUG_MODE=coverage must be set for the process.
@@ -393,7 +398,7 @@ silently. Mitigation: an occasional full run off the critical path.
 | **Laravel `RefreshDatabase` / `DatabaseTransactions`** | Per-test DB isolation | `RefreshDatabase` migrates once then wraps in transactions — fast. `DatabaseMigrations` re-migrates **every test** and is the usual reason a Laravel suite takes 20 minutes |
 | **Symfony `dama/doctrine-test-bundle`** | Transactional rollback per test for Doctrine | The Symfony equivalent of `RefreshDatabase`; a large, cheap speedup |
 | **SQLite `:memory:`** as the test DB | Fast local runs | **Different SQL dialect from MySQL/Postgres** — JSON columns, `ENUM`, full-text, locking and migration DDL all differ. A green SQLite suite does not prove the production query works |
-| **Testcontainers for PHP** | Real MySQL/Postgres/Redis | Docker daemon; 2–20s startup. Many PHP teams use a docker-compose service instead |
+| **Testcontainers for PHP** | Real MySQL/Postgres/Redis | Docker daemon; container startup costs seconds, not milliseconds — time it in your own suite. Many PHP teams use a docker-compose service instead |
 | **Guzzle `MockHandler`** / **`Http::fake()`** (Laravel) | Faking outbound HTTP | Cheap and precise. Pair with `Http::preventStrayRequests()` so a real call is an error |
 | **`php-vcr`** | Record/replay cassettes | Cassettes rot silently. *Verify maintenance before adopting* |
 | **WireMock / MockServer (container)** | Contract-style stubbing | Another process; worth it for multi-service contracts |

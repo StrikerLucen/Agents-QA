@@ -91,17 +91,22 @@ Only now open the editor.
    and confirm the test goes red. Restore, remove the worktree, confirm `git status` on the
    working copy is clean. **Report the mutation and the failure.** A test you have not seen
    fail is unverified, and most of the value of your work is in this step.
-4. **Determinism is not optional.** Freeze the clock. Seed every RNG. No `sleep`. No real
+4. **Stability is graded at 5 runs.** Before you hand over, run each new test **5 times
+   on the same commit; any disagreement between runs is a rejection**, and make 2 of the 5
+   adversarial — one in shuffled order in a fresh process, one under CPU/IO contention.
+   That is the gatekeeper's bar, stated in its own file; do not substitute a count of your
+   own. Report the runs and say that 5 runs verify coarse stability, not stability.
+5. **Determinism is not optional.** Freeze the clock. Seed every RNG. No `sleep`. No real
    network, DNS, filesystem ordering or locale dependence. No reliance on dict, set or map
    iteration order. No float equality — use a tolerance.
-5. **Follow the repo, not your taste.** Match the existing runner, file layout, naming and
+6. **Follow the repo, not your taste.** Match the existing runner, file layout, naming and
    assertion style, even where you would write it differently. Grep for an existing fixture
    or factory before writing a new one; duplicated hand-rolled fakes are how suites drift
    out of sync with the models they imitate.
-6. **Name tests descriptively.** `test_applies_tax_before_discount`, not `test_tax_2`.
+7. **Name tests descriptively.** `test_applies_tax_before_discount`, not `test_tax_2`.
    Descriptive naming measurably improves oracle quality, and it is what makes a failure
    readable six months later.
-7. **One behaviour per test.** Several unrelated assertions in one test means a failure
+8. **One behaviour per test.** Several unrelated assertions in one test means a failure
    tells you almost nothing about what broke.
 
 # What will get your work rejected
@@ -110,13 +115,17 @@ Write none of these, and check your own output for them before you finish:
 
 - a test with **no assertion**, or an empty body
 - a tautology — `assertTrue(True)`, `expect(1).toBe(1)`, `assert x == x`
-- `assertIsNotNone` / `toBeDefined` / `toBeTruthy` as the **only** assertion: that checks
-  the function returned, not that it was right
 - a `TODO: add assertion` scaffold — it adds coverage and proves nothing
 - an assertion that merely echoes a mock's configured return value
 - a near-duplicate of a test that already exists, differing only in name
 - `.only` / `fit` / `describe.only` left behind, which silently disables the rest of the suite
 - a skipped or commented-out test presented as coverage
+
+The gatekeeper rejects every one of those outright. A **lone** `assertIsNotNone` /
+`toBeDefined` / `toBeTruthy` assertion it treats differently — weak, and called out, not
+rejected — because it checks that the function returned, not that it was right. So do not
+write one; but do not delete somebody else's test over it either. Where that line falls
+is the grader's call, not yours.
 
 # Expect most of your candidates to die
 

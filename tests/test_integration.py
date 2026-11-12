@@ -37,6 +37,7 @@ Standard library only, unittest, Python 3.9 compatible.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -65,8 +66,27 @@ def run_script(name, *args, **kwargs):
     """Run a script the way a hook or CI job would: as a subprocess, so the
     exit code and the stdout/stderr split are part of what is under test."""
     cmd = [sys.executable, os.path.join(SCRIPTS, name), *args]
+    env = dict(os.environ)
+    env.update(kwargs.get("env") or {})
     return subprocess.run(cmd, capture_output=True, text=True,
-                          cwd=kwargs.get("cwd"))
+                          cwd=kwargs.get("cwd"), env=env)
+
+
+def onboard(repo_path):
+    """Record that this user onboarded this repo, the way /testsquad:start does.
+
+    session_context.py stays silent otherwise, and deliberately: `.testing/` is
+    committed, so without a record outside the repo anyone who got you to clone
+    a repo could write your session preamble. Returns the env the child needs.
+    """
+    data_dir = tempfile.mkdtemp()
+    marker = os.path.join(
+        data_dir, "onboarded",
+        hashlib.sha256(os.path.abspath(repo_path).encode("utf-8")).hexdigest()[:16] + ".json")
+    os.makedirs(os.path.dirname(marker), exist_ok=True)
+    with open(marker, "w", encoding="utf-8") as fh:
+        fh.write("{}")
+    return {"CLAUDE_PLUGIN_DATA": data_dir}
 
 
 def load_manifest():
@@ -902,7 +922,7 @@ class SessionContextBudgetTest(ChainCase):
                       conventions=[CONVENTION_LINE] * 10,
                       blockers=["KI-{0:02d} ".format(i) + CONVENTION_LINE
                                 for i in range(6)])
-        proc = run_script("session_context.py", root)
+        proc = run_script("session_context.py", root, env=onboard(root))
         self.assertEqual(0, proc.returncode, proc.stderr)
         body = proc.stdout
         self.assertTrue(body.strip(), "a populated .testing/ printed nothing")
@@ -937,7 +957,7 @@ class SessionContextBudgetTest(ChainCase):
                   encoding="utf-8") as fh:
             json.dump({"stack": "TypeScript / Vitest"}, fh)
 
-        proc = run_script("session_context.py", root)
+        proc = run_script("session_context.py", root, env=onboard(root))
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertNotRegex(
             proc.stdout, r"\{\{[^}]*\}\}",
@@ -951,7 +971,7 @@ class SessionContextBudgetTest(ChainCase):
         uninstall."""
         root = os.path.join(self.tmp, "bare")
         os.makedirs(root)
-        proc = run_script("session_context.py", root)
+        proc = run_script("session_context.py", root, env=onboard(root))
         self.assertEqual(0, proc.returncode)
         self.assertEqual("", proc.stdout)
 

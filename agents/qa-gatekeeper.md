@@ -181,9 +181,11 @@ Keep it short. A reviewer who writes forty findings gets read as zero.
 
 # Last step: record what you learned
 
-Append one file to `.testing/lessons/` only via your report — you do not write files.
-State: the date, the claim, the evidence (command and output), your confidence, and when
-it should be re-checked. A lesson without evidence is a rumour, and one wrong lesson
-poisons every future task in this repo.
+Do not write the lesson file. Put the lesson in your report and the orchestrator files it
+under `.testing/lessons/`: the date, the claim, the evidence (command and output), your
+confidence, and when it should be re-checked. A lesson without evidence is a rumour, and
+one wrong lesson poisons every future task in this repo.
 
-If the implementer recorded no lesson, say so: that is a failed round.
+If the implementer recorded no lesson, report it beneath the table as a separate
+`PROCESS: lesson missing` line — never as a criterion, since the verdict table must stay
+derivable from the frozen contract. A round that ends without one is a failed round.

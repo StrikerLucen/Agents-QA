@@ -162,6 +162,28 @@ class RenderNeverRaises(unittest.TestCase):
                                         "title": "boom", "count": "3"}]})
         self.assertIn("(×3)", body)
 
+    def test_an_infinite_or_nan_count_does_not_crash(self):
+        """`json.load` accepts the JavaScript spellings by default, so
+        `"count": Infinity` in a hand-written findings.json reaches as_count()
+        as a real float. int() raises OverflowError on it -- not a ValueError,
+        so it escapes a `except ValueError` and lands in the PR as a
+        traceback. NaN is the same story."""
+        for literal in ("Infinity", "-Infinity", "NaN"):
+            with self.subTest(count=literal):
+                blob = ('{"findings": [{"evidence": "reproduced", '
+                        '"severity": "S2", "title": "boom", "count": %s}]}'
+                        % literal)
+                body = self.body(json.loads(blob))
+                self.assertIn("boom", body)
+                self.assertNotIn("×", body,
+                                 "no multiplier may be invented from infinity")
+                self.assertIn(MALFORMED_NOTICE, body)
+
+    def test_an_infinite_pre_existing_count_does_not_crash(self):
+        body = prc.render(json.loads('{"pre_existing_count": Infinity}'))
+        self.assertIn(prc.MARKER, body)
+        self.assertNotIn("inf", body.lower())
+
     def test_sorting_survives_mixed_junk_counts(self):
         body = self.body({"findings": [
             {"evidence": "reproduced", "severity": "S3", "title": "low", "count": {}},

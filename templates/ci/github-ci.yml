@@ -1,0 +1,131 @@
+# CI for testsquad.
+#
+# This repository's state used to be knowable only by running things on one
+# machine. That is a bad property for a project whose entire premise is that a
+# claim without evidence is not a claim. These three jobs make the state
+# visible from GitHub, on every push, from any machine.
+#
+# Design notes:
+#
+#   * No secrets, no tokens, read-only permissions. Nothing here needs write
+#     access to anything, so it does not get any.
+#
+#   * No `claude` CLI job. The CLI is not available on the runners, so an
+#     agent-behaviour check would either be skipped or lie. The evals in
+#     `evals/` stay a local, human-run exercise until that changes.
+#
+#   * No caching. The suite runs in roughly 20 seconds and the project has
+#     zero dependencies (stdlib only, deliberately). Cache plumbing would cost
+#     more to maintain than it saves.
+#
+#   * If a job here is red, it is red because the repository really is in that
+#     state. Nothing is marked `continue-on-error`. A green badge that is not
+#     earned is worse than no badge. See CONTRIBUTING.md, "Expect red".
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor, not a courtesy. The scripts rely on
+        # `from __future__ import annotations` for 3.9-compatible typing and
+        # the author's machine is 3.9.6, so a 3.9-only break must be caught
+        # here rather than discovered by the person it blocks.
+        python-version: ["3.9", "3.11", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history: the fixture regeneration and the git-history tests
+          # want a real repository, not a depth-1 graft.
+          fetch-depth: 0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Rebuild the fixture git history
+        # REQUIRED. The three fixture repositories are committed as plain
+        # files; their git history is not in this repo (an embedded repo would
+        # not survive the clone). Several tests in test_integration.py and
+        # test_risk_map.py read that history, and risk_map.py's ranking is
+        # evaluated against it, so it must be rebuilt before the suite runs.
+        # The script sets its own author/committer identity and dates, so the
+        # result is byte-identical on every machine.
+        working-directory: examples/fixtures
+        run: ./regen_git_history.sh
+
+      - name: Run the test suite
+        # Run by name, not by discovery. `python3 -m unittest discover` does
+        # not work from inside tests/ in this layout; this is the exact
+        # invocation documented in HANDOFF.md and CONTRIBUTING.md, and the one
+        # every contributor runs locally.
+        working-directory: tests
+        run: ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest
+
+  validate:
+    name: validate plugin (strict)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate the plugin manifest and context budgets
+        # This is a real gate, not a lint. --strict enforces two separate
+        # things: that the manifest and every component it names are
+        # well-formed, and that each file stays inside its context budget
+        # (3,500 tokens per agent, 3,000 per skill, 1,600 per agent template,
+        # 1,200 for the report rules). A prompt that grows past its budget is
+        # a regression in the product, because it is loaded into every run.
+        run: python3 scripts/validate_plugin.py . --strict
+
+  dogfood:
+    name: dogfood (our own flake gate, on us)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run the project's own flake gate on the project
+        # This is the most on-brand check in the file.
+        #
+        # testsquad's central claim is that a test which cannot fail is not a
+        # test. flake_smells.py is the Tier 0 gate that enforces that claim for
+        # our users. Running it on our own tests/ and scripts/ with
+        # `--fail-on block` means we are held to it too: a new `block` finding
+        # means someone on this project wrote a test that cannot fail, or one
+        # whose result depends on the clock, the network or a float equality.
+        #
+        # If we would not ship a suite like that to a user, we do not get to
+        # keep one ourselves. A failure here is a finding against us, and the
+        # fix is either the test or -- if the check is wrong -- the check,
+        # filed as a false positive. See .github/ISSUE_TEMPLATE/false_positive.md.
+        run: python3 scripts/flake_smells.py tests scripts --fail-on block

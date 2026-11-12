@@ -290,10 +290,18 @@ def as_count(value, notes: list[str] | None = None) -> int:
         _note(notes, "a finding count was not a number")
         return 1
     try:
-        return int(float(str(value).strip()))
+        parsed = float(str(value).strip())
     except (TypeError, ValueError):
         _note(notes, "a finding count was not a number")
         return 1
+    # `json.load` accepts the JavaScript spellings `Infinity` and `NaN` by
+    # default, so both reach here from a real data file. int() raises on them
+    # -- OverflowError, which is not a ValueError and would escape as a
+    # traceback in the CI step that comments on the pull request.
+    if math.isnan(parsed) or math.isinf(parsed):
+        _note(notes, "a finding count was not a finite number")
+        return 1
+    return int(parsed)
 
 
 def pct(value) -> str:

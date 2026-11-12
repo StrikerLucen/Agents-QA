@@ -310,11 +310,11 @@ changes can flip mutant status silently.
 | Tool | Use when | Honest cost |
 |---|---|---|
 | **pytest fixtures** (`conftest.py`) | The native integration seam — DB sessions, app clients, temp dirs | Fixture scope (`session` vs `function`) is the #1 source of Python's order-dependency flake (see §6) |
-| **Testcontainers-Python** | Real Postgres/Redis/Kafka/LocalStack | Docker daemon required; 2–20s startup per container; unusable in sandboxed CI |
+| **Testcontainers-Python** | Real Postgres/Redis/Kafka/LocalStack | Docker daemon required; container startup costs seconds, not milliseconds — time it in your own suite; unusable in sandboxed CI |
 | **pytest-postgresql / pytest-mysql** | Lighter than containers, local binary | Needs the server installed on the runner |
 | **responses / respx / vcrpy** | HTTP mocking (requests / httpx / cassettes) | Cassettes rot silently; a stale cassette is a test that passes against an API that changed |
 | **WireMock** (via `wiremock` py client or a container) | Contract-style stubbing of a third-party HTTP API | Another process to manage; worth it only for multi-service contracts |
-| **Playwright for Python** | Browser E2E | Browser download ~1GB; 10%-flake tier per Meta's floors |
+| **Playwright for Python** | Browser E2E | Browser download is large — hundreds of megabytes, cache it in CI; 10%-flake tier per Meta's floors |
 | **`httpx.AsyncClient(app=...)` / Django `Client` / Flask `test_client`** | In-process HTTP assertions | Proves nothing about the deployed network path |
 | **Hypothesis** | Property-based testing | **Assess-tier, not a default** — see below |
 

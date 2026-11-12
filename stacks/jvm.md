@@ -160,7 +160,10 @@ Results land in `target/surefire-reports/*.xml` (Maven, unit),
 machine-readable source of truth — parse them rather than scraping stdout.
 
 Spring Boot specifically: prefer slice annotations over `@SpringBootTest`.
-A full-context test is 10–60x the cost of a `@WebMvcTest`, and context reuse
+A full-context test is dramatically slower to start than a `@WebMvcTest` —
+measure the gap in your own repo before deciding (`./gradlew test --profile`, or
+`logging.level.org.springframework.test.context.cache=DEBUG` to watch the
+context cache). Context reuse
 breaks whenever a test uses `@MockBean`/`@MockitoBean` or `@DirtiesContext`,
 causing the context cache to thrash. Grep for these when a suite is slow:
 
@@ -393,7 +396,7 @@ path.
 
 | Tool | Use when | Honest cost |
 |---|---|---|
-| **Testcontainers (JVM)** | The idiomatic JVM integration seam — real Postgres/Kafka/Redis/Elasticsearch in a JUnit lifecycle | Docker daemon required; 2–20s per container. Reusable containers (`testcontainers.reuse.enable=true`) and `@Container static` cut this materially |
+| **Testcontainers (JVM)** | The idiomatic JVM integration seam — real Postgres/Kafka/Redis/Elasticsearch in a JUnit lifecycle | Docker daemon required; real container startup, usually seconds — time it in your own suite. Reusable containers (`testcontainers.reuse.enable=true`) and `@Container static` cut this materially |
 | **Spring Boot slices** (`@WebMvcTest`, `@DataJpaTest`, `@JsonTest`) | Fast integration without a full context | Each distinct slice config is a separate cached context; too many variants and the cache thrashes |
 | **`@SpringBootTest(webEnvironment = RANDOM_PORT)` + `TestRestTemplate`/`WebTestClient`** | Full-stack HTTP in-process | Slowest unit-adjacent test you can write; use sparingly |
 | **WireMock** | Stubbing a third-party HTTP dependency, including fault/latency injection | Another server lifecycle to manage; stubs drift from the real API unless generated from a spec |

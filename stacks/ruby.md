@@ -372,9 +372,9 @@ occasional full run off the critical path.
 | **`cuprite` (CDP) vs `selenium-webdriver`** | system-test driver | cuprite is faster with no webdriver binary to drift; selenium covers more browsers |
 | **`webmock`** | Block **all** real HTTP in tests | `WebMock.disable_net_connect!(allow_localhost: true)` in `spec_helper` is the single highest-value line in a Ruby test suite. Add it if missing |
 | **`vcr`** | Record/replay a real API once | **Cassettes rot silently** — a stale cassette is a test passing against an API that changed. Set `record: :none` in CI and re-record deliberately |
-| **Testcontainers (ruby gem)** | Real Postgres/Redis/Kafka | Docker daemon; 2–20s startup. Less common in Ruby than elsewhere; most teams run real local services instead |
+| **Testcontainers (ruby gem)** | Real Postgres/Redis/Kafka | Docker daemon; container startup costs seconds, not milliseconds — time it in your own suite. Less common in Ruby than elsewhere; most teams run real local services instead |
 | **`database_cleaner`** | Truncation when transactions cannot be used (JS system tests) | Far slower. Its presence usually means someone hit the system-test transaction problem — see §6 |
-| **`factory_bot`** | Object graphs for tests | `create` hits the DB; `build`/`build_stubbed` do not. **`build_stubbed` is 10–100x faster** — the biggest single speedup available in most Rails suites |
+| **`factory_bot`** | Object graphs for tests | `create` hits the DB; `build`/`build_stubbed` do not. **`build_stubbed` avoids the database entirely** — usually the cheapest large win in a Rails suite. Confirm it on yours with `bundle exec rspec --profile` before and after |
 | **Rails fixtures** (`test/fixtures/*.yml`) | Static shared data, loaded once per suite in a transaction | Very fast; but shared mutable data across the whole suite, and the classic source of cross-test coupling |
 | **`rswag` / `committee`** | Assert responses against an OpenAPI schema | Real contract value if a schema already exists |
 | **`shoulda-matchers` model specs** | Validations/associations | Nearly free, but **asserts the declaration, not the behaviour** — a textbook tautological test. Do not count them as coverage of business logic |

@@ -50,8 +50,17 @@ for half the success rate. So select from the change, not from the roster:
 | A reported failure, a flaky test, a red CI job | `ts-debugger` |
 | Anything, at the end | `ts-qa-gatekeeper` |
 
+The `ts-*` agents exist only after `/testsquad:start` has run here. **If one is absent,
+dispatch the plugin agent of the same name without the prefix** — `unit-test-engineer`,
+`automation-engineer`, `debugger`, `qa-gatekeeper` — and say in your report that you did,
+because those are generic where the generated ones carry this repo's commands.
+
 Give each specialist **one dimension and a tool-call budget**. An agent handed four
 dimensions and an open-ended budget exhausts its context and returns nothing usable.
+Defaults, raised only with a reason you state: **unit ≤40 tool calls, automation ≤60,
+gatekeeper ≤40, debugger the budget the current depth level sets, scout 12 web
+operations.** Each specialist states the calls it used in its report — a number it can
+count, unlike the minutes it cannot.
 
 **Keep writes with you where approval might be needed.** Subagents cannot ask the user
 anything mid-task, so investigation belongs in them and approval-gated actions belong in
@@ -79,16 +88,21 @@ the summary approves the summary.
 
 - **Rounds 1–3**: resume the *original* implementer with the findings verbatim. Its
   context is intact, which is the cheapest place to fix something.
-- **Rounds 4–5**: dispatch a *fresh* implementer on a more capable model, told plainly
-  that previous attempts failed and it now owns the problem. A loop that survives three
-  resumes usually means the implementer cannot see its own mistake.
+- **Rounds 4–5**: dispatch a *fresh* implementer — a new context, not a different model;
+  every agent here runs on the same one — told plainly that two attempts failed, what
+  they were, and that it now owns the problem. A loop that survives three resumes usually
+  means the implementer cannot see its own mistake, and a clean context is the fix.
 
-**Stop early** on any of: the same failure signature twice, a time or token budget, or a
-blocker. A loop that burns budget rediscovering the same wall is worse than one that
-stops and says so.
+**Stop early** on any of: the **same failure signature in three consecutive rounds**, a
+blocker, or the time or token budget. The signature rule never pre-empts the round-4
+hand-off: repetition is the *reason* for a fresh implementer, not an alternative to
+trying one. A loop that burns budget rediscovering the same wall is worse than one that
+stops and says so — but stopping at round 2 means the ladder was never climbed.
 
 **Minor findings are ledgered and deferred** to a final review rather than looped — but
-they must actually appear there. A roll-up nobody reads is a silent discard.
+they must actually appear there. A roll-up nobody reads is a silent discard. **Minor
+means: not attached to any acceptance criterion, and severity S3 or S4.** A gap against a
+numbered criterion is never minor, however small it looks and however late it is.
 
 ## 4. Rulings, not stalls
 

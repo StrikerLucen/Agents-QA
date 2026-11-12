@@ -160,7 +160,8 @@ exit $rc
 | Repeat for flake hunting | NUnit `[Repeat(50)]`; otherwise loop in shell |
 
 `--filter` operators: `=` exact, `!=` not, `~` contains, `!~` not-contains.
-`FullyQualifiedName~Foo` is the one you want 90% of the time.
+`FullyQualifiedName~Foo` is the one to reach for by default; use the others only
+when a substring match is ambiguous.
 
 Verify your filter selected something before trusting a green run:
 
@@ -363,7 +364,7 @@ status silently. Mitigation: an occasional full run off the critical path.
 | **SQLite in-memory** (`DataSource=:memory:`) | Lighter than a container, keeps relational semantics | Connection must stay open or the DB vanishes. Still not your production dialect |
 | **WireMock.Net** | Stubbing an outbound third-party HTTP API | Another listener; worth it for contract-style stubs |
 | **`HttpMessageHandler` fake + `IHttpClientFactory`** | Mocking one outbound call | The cheap, framework-free way. Prefer it for single calls |
-| **Playwright for .NET** | Browser E2E | Browser download ~1GB; the 10%-flake tier |
+| **Playwright for .NET** | Browser E2E | Browser download is large — hundreds of megabytes, cache it in CI; the 10%-flake tier |
 | **Verify / Snapshooter** | Approval/snapshot assertions | Snapshots rot; require a deliberate `*.received.*` → `*.verified.*` review step, and commit the verified files |
 | **FsCheck / CsCheck** | Property-based testing | **Assess-tier, not a default** (RESEARCH §16). No study shows LLM-written property tests beat example tests under equal budget |
 

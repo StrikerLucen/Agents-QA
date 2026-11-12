@@ -328,7 +328,7 @@ Go's integration story is unusually good because the stdlib covers most of it.
 | **`net/http/httptest`** | The idiomatic default. `httptest.NewServer` for a real local HTTP server; `httptest.NewRecorder` for handler unit tests | Essentially free. No reason not to use it |
 | **`testing/fstest.MapFS`** | Filesystem fakes without touching disk | Only if the code takes an `fs.FS` — refactor to accept one |
 | **`testdata/` + golden files** | Snapshot-style assertions, stdlib convention | Golden files rot; always provide an `-update` flag to regenerate |
-| **Testcontainers-Go** | Real Postgres/Redis/Kafka in integration tests | Docker daemon required; 2–20s startup. Gate behind `//go:build integration` so unit runs stay fast |
+| **Testcontainers-Go** | Real Postgres/Redis/Kafka in integration tests | Docker daemon required; container startup costs seconds, not milliseconds — time it in your own suite. Gate behind `//go:build integration` so unit runs stay fast |
 | **`dockertest`** | Older alternative to Testcontainers | Prefer Testcontainers for new work |
 | **`sqlmock`** | Asserting the exact SQL a repository emits | Asserts the query string, not the behaviour — brittle, and a textbook tautological test. Prefer a real DB via Testcontainers |
 | **`httptest` + an interface seam** | Mocking an outbound third-party HTTP call | The Go way: define a narrow interface, inject a fake. No mocking framework needed |
@@ -439,7 +439,9 @@ TZ=UTC go test ./...
 go test -race -run '^TestX$' -v ./pkg 2>&1 | grep -i "after Test has completed"
 ```
 
-`-race` costs roughly 2–10x runtime and ~5–10x memory. Run it on changed
+`-race` costs a large multiple of both runtime and memory — the Go race
+detector's own documentation gives the upstream figures, and
+`go test -count=1 ./pkg` with and without `-race` gives yours. Run it on changed
 packages in hooks and on everything in CI — not the reverse.
 
 ### Static flake smells — check before the test ever runs (Tier 0)

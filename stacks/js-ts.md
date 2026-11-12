@@ -311,10 +311,10 @@ occasional full run off the critical path.
 
 | Tool | Use when | Honest cost |
 |---|---|---|
-| **Playwright** | Default for browser E2E. Multi-browser, auto-waiting, trace viewer, parallel by default | Browser download ~1GB; CI run minutes; still the 10%-flake tier per Meta's floors (RESEARCH §17) |
+| **Playwright** | Default for browser E2E. Multi-browser, auto-waiting, trace viewer, parallel by default | Browser download is large — hundreds of megabytes, cache it in CI; CI run minutes; still the 10%-flake tier per Meta's floors (RESEARCH §17) |
 | **Cypress** | Existing investment, strong DX | Single-tab/single-origin model, slower parallelism, paid dashboard for sharding |
 | **MSW** | Mocking HTTP at the network layer in unit + component tests | Handlers drift from the real API unless generated from a schema/OpenAPI spec |
-| **Testcontainers (node)** | Real Postgres/Redis/Kafka in integration tests | Needs a Docker daemon; 2–20s container startup per suite; unusable in sandboxed CI without privileges |
+| **Testcontainers (node)** | Real Postgres/Redis/Kafka in integration tests | Needs a Docker daemon; container startup costs seconds, not milliseconds — time it in your own suite; unusable in sandboxed CI without privileges |
 | **supertest** | HTTP assertions against an Express/Koa/Nest app without binding a port | In-process only — proves nothing about the deployed network path |
 | **Testing Library** (`@testing-library/react` etc.) | Component tests via the DOM | jsdom is not a browser; layout, scroll, real focus and CSS behave differently |
 

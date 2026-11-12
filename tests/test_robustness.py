@@ -161,41 +161,51 @@ class EncodingTests(TempMixin, unittest.TestCase):
         self.assertEqual(data["totals"]["lines_found"], 2)
 
     def test_coverage_json_with_bom_is_recognised(self):
-        """BUG: a BOM on coverage.json makes auto-detection give up.
+        """Fixed: a BOM'd coverage.json is detected and parsed, not refused.
 
-        detect_format() tests `head.startswith("{")`, and the file is opened as
-        plain utf-8, so the BOM survives as a leading \\ufeff and the report is
-        rejected as unrecognisable. coverage.py itself reads the file fine, so
-        the plugin refuses a report its own ecosystem considers valid.
-        SHOULD: strip the BOM (open with utf-8-sig) and parse normally.
+        detect_format() used to test `head.startswith("{")` on text that still
+        carried a leading \\ufeff, so the report was rejected as unrecognisable
+        even though coverage.py reads its own BOM'd file fine. The numbers are
+        asserted, not just the exit code: recognising the format and then
+        mis-parsing it would be the worse failure.
         """
         self.write("coverage.json",
                    '﻿{"files": {"a.py": {"summary": '
                    '{"num_statements": 4, "covered_lines": 2}}}}')
         self.assertEqual(ncov.main([self.path("coverage.json"),
                                     "--out", self.path("o.json")]), 0)
+        with open(self.path("o.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertEqual(data["source_format"], "coveragepy")
+        self.assertEqual(data["totals"]["lines_found"], 4)
+        self.assertEqual(data["totals"]["line_pct"], 50.0)
 
-    def test_coverage_json_with_bom_currently_exits_two(self):
-        # Current behaviour, pinned so the fix above is visible when it lands.
-        # Exiting 2 is at least honest; it does not invent a number.
+    def test_bomd_coverage_json_with_no_files_is_still_an_error(self):
+        # Exit 2, but for the honest reason now: the BOM no longer defeats
+        # detection, so this is recognised as coveragepy and then refused for
+        # carrying zero records. Pinned because "unrecognisable" and "parsed
+        # nothing" used to be the same exit code hiding two different faults.
         self.write("coverage.json", '﻿{"files": {}}')
         self.assertEqual(ncov.main([self.path("coverage.json")]), 2)
+        self.assertEqual(ncov.detect_format('﻿{"files": {}}', "coverage.json"),
+                         "coveragepy")
 
-    def test_utf16_lcov_is_refused_rather_than_reported_as_empty(self):
-        """BUG: a UTF-16 lcov report is silently reported as zero coverage.
+    def test_utf16_lcov_never_produces_the_silent_zero_shape(self):
+        """Fixed: the one shape this must never produce is exit 0 + no records.
 
-        The file is read as utf-8 with errors="replace", so every line turns
-        into mojibake, no DA: record matches, and normalize exits 0 with
-        totals of zero files and line_pct=None. Downstream that is
-        indistinguishable from "this project has no coverage data" and a
-        coverage gate reads it as a clean, empty report.
-        SHOULD: detect the UTF-16 BOM and either decode it or exit 2.
+        Read as utf-8 with errors="replace" the report turns into mojibake, no
+        DA: record matches, and the run used to exit 0 with zero files and
+        line_pct=None -- indistinguishable downstream from "this project has
+        no coverage data", which a coverage gate reads as clean. Asserted as a
+        property rather than a specific outcome: decoding the file and
+        refusing it are both honest, an empty success is not.
         """
         self.write("lcov.info", LCOV_OK.encode("utf-16"), binary=True)
         rc = ncov.main([self.path("lcov.info"), "--out", self.path("o.json")])
         if rc == 0:
             with open(self.path("o.json"), encoding="utf-8") as fh:
                 data = json.load(fh)
+            self.assertNotEqual(data["totals"]["files"], 0)
             self.assertEqual(data["totals"]["lines_found"], 2)
         else:
             self.assertEqual(rc, 2)
@@ -232,20 +242,37 @@ class EncodingTests(TempMixin, unittest.TestCase):
         self.assertEqual(result["scanned_files"], [])
 
     def test_utf16_env_pointing_at_production_is_read_and_flagged(self):
-        # WRONG ANSWER, documented: a UTF-16 .env naming a production host is
-        # treated as binary, so the verdict is SAFE while the suite is aimed at
-        # production. The file is listed in skipped_files, but nothing in the
-        # CLI exit code reflects it -- `--fail-on` only looks at findings.
-        # SHOULD: decode UTF-16, or treat an unreadable .env as at least a
-        # HIGH finding so the gate does not pass on a file it never read.
+        # FIXED. Was SAFE: a UTF-16 .env was taken for binary, skipped, and the
+        # verdict computed from findings alone -- so a suite aimed at
+        # production came back clean. The BOM is now sniffed and the file
+        # decoded, so the production host is seen for what it is.
         self.write(".env", "URL=https://api.prod.acme.com\n".encode("utf-16"),
                    binary=True)
         result = esc.scan(self.tmp)
-        # Was SAFE: a UTF-16 .env read as binary, skipped, and the verdict
-        # computed from findings alone. "I could not read it" rendering as
-        # "it is safe" is the failure this gate exists to prevent.
         self.assertEqual(result["verdict"], "UNSAFE")
-        self.assertTrue(result["skipped_files"])
+        # Read, therefore NOT skipped: the file must appear in scanned_files,
+        # and the verdict must come from a real detector rather than from the
+        # "I could not read it" fallback.
+        self.assertEqual(result["skipped_files"], [])
+        self.assertEqual(result["scanned_files"], [".env"])
+        self.assertIn("production_hostname",
+                      {f["detector"] for f in result["findings"]})
+
+    def test_env_file_over_the_ceiling_never_comes_back_safe(self):
+        # The ceiling creates a new way for a sensitive file to go unread, so
+        # it has to route through the same finding every other unread reason
+        # does. A .env that was never opened is exactly where a production
+        # target hides; "too big to check" may never render as "safe".
+        self.write(".env", "URL=https://api.prod.acme.com\n" + "# pad\n" * 1000)
+        result = esc.scan(self.tmp, max_bytes=64)
+        self.assertEqual([s["file"] for s in result["skipped_files"]], [".env"])
+        self.assertIn("ceiling", result["skipped_files"][0]["reason"])
+        self.assertEqual(result["scanned_files"], [])
+        # Not SAFE, and loud enough to trip `--fail-on high`.
+        self.assertNotEqual(result["verdict"], "SAFE")
+        self.assertEqual([f["detector"] for f in result["findings"]],
+                         ["unreadable_config"])
+        self.assertTrue(esc.breaches(result, "high"))
 
     def test_latin1_env_file_does_not_crash_the_gate(self):
         self.write(".env", "PASSWORD=contrase\xf1a\nURL=https://api.prod.acme.com\n"
@@ -313,19 +340,24 @@ class EncodingTests(TempMixin, unittest.TestCase):
         self.assertEqual([e for e in report.errors if "plugin.json" in e], [])
 
     def test_validate_plugin_survives_a_utf16_agent_file(self):
-        """CRASH: validate_plugin.py dies on any component file that is not UTF-8.
+        """Fixed: a component that is not UTF-8 costs that component, not the run.
 
-        check_markdown_component() and check_context_budget() both do a bare
-        `open(path, encoding="utf-8").read()`. A UTF-16 or latin-1 agent/skill
-        markdown file raises UnicodeDecodeError straight out of validate(),
-        so the whole validation run aborts with a traceback and reports
-        nothing about the other components.
-        SHOULD: decode with errors="replace" and report the file as unreadable.
+        check_markdown_component() and check_context_budget() both did a bare
+        `open(path, encoding="utf-8").read()`, so one UTF-16 agent file raised
+        UnicodeDecodeError straight out of validate() and the run reported
+        nothing about any component. Both now go through read_text(), which
+        sniffs the BOM; the neighbouring agent must still get its verdict.
         """
         self.write("agents/a.md",
                    "---\nname: a\ndescription: x\n---\nbody\n".encode("utf-16"),
                    binary=True)
-        vplug.validate(self.tmp)
+        self.write("agents/b.md",
+                   "---\nname: b\ndescription: >\n  x\n---\n" + "b" * 500)
+        report = vplug.validate(self.tmp)
+        # a.md decoded, so it is judged on its contents (a 4-byte stub body),
+        # and b.md -- which comes after it -- was reached and found clean.
+        self.assertTrue(any("a.md" in m for m in report.warnings + report.errors))
+        self.assertEqual([e for e in report.errors if "b.md" in e], [])
 
     def test_validate_plugin_reports_a_latin1_component_without_aborting(self):
         # Fixed: the undecodable byte becomes U+FFFD, the file is still
@@ -384,24 +416,39 @@ class StructureTests(TempMixin, unittest.TestCase):
 
     def test_single_ten_megabyte_line(self):
         # One enormous line is what a minified bundle or an inlined fixture
-        # looks like. Every regex on it runs against 10MB of text at once.
+        # looks like, and every regex would run against 10MB of text at once.
+        # It is now over MAX_FILE_BYTES, so it is not scanned -- and the whole
+        # value of the ceiling depends on that being SAID rather than implied
+        # by a file's absence from the report.
         self.write("test_huge.py", "x = '" + "a" * 10_000_000 + "'\n")
         with timed(self, "flake_smells on a 10MB single line", budget=10.0):
             result = fsm.scan_paths([self.tmp])
+        self.assertEqual(result["summary"]["files_scanned"], 0)
+        skipped = result["summary"]["skipped"]
+        self.assertEqual([s["file"] for s in skipped],
+                         [self.path("test_huge.py")])
+        self.assertIn("ceiling", skipped[0]["reason"])
+
+    def test_single_ten_megabyte_line_is_scanned_when_the_ceiling_is_raised(self):
+        # The ceiling is a default, not a verdict: --max-file-bytes raises it,
+        # and the scan of a 10MB single line still has to terminate promptly.
+        self.write("test_huge.py", "x = '" + "a" * 10_000_000 + "'\n")
+        with timed(self, "flake_smells on a 10MB single line, ceiling raised",
+                   budget=20.0):
+            result = fsm.scan_paths([self.tmp], max_bytes=64 * 1024 * 1024)
         self.assertEqual(result["summary"]["files_scanned"], 1)
+        self.assertEqual(result["summary"]["skipped"], [])
 
     def test_multi_megabyte_test_file_is_read_whole_into_memory(self):
-        """RESOURCE, documented: flake_smells.py has no size ceiling at all.
+        """FIXED: flake_smells.py now has MAX_FILE_BYTES = 2MB.
 
-        read_lines() does a bare fh.read() and then splitlines(keepends=True),
-        so a file costs several times its own size in RAM. Measured on this
-        machine: a 49MB generated test file took 45s and peaked near 3GB RSS.
-        env_safety_check.py has MAX_BYTES = 2MB for exactly this reason;
-        flake_smells.py, arid_nodes.py and normalize_coverage.py have nothing.
-        SHOULD: skip (and report as skipped) anything over a few MB.
+        read_lines() did a bare fh.read() then splitlines(keepends=True), so a
+        file cost several times its own size in RAM. Measured on this machine:
+        a 49MB generated test file took 45s and peaked near 3GB RSS.
 
-        This test uses a ~2MB file so the suite stays fast, and asserts only the
-        bound that makes the extrapolation honest.
+        This file is just UNDER the ceiling, so it is still scanned -- the
+        ceiling has to bound the pathological case without quietly dropping
+        the large-but-ordinary one.
         """
         lines = ["def test_a():\n"]
         lines += ["    assert foo(%d) == %d  # padding padding padding\n" % (i, i)
@@ -988,15 +1035,18 @@ class ResourceBoundTests(unittest.TestCase):
         self.assertIn("getsize", self.source("env_safety_check.py"))
 
     def test_scripts_without_any_size_ceiling(self):
-        """RESOURCE, documented: three scripts read whole files unbounded.
+        """FIXED for three of the four: a ceiling, and a reported skip.
 
-        flake_smells.py and arid_nodes.py both do `fh.read()` in read_lines()
-        with no getsize() check; normalize_coverage.py reads the entire report
-        with `fh.read()`; risk_map.current_files() reads every tracked file
-        whole just to count its newlines. Measured: flake_smells on a 49MB
-        generated test file took 45s and peaked near 3GB RSS.
-        SHOULD: each of these needs env_safety_check's MAX_BYTES treatment --
-        a ceiling, and a 'skipped because too large' entry in the report.
+        flake_smells.py and arid_nodes.py both did a bare `fh.read()` in
+        read_lines() with no getsize() check, and risk_map.current_files()
+        read every tracked file whole just to count its newlines. Measured on
+        the input that motivated the work: a 49MB generated test file took 45s
+        and peaked near 3GB RSS. Each now has MAX_FILE_BYTES, a getsize()
+        check before the read, a --max-file-bytes flag, and a skipped_files
+        entry so an unread file can never pass for a clean one.
+
+        normalize_coverage.py is the remaining one; it is owned by another
+        change in flight and is deliberately left here as the only entry.
         """
         unbounded = []
         for name in ("flake_smells.py", "arid_nodes.py", "normalize_coverage.py",
@@ -1006,19 +1056,50 @@ class ResourceBoundTests(unittest.TestCase):
             src = self.source(name)
             if "getsize" not in src and "MAX_BYTES" not in src:
                 unbounded.append(name)
-        expected = ["flake_smells.py", "normalize_coverage.py", "risk_map.py"]
-        if arid is not None:
-            expected.insert(1, "arid_nodes.py")
-        self.assertEqual(unbounded, expected)
+        self.assertEqual(unbounded, ["normalize_coverage.py"])
 
-    def test_risk_map_reads_each_tracked_file_whole_to_count_lines(self):
-        # current_files() needs a newline count and nothing else, so it could
-        # stream in chunks. It does fh.read() instead, so a repo with one 500MB
-        # tracked fixture costs 500MB of RAM in a script that only wanted an int.
-        # SHOULD: count newlines over a chunked read.
+    def test_bounded_scripts_all_report_what_they_skipped(self):
+        # A ceiling that drops a file quietly is worse than no ceiling: the
+        # report then reads exactly like one over a clean repository. Every
+        # script that gained a ceiling must also have gained the skip list.
+        for name in ("flake_smells.py", "arid_nodes.py", "risk_map.py"):
+            if arid is None and name == "arid_nodes.py":
+                continue
+            src = self.source(name)
+            with self.subTest(script=name):
+                self.assertIn("skipped_files", src)
+                self.assertIn("--max-file-bytes", src)
+
+    def test_risk_map_counts_lines_without_reading_the_file_whole(self):
+        # FIXED. current_files() needs a newline count and nothing else, so
+        # holding the file in memory to produce one int bought nothing and
+        # cost the file's size in RAM -- a repo with one 500MB tracked fixture
+        # cost 500MB. It now streams in READ_CHUNK blocks.
         src = self.source("risk_map.py")
-        self.assertIn("chunk = fh.read()", src)
-        self.assertNotIn("while True", src)
+        self.assertNotIn("chunk = fh.read()\n", src)
+        self.assertIn("fh.read(READ_CHUNK)", src)
+        self.assertIn("chunk.count(b\"\\n\")", src)
+
+    def test_risk_map_line_count_is_still_correct_when_streamed(self):
+        # Streaming is only a win if it still counts right, including the two
+        # edge cases a chunked loop gets wrong: a chunk boundary, and a file
+        # whose last line has no trailing newline.
+        tmp = tempfile.mkdtemp(prefix="testsquad-lines-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        body = "".join("line %d\n" % i for i in range(300_000))
+        path = os.path.join(tmp, "big.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        self.assertGreater(os.path.getsize(path), rmap.READ_CHUNK)
+        self.assertEqual(rmap.count_lines(path, max_bytes=10 ** 9), 300_000)
+
+        no_newline = os.path.join(tmp, "nonl.txt")
+        with open(no_newline, "w", encoding="utf-8") as fh:
+            fh.write("a\nb")
+        self.assertEqual(rmap.count_lines(no_newline), 2)
+        # Over the ceiling: not a count of zero, which would read as an empty
+        # file and quietly inflate that file's relative churn.
+        self.assertIsNone(rmap.count_lines(path, max_bytes=16))
 
     def test_flake_smells_and_arid_nodes_cap_output_not_input(self):
         # arid_nodes does bound its OUTPUT (max_per_file, default 7), which is
@@ -1068,9 +1149,8 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         esc.scan_text(line, rel=".env", kind="env")
         return time.monotonic() - start
 
-    @unittest.expectedFailure
     def test_env_safety_check_cost_is_linear_in_value_length(self):
-        """DoS: EMAIL_RE.sub() is quadratic in the length of a config value.
+        """FIXED: EMAIL_RE.sub() was quadratic in the length of a config value.
 
         real_hosts_in() calls `EMAIL_RE.sub(" ", remainder)` on every value.
         EMAIL_RE is `[A-Za-z0-9._%+\-]+@...`; on a long run of characters with
@@ -1310,6 +1390,53 @@ class ManifestTests(TempMixin, unittest.TestCase):
         self.write("hooks/hooks.json", "[]")
         report = vplug.validate(self.tmp)
         self.assertTrue(any("top-level 'hooks' key" in e for e in report.errors))
+
+    def test_every_malformed_manifest_is_reported_in_one_run(self):
+        # The whole value of a validator is telling you everything that is
+        # wrong at once. Each of these used to abort the run with a traceback,
+        # so whichever came first was the only thing you ever heard about.
+        self.write(".claude-plugin/plugin.json", '{"name": 42}')
+        self.write(".claude-plugin/marketplace.json",
+                   '{"name": 123, "owner": {"name": "x"}, "plugins": []}')
+        self.write("hooks/hooks.json", "5")
+        self.write("agents/a.md",
+                   "---\nname: a\ndescription: x\n---\nbody\n".encode("utf-16"),
+                   binary=True)
+        self.write("agents/b.md",
+                   "---\nname: b\ndescription: >\n  x\n---\n" + "b" * 500)
+        report = vplug.validate(self.tmp)
+        joined = "\n".join(report.errors)
+        self.assertIn("plugin.json", joined)
+        self.assertIn("marketplace.json", joined)
+        self.assertIn("hooks/hooks.json", joined)
+        # And the one well-formed component still got checked, last of all.
+        self.assertEqual([e for e in report.errors if "b.md" in e], [])
+
+    def test_claude_md_warns_only_in_a_packaged_plugin(self):
+        # Packaged, CLAUDE.md is never loaded, so instructions there reach
+        # nobody. In a development checkout it IS loaded and is the point. The
+        # check must tell the two trees apart, or --strict fails CI for a file
+        # doing its job.
+        self.write("CLAUDE.md", "how to work on this repo\n")
+        packaged = vplug.validate(self.tmp)
+        self.assertTrue(any("CLAUDE.md" in w for w in packaged.warnings))
+
+        os.makedirs(self.path("tests"), exist_ok=True)
+        checkout = vplug.validate(self.tmp)
+        self.assertEqual([w for w in checkout.warnings if "CLAUDE.md" in w], [])
+
+    def test_an_unexpected_exception_costs_one_check_not_the_run(self):
+        # guarded() is the backstop for the input nobody thought of: a check
+        # that raises must cost that check's verdict and nothing else, or the
+        # next unanticipated byte sequence silently blanks the whole report.
+        r = vplug.Report()
+
+        def boom():
+            raise RuntimeError("unanticipated")
+
+        self.assertIsNone(vplug.guarded("widget", r, boom))
+        self.assertTrue(any("widget" in e and "RuntimeError" in e
+                            for e in r.errors))
 
     def test_marketplace_source_escaping_the_root_is_an_error(self):
         self.write(".claude-plugin/marketplace.json", json.dumps({

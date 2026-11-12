@@ -68,6 +68,10 @@ import sys
 from collections import Counter
 from datetime import datetime, timezone
 
+if __package__ in (None, ""):  # run as a script: scripts/ is already sys.path[0]
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from atomic_io import write_text_atomic  # noqa: E402
+
 SCHEMA = "testsquad.envsafety/1"
 
 SEVERITY_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
@@ -298,7 +302,7 @@ def real_hosts_in(text: str, *, bare: bool) -> tuple[list[str], bool]:
                 continue
             seen.add(host.lower())
             found.append(host)
-    return found
+    return found, truncated
 
 
 # --------------------------------------------------------------------------
@@ -602,7 +606,22 @@ def scan_value(key: str, value: str, *, file: str, line: int,
     # Mongo Atlas URI should produce one finding that says "database", not
     # also a vaguer one that says "external host".
     if not is_masked(stripped) and not out:
-        hosts = real_hosts_in(stripped, bare=(context == "config"))
+        hosts, host_scan_truncated = real_hosts_in(
+            stripped, bare=(context == "config"))
+        if host_scan_truncated:
+            # The tail past MAX_HOST_SCAN_CHARS was never matched against, so
+            # "no production host here" is a statement about the head only. A
+            # bound that silently shortens its own input turns a cost control
+            # into a blind spot, which is the one thing this gate may never
+            # do -- so the truncation is a finding, not a footnote. HIGH in a
+            # config file for the same reason unread_finding() is HIGH: not
+            # evidence of production, but not evidence of safety either.
+            add("HIGH" if context == "config" else "MEDIUM",
+                "host_scan_truncated",
+                f"this value is longer than {MAX_HOST_SCAN_CHARS} characters, "
+                "so only its first "
+                f"{MAX_HOST_SCAN_CHARS} were checked for hostnames -- the rest "
+                "was NOT examined and may name a production server")
         prod = [h for h in hosts if is_prod_host(h)]
         if prod:
             add("CRITICAL", "production_hostname",
@@ -707,7 +726,7 @@ BOMS = (
 )
 
 
-def read_text(path: str) -> tuple[str | None, str | None]:
+def read_text(path: str, *, max_bytes: int = MAX_BYTES) -> tuple[str | None, str | None]:
     """(text, skip_reason). Exactly one of the two is None.
 
     A reason rather than a bare None, because "I could not read it" has to
@@ -716,8 +735,9 @@ def read_text(path: str) -> tuple[str | None, str | None]:
     """
     try:
         size = os.path.getsize(path)
-        if size > MAX_BYTES:
-            return None, (f"larger than {MAX_BYTES} bytes (2MB ceiling) so it "
+        if size > max_bytes:
+            return None, (f"larger than {max_bytes} bytes "
+                          f"({max_bytes // (1024 * 1024)}MB ceiling) so it "
                           "was never read")
         with open(path, "rb") as fh:
             raw = fh.read()
@@ -875,7 +895,7 @@ def iter_config_files(repo: str):
                 yield full, rel, kind
 
 
-def scan(repo: str) -> dict:
+def scan(repo: str, *, max_bytes: int = MAX_BYTES) -> dict:
     if not os.path.isdir(repo):
         raise NotADirectoryError(f"{repo} is not a directory")
 
@@ -884,7 +904,7 @@ def scan(repo: str) -> dict:
     skipped: list[dict] = []
 
     for full, rel, kind in iter_config_files(repo):
-        text, reason = read_text(full)
+        text, reason = read_text(full, max_bytes=max_bytes)
         if text is None:
             # Unreadable is not clean. It goes in skipped_files AND produces a
             # finding of its own, because `--fail-on` only ever looks at
@@ -943,19 +963,26 @@ def main(argv: list[str] | None = None) -> int:
                     choices=["critical", "high", "medium"],
                     help="exit 1 when a finding at this severity or above exists "
                          "(default: critical)")
+    ap.add_argument("--max-bytes", type=int, default=MAX_BYTES,
+                    help="never read a config file larger than this "
+                         f"(default {MAX_BYTES}, i.e. 2MB); a file over the "
+                         "ceiling is listed in skipped_files AND raises an "
+                         "unreadable_config finding, never passed as clean")
     args = ap.parse_args(argv)
 
     try:
-        result = scan(args.repo)
+        result = scan(args.repo, max_bytes=args.max_bytes)
     except (NotADirectoryError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
     payload = json.dumps(result, indent=2)
     if args.out:
+        # Atomic: the gate runs in parallel with the other scripts under
+        # .testing/, and a half-written safety report that still parses would
+        # be read as a verdict. See scripts/atomic_io.py.
         try:
-            with open(args.out, "w", encoding="utf-8") as fh:
-                fh.write(payload + "\n")
+            write_text_atomic(args.out, payload + "\n")
         except OSError as exc:
             print(f"error: cannot write {args.out}: {exc}", file=sys.stderr)
             return 2
@@ -965,7 +992,8 @@ def main(argv: list[str] | None = None) -> int:
     c = result["counts"]
     print(f"{result['verdict']}: {c['CRITICAL']} critical, {c['HIGH']} high, "
           f"{c['MEDIUM']} medium, {c['LOW']} low "
-          f"({len(result['scanned_files'])} files scanned)", file=sys.stderr)
+          f"({len(result['scanned_files'])} files scanned, "
+          f"{len(result['skipped_files'])} skipped unread)", file=sys.stderr)
     for f in result["findings"][:10]:
         if f["severity"] == "LOW":
             continue
