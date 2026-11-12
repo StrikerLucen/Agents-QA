@@ -1,0 +1,720 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>testsquad report</title>
+<style>
+:root{
+  --bg:#ffffff; --surface:#f7f8fa; --surface-2:#eef0f4; --border:#d8dce4;
+  --text:#14171f; --text-dim:#5a6273; --text-faint:#858d9e;
+  --red:#b3261e; --red-bg:#fdeceb; --red-border:#f0b7b3;
+  --amber:#8a5200; --amber-bg:#fdf3e2; --amber-border:#eccfa0;
+  --grey:#4a5160; --grey-bg:#eef0f4; --grey-border:#d8dce4;
+  --green:#1b6b3a; --green-bg:#e8f5ec;
+  --accent:#1f4fd8;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --radius:8px;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0f1116; --surface:#171a21; --surface-2:#1f232c; --border:#2e3440;
+    --text:#e7e9ee; --text-dim:#a2aab9; --text-faint:#7b8494;
+    --red:#ff8d84; --red-bg:#2a1414; --red-border:#5c2a26;
+    --amber:#f0bf6a; --amber-bg:#261c0c; --amber-border:#5a441c;
+    --grey:#a2aab9; --grey-bg:#1f232c; --grey-border:#2e3440;
+    --green:#6fd79a; --green-bg:#0f2418;
+    --accent:#88aaff;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0f1116; --surface:#171a21; --surface-2:#1f232c; --border:#2e3440;
+  --text:#e7e9ee; --text-dim:#a2aab9; --text-faint:#7b8494;
+  --red:#ff8d84; --red-bg:#2a1414; --red-border:#5c2a26;
+  --amber:#f0bf6a; --amber-bg:#261c0c; --amber-border:#5a441c;
+  --grey:#a2aab9; --grey-bg:#1f232c; --grey-border:#2e3440;
+  --green:#6fd79a; --green-bg:#0f2418;
+  --accent:#88aaff;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0; background:var(--bg); color:var(--text);
+  font-family:var(--sans); font-size:15px; line-height:1.55;
+  overflow-x:hidden;
+}
+.wrap{max-width:860px; margin:0 auto; padding:24px 16px 72px}
+h1,h2,h3{line-height:1.25; margin:0}
+h1{font-size:1.15rem; font-weight:650; letter-spacing:-0.01em}
+h2{font-size:0.78rem; font-weight:700; letter-spacing:0.09em; text-transform:uppercase; color:var(--text-dim)}
+h3{font-size:0.98rem; font-weight:600}
+p{margin:0.4em 0}
+a{color:var(--accent)}
+section{margin-top:34px}
+.sec-head{display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; margin-bottom:12px;
+  padding-bottom:8px; border-bottom:1px solid var(--border)}
+.sec-note{font-size:0.8rem; color:var(--text-faint)}
+
+/* header */
+header.top{display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap}
+.meta{font-size:0.78rem; color:var(--text-faint); font-family:var(--mono); word-break:break-word}
+
+/* verdict */
+.verdict{margin-top:16px; border:1px solid var(--border); border-left-width:5px;
+  border-radius:var(--radius); padding:14px 16px; background:var(--surface)}
+.verdict.state-blocked{border-color:var(--red-border); border-left-color:var(--red); background:var(--red-bg)}
+.verdict.state-attention{border-color:var(--amber-border); border-left-color:var(--amber); background:var(--amber-bg)}
+.verdict.state-safe{border-color:var(--border); border-left-color:var(--green); background:var(--green-bg)}
+.verdict-label{font-family:var(--mono); font-size:0.72rem; font-weight:700; letter-spacing:0.1em;
+  text-transform:uppercase; color:var(--text-dim); display:block; margin-bottom:4px}
+.verdict-text{font-size:1.1rem; font-weight:600; margin:0}
+
+/* changed strip */
+.changed{display:flex; flex-wrap:wrap; gap:8px; margin-top:4px}
+.chip{border:1px solid var(--border); background:var(--surface); border-radius:999px;
+  padding:5px 11px; font-size:0.84rem; color:var(--text-dim)}
+.chip b{color:var(--text); font-variant-numeric:tabular-nums}
+
+/* actions */
+ol.actions{list-style:none; margin:0; padding:0; counter-reset:act}
+ol.actions li{counter-increment:act; display:flex; gap:12px; padding:12px 0;
+  border-bottom:1px solid var(--border)}
+ol.actions li:last-child{border-bottom:0}
+.rank{font-family:var(--mono); font-size:0.8rem; color:var(--text-faint); padding-top:2px; min-width:1.4em}
+.act-body{flex:1; min-width:0}
+.act-title{font-weight:600}
+.act-why{font-size:0.86rem; color:var(--text-dim)}
+.effort{display:inline-block; font-family:var(--mono); font-size:0.72rem; border:1px solid var(--border);
+  border-radius:999px; padding:1px 8px; color:var(--text-dim); background:var(--surface); white-space:nowrap}
+
+/* badges */
+.badge{display:inline-flex; align-items:center; gap:5px; font-size:0.74rem; font-weight:600;
+  border-radius:999px; padding:2px 9px; border:1px solid var(--grey-border);
+  background:var(--grey-bg); color:var(--grey); white-space:nowrap}
+.badge.red{border-color:var(--red-border); background:var(--red-bg); color:var(--red)}
+.badge.amber{border-color:var(--amber-border); background:var(--amber-bg); color:var(--amber)}
+.badge .ic{font-style:normal}
+.sev{font-family:var(--mono); font-size:0.74rem; font-weight:700}
+.count-x{font-family:var(--mono); font-size:0.78rem; color:var(--text-dim); white-space:nowrap}
+
+/* table */
+table{width:100%; border-collapse:collapse; font-size:0.9rem}
+th{text-align:left; font-size:0.7rem; letter-spacing:0.07em; text-transform:uppercase;
+  color:var(--text-faint); font-weight:700; padding:6px 8px; border-bottom:1px solid var(--border)}
+td{padding:11px 8px; border-bottom:1px solid var(--border); vertical-align:top}
+tr:last-child td{border-bottom:0}
+td.c-title{width:46%}
+.f-title{font-weight:600}
+.f-sub{font-size:0.82rem; color:var(--text-dim); margin-top:3px}
+.f-loc{font-family:var(--mono); font-size:0.78rem; color:var(--text-faint); word-break:break-all}
+
+details.proof{margin-top:8px}
+details.proof>summary{cursor:pointer; font-size:0.8rem; color:var(--accent); list-style:none;
+  display:inline-flex; gap:5px; align-items:center}
+details.proof>summary::-webkit-details-marker{display:none}
+details.proof>summary::before{content:"▸"; font-size:0.7em}
+details.proof[open]>summary::before{content:"▾"}
+pre{margin:8px 0 0; background:var(--surface-2); border:1px solid var(--border);
+  border-radius:6px; padding:10px 12px; overflow-x:auto; font-family:var(--mono);
+  font-size:0.78rem; line-height:1.5; white-space:pre; max-width:100%}
+code{font-family:var(--mono); font-size:0.86em}
+
+.feedback{margin-top:8px; display:flex; gap:6px; flex-wrap:wrap}
+.fb-btn{font:inherit; font-size:0.74rem; cursor:pointer; background:var(--surface);
+  border:1px solid var(--border); color:var(--text-dim); border-radius:999px; padding:3px 10px}
+.fb-btn:hover{border-color:var(--text-faint); color:var(--text)}
+.fb-btn[aria-pressed="true"]{background:var(--amber-bg); border-color:var(--amber-border); color:var(--amber)}
+.fb-note{font-size:0.74rem; color:var(--text-faint)}
+
+.truncation{margin-top:10px; font-size:0.84rem; color:var(--text-dim);
+  background:var(--surface); border:1px dashed var(--border); border-radius:6px; padding:8px 11px}
+
+/* lists */
+ul.plain{list-style:none; margin:0; padding:0}
+ul.plain>li{padding:10px 0; border-bottom:1px solid var(--border)}
+ul.plain>li:last-child{border-bottom:0}
+
+.kv{display:flex; flex-wrap:wrap; gap:8px; margin-top:6px}
+.kv>div{background:var(--surface); border:1px solid var(--border); border-radius:6px;
+  padding:7px 11px; font-size:0.84rem}
+.kv b{font-variant-numeric:tabular-nums}
+
+.charter{background:var(--surface); border:1px solid var(--border); border-left:3px solid var(--text-faint);
+  border-radius:6px; padding:11px 13px; margin-bottom:10px}
+.charter .cw{color:var(--text-faint)}
+
+details.appendix{border:1px solid var(--border); border-radius:var(--radius);
+  background:var(--surface); padding:0 14px}
+details.appendix>summary{cursor:pointer; padding:13px 0; font-weight:600; font-size:0.95rem}
+details.appendix[open]>summary{border-bottom:1px solid var(--border); margin-bottom:10px}
+details.appendix .inner{padding-bottom:16px}
+.reason{font-size:0.84rem; color:var(--text-dim)}
+.reason b{color:var(--text)}
+
+.empty{border:1px dashed var(--border); border-radius:var(--radius); padding:28px 18px;
+  text-align:center; color:var(--text-dim); background:var(--surface)}
+.empty h3{color:var(--text); margin-bottom:6px}
+footer{margin-top:48px; padding-top:14px; border-top:1px solid var(--border);
+  font-size:0.78rem; color:var(--text-faint)}
+
+@media (max-width:640px){
+  td.c-title{width:auto}
+  table, thead, tbody, tr, td{display:block; width:100%}
+  thead{position:absolute; left:-9999px}
+  tr{border-bottom:1px solid var(--border); padding:12px 0}
+  tr:last-child{border-bottom:0}
+  td{border-bottom:0; padding:3px 0}
+  td[data-label]::before{content:attr(data-label) " "; font-size:0.68rem; letter-spacing:0.07em;
+    text-transform:uppercase; color:var(--text-faint); display:block; margin-bottom:2px}
+  td.c-title::before{display:none}
+}
+</style>
+</head>
+<body>
+<div class="wrap" id="root"></div>
+
+<!-- Data slot. testsquad replaces the contents of this script tag with the run's JSON.
+     The worked example below is the default so the file renders standalone from file://. -->
+<script id="testsquad-data" type="application/json">
+{
+  "meta": {
+    "title": "testsquad — checkout & sync",
+    "repo": "acme/storefront",
+    "branch": "feat/eu-discounts",
+    "commit": "8f2c1ab",
+    "generatedAt": "2026-11-12 14:20 UTC",
+    "previousAt": "2026-11-11 09:05 UTC",
+    "rankedBy": "business cost of leaving it broken — customers blocked, then data loss, then developer minutes burned"
+  },
+  "verdict": {
+    "state": "blocked",
+    "text": "Not safe to merge — EU checkout drops discounts on taxed lines; fix that first."
+  },
+  "changed": [
+    { "label": "New", "value": 3 },
+    { "label": "Reproduced since last report", "value": 1 },
+    { "label": "Fixed", "value": 4 },
+    { "label": "Reopened", "value": 1 },
+    { "label": "Still open", "value": 29 }
+  ],
+  "actions": [
+    {
+      "title": "Fix the discount/tax ordering in the EU checkout path",
+      "why": "Blocks every EU customer with a promo code. No workaround.",
+      "effort": "~2h",
+      "command": "npm test -- src/checkout/discount.test.ts --runInBand"
+    },
+    {
+      "title": "Add the null guard for customers with no email before invoicing",
+      "why": "One guard clears 40 failing tests and an open support thread.",
+      "effort": "~30m",
+      "command": "npm test -- src/invoice --runInBand"
+    },
+    {
+      "title": "Decide whether VisitSyncSpec stays quarantined or gets rewritten",
+      "why": "Needs a human call — it has flagged a real bug once already.",
+      "effort": "15m decision",
+      "command": "npx testsquad flaky show VisitSyncSpec"
+    }
+  ],
+  "findings": {
+    "totalQualifying": 37,
+    "bugs": [
+      {
+        "title": "Checkout fails for EU customers when a discount is applied to a taxed line",
+        "status": "critical",
+        "evidence": "reproduced",
+        "severity": "S1",
+        "severityInputs": "revenue path blocked, no workaround, reproduced 10/10",
+        "priority": "proposed P1 — needs confirmation from @payments-owner",
+        "cause": "Discount is applied after VAT, so the gross total is computed from the undiscounted line.",
+        "location": "src/checkout/total.ts:118",
+        "cost": "All EU carts with a promo code — ~900 orders/day.",
+        "clusterCount": 3,
+        "clusterNote": "3 tests, one cause",
+        "command": "npm test -- src/checkout/discount.test.ts --runInBand\n# 3 failed, 41 passed — total.ts:118 returns 120.00, expected 108.00"
+      },
+      {
+        "title": "Customers with no email can't be invoiced — the invoice screen shows a blank recipient",
+        "status": "attention",
+        "evidence": "reproduced",
+        "severity": "S2",
+        "severityInputs": "no data loss, workaround exists (add email first), reproduced 10/10",
+        "priority": "proposed P2 — needs confirmation from @billing-owner",
+        "cause": "Missing null guard on recipient resolution; every downstream render inherits the empty string.",
+        "location": "src/invoice/recipient.ts:31",
+        "cost": "Support thread open since Nov 4; 12 accounts affected.",
+        "clusterCount": 40,
+        "clusterNote": "40 tests, one missing null guard",
+        "command": "npm test -- src/invoice --runInBand\n# 40 failed, 7 passed — all from recipient.ts:31"
+      },
+      {
+        "title": "Orders edited on two devices lose the later edit instead of merging",
+        "status": "info",
+        "evidence": "observed",
+        "severity": "S2",
+        "severityInputs": "silent data loss, workaround unknown, seen once in CI run #4471 — not yet re-run deterministically",
+        "priority": "proposed P2 — needs confirmation from @sync-owner",
+        "cause": "Last-write-wins on the whole document rather than per-field.",
+        "location": "src/sync/merge.ts:74",
+        "cost": "Field reps lose visit notes. Rare, but silent.",
+        "command": "npm test -- src/sync/merge.test.ts -t 'concurrent edit' --runInBand\n# passes locally; failed once in CI run #4471"
+      },
+      {
+        "title": "A failed payment retries forever instead of giving up after 3 attempts",
+        "status": "info",
+        "evidence": "reproduced",
+        "severity": "S3",
+        "severityInputs": "no customer impact, bounded by rate limiter, reproduced 10/10",
+        "priority": "proposed P3 — needs confirmation from @payments-owner",
+        "cause": "The attempt counter resets inside the catch block.",
+        "location": "src/payments/retry.ts:52",
+        "cost": "Burns ~40 CI minutes a week and fills the error log.",
+        "command": "npm test -- src/payments/retry.test.ts --runInBand\n# 1 failed — attempt count reached 9, expected 3"
+      }
+    ],
+    "issues": [
+      {
+        "title": "Visit sync sometimes reports success without saving — 3 runs in 10",
+        "status": "info",
+        "evidence": "reproduced",
+        "classification": "test defect",
+        "severity": "S3",
+        "severityInputs": "flaky, 30% failure rate over 7 days, 14 observations",
+        "priority": "proposed P3 — needs confirmation from @sync-owner",
+        "cause": "Unseeded UUID in the fixture collides with an existing row about a third of the time.",
+        "location": "test/sync/VisitSyncSpec.groovy:88",
+        "cost": "Blocked 6 PRs last week.",
+        "command": "./gradlew test --tests VisitSyncSpec --rerun-tasks\n# 3 of 10 runs failed, seeds printed"
+      },
+      {
+        "title": "The EU tax fixture can't start — there is no staging VAT table in CI",
+        "status": "info",
+        "evidence": "observed",
+        "classification": "infrastructure",
+        "severity": "S4",
+        "severityInputs": "blocks one test file only, no product impact",
+        "priority": "proposed P4 — needs confirmation from @platform",
+        "cause": "CI image ships without the vat_rates seed.",
+        "location": "ci/seed.sql",
+        "cost": "2 checkout tests skipped on every run — a silent coverage hole.",
+        "command": "docker compose -f ci/compose.yml run --rm seed\n# ERROR: relation \"vat_rates\" does not exist"
+      }
+    ]
+  },
+  "coverage": {
+    "note": "Coverage is a floor detector, not a target. Uncovered code is definitely untested; covered code may still be unverified.",
+    "untested": [
+      { "area": "src/checkout/total.ts — VAT branch", "why": "high churn (7 fixes in 30 days), no test reaches the taxed+discounted path" },
+      { "area": "src/sync/merge.ts — conflict branch", "why": "reached by zero tests; last touched by the commit under review" }
+    ],
+    "trust": {
+      "healthy": 412,
+      "flaky": 5,
+      "quarantined": 2,
+      "broken": 1,
+      "note": "Headline counts above are computed from the 412 healthy tests only. 8 tests were excluded as untrusted."
+    },
+    "quarantined": [
+      {
+        "name": "VisitSyncSpec > saves on reconnect",
+        "rate": "33% failures over a rolling 7-day window (14 observations)",
+        "since": "2026-11-05",
+        "note": "Still running and still collecting data. Quarantine is not deletion — a stable test that turns flaky is a real production bug about 1 time in 6."
+      }
+    ]
+  },
+  "charters": [
+    {
+      "target": "the EU checkout flow with a promo code and a mixed-VAT basket",
+      "resources": "the staging storefront, a seeded DE/FR/IE customer, and the VAT rate table",
+      "discover": "whether any other country pair produces the same rounding gap"
+    },
+    {
+      "target": "offline order editing on two devices",
+      "resources": "two tablets in airplane mode and the sync debug log",
+      "discover": "which fields survive a merge and which are silently dropped"
+    }
+  ],
+  "appendix": {
+    "unconfirmed": [
+      {
+        "title": "Refund totals may double-count shipping on partial refunds",
+        "evidence": "code-read",
+        "reason": "Found by reading code only — never executed. No fixture exists for a partial refund with shipping.",
+        "location": "src/payments/refund.ts:96"
+      },
+      {
+        "title": "Session cookie may not be cleared on logout in Safari",
+        "evidence": "suspicion",
+        "reason": "Hypothesis from a single support report. Reproduced 0 of 10 runs; no Safari runner in CI.",
+        "location": "src/auth/session.ts:40"
+      }
+    ],
+    "efp": [
+      { "check": "null-guard-heuristic", "rate": "4%", "observations": 52, "state": "in the main report" },
+      { "check": "string-format-drift", "rate": "22%", "observations": 31, "state": "demoted — above the 10% limit" }
+    ],
+    "method": "Severity is computed from blast radius, data loss, reproducibility and workaround. Priority is proposed only; when to fix is a business call. Unconfirmed items are never counted in the bug total.",
+    "commands": [
+      "git log --oneline -n 1 8f2c1ab",
+      "npm ci && npm test -- --runInBand",
+      "npx testsquad flaky report --window 7d"
+    ]
+  }
+}
+</script>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ---------- escaping: every injected string passes through here ---------- */
+  function esc(v) {
+    if (v === null || v === undefined) return "";
+    return String(v)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+  function arr(v) { return Array.isArray(v) ? v : []; }
+  function obj(v) { return v && typeof v === "object" && !Array.isArray(v) ? v : {}; }
+  function str(v) { return typeof v === "string" || typeof v === "number" ? String(v) : ""; }
+
+  var MAX_MAIN = 10; /* STYLE.md §2 — hard cap, not a rendering limit */
+
+  var STATUS = {
+    critical:  { cls: "red",   icon: "🔴", word: "Critical" },
+    attention: { cls: "amber", icon: "🟠", word: "Attention" },
+    info:      { cls: "",      icon: "⚪",       word: "Info" }
+  };
+  var EVIDENCE = {
+    "reproduced":  { icon: "✅", word: "Reproduced", main: true },
+    "observed":    { icon: "👁", word: "Observed", main: true },
+    "code-read":   { icon: "📖", word: "Code-read only", main: false },
+    "suspicion":   { icon: "💭", word: "Suspicion", main: false }
+  };
+
+  function statusOf(f) { return STATUS[str(f.status).toLowerCase()] || STATUS.info; }
+  function evidenceOf(f) { return EVIDENCE[str(f.evidence).toLowerCase()] || EVIDENCE.suspicion; }
+
+  function badge(cls, icon, word) {
+    return '<span class="badge ' + esc(cls) + '"><i class="ic" aria-hidden="true">' +
+      esc(icon) + '</i>' + esc(word) + '</span>';
+  }
+
+  function proofBlock(cmd, id) {
+    if (!str(cmd)) {
+      return '<p class="fb-note">No reproduction command recorded — this claim does not meet the style contract.</p>';
+    }
+    return '<details class="proof"><summary>Proof — run it yourself</summary>' +
+      '<pre><code>' + esc(cmd) + '</code></pre></details>';
+  }
+
+  function feedback(id) {
+    return '<div class="feedback" data-fb="' + esc(id) + '">' +
+      '<button class="fb-btn" type="button" data-kind="not-useful" aria-pressed="false">Not useful</button>' +
+      '<button class="fb-btn" type="button" data-kind="no-repro" aria-pressed="false">Couldn’t reproduce</button>' +
+      '<span class="fb-note"></span></div>';
+  }
+
+  /* ---------- sections ---------- */
+
+  function renderHeader(meta) {
+    var bits = [];
+    if (str(meta.repo)) bits.push(esc(meta.repo));
+    if (str(meta.branch)) bits.push(esc(meta.branch));
+    if (str(meta.commit)) bits.push("@" + esc(meta.commit));
+    if (str(meta.generatedAt)) bits.push(esc(meta.generatedAt));
+    return '<header class="top"><h1>' + esc(str(meta.title) || "testsquad report") + '</h1>' +
+      '<div class="meta">' + bits.join(" · ") + '</div></header>';
+  }
+
+  function renderVerdict(v) {
+    var state = str(v.state).toLowerCase();
+    if (["blocked", "attention", "safe"].indexOf(state) === -1) state = "attention";
+    var text = str(v.text) || "No verdict recorded for this run.";
+    return '<div class="verdict state-' + esc(state) + '" role="status">' +
+      '<span class="verdict-label">Verdict</span>' +
+      '<p class="verdict-text">' + esc(text) + '</p></div>';
+  }
+
+  function renderChanged(list) {
+    if (!list.length) return "";
+    var chips = list.map(function (c) {
+      return '<span class="chip">' + esc(str(c.label)) + ' <b>' + esc(str(c.value)) + '</b></span>';
+    }).join("");
+    return '<section><div class="sec-head"><h2>What changed since the last report</h2></div>' +
+      '<div class="changed">' + chips + '</div></section>';
+  }
+
+  function renderActions(list) {
+    if (!list.length) return "";
+    var items = list.slice(0, 5).map(function (a, i) {
+      return '<li><span class="rank">' + (i + 1) + '.</span><div class="act-body">' +
+        '<div class="act-title">' + esc(str(a.title)) + ' ' +
+        (str(a.effort) ? '<span class="effort">' + esc(str(a.effort)) + '</span>' : '') + '</div>' +
+        (str(a.why) ? '<div class="act-why">' + esc(str(a.why)) + '</div>' : '') +
+        (str(a.command) ? '<details class="proof"><summary>Command</summary><pre><code>' +
+          esc(str(a.command)) + '</code></pre></details>' : '') +
+        '</div></li>';
+    }).join("");
+    return '<section><div class="sec-head"><h2>Top actions</h2>' +
+      '<span class="sec-note">ranked, most costly to leave broken first</span></div>' +
+      '<ol class="actions">' + items + '</ol></section>';
+  }
+
+  function findingRow(f, idx, prefix) {
+    var s = statusOf(f), e = evidenceOf(f);
+    var id = prefix + "-" + idx;
+    var title = '<div class="f-title">' + esc(str(f.title)) + '</div>';
+    if (f.clusterCount && Number(f.clusterCount) > 1) {
+      title += '<div class="f-sub"><span class="count-x">×' + esc(str(f.clusterCount)) +
+        '</span> ' + esc(str(f.clusterNote) || "tests, one root cause") + '</div>';
+    }
+    if (str(f.cause)) title += '<div class="f-sub"><b>Why it happens:</b> ' + esc(str(f.cause)) + '</div>';
+    if (str(f.location)) title += '<div class="f-loc">' + esc(str(f.location)) + '</div>';
+    if (str(f.cost)) title += '<div class="f-sub">Cost of leaving it: ' + esc(str(f.cost)) + '</div>';
+    title += proofBlock(str(f.command), id);
+    title += feedback(id);
+
+    var sev = '<span class="sev">' + esc(str(f.severity) || "S?") + '</span>';
+    if (str(f.severityInputs)) sev += '<div class="f-sub">computed: ' + esc(str(f.severityInputs)) + '</div>';
+    if (str(f.priority)) sev += '<div class="f-sub">' + esc(str(f.priority)) + '</div>';
+    if (str(f.classification)) sev += '<div class="f-sub">class: ' + esc(str(f.classification)) + '</div>';
+
+    return '<tr>' +
+      '<td class="c-title">' + title + '</td>' +
+      '<td data-label="Status">' + badge(s.cls, s.icon, s.word) + '</td>' +
+      '<td data-label="Evidence level">' + badge("", e.icon, e.word) + '</td>' +
+      '<td data-label="Severity">' + sev + '</td>' +
+      '</tr>';
+  }
+
+  function findingTable(list, prefix) {
+    return '<table><thead><tr>' +
+      '<th scope="col">Finding</th><th scope="col">Status</th>' +
+      '<th scope="col">Evidence level</th><th scope="col">Severity</th>' +
+      '</tr></thead><tbody>' +
+      list.map(function (f, i) { return findingRow(f, i, prefix); }).join("") +
+      '</tbody></table>';
+  }
+
+  function renderFindings(fn, rankedBy) {
+    var bugsAll = arr(fn.bugs).filter(function (f) { return evidenceOf(f).main; });
+    var issuesAll = arr(fn.issues).filter(function (f) { return evidenceOf(f).main; });
+
+    var bugs = bugsAll.slice(0, MAX_MAIN);
+    var issueRoom = Math.max(0, MAX_MAIN - bugs.length);
+    var issues = issuesAll.slice(0, issueRoom);
+
+    var shown = bugs.length + issues.length;
+    var total = Number(fn.totalQualifying);
+    if (!isFinite(total) || total < bugsAll.length + issuesAll.length) {
+      total = bugsAll.length + issuesAll.length;
+    }
+
+    var html = '<section><div class="sec-head"><h2>Findings</h2>' +
+      '<span class="sec-note">new, reproduced and untriaged only</span></div>';
+
+    html += '<p class="sec-note">Bug total counts reproduced and observed items only: <b>' +
+      esc(String(bugsAll.length)) + '</b> bug' + (bugsAll.length === 1 ? '' : 's') +
+      '. Unconfirmed items in the appendix are not counted.</p>';
+
+    html += '<h3 style="margin-top:14px">Bugs &mdash; problems in the product (' +
+      esc(String(bugsAll.length)) + ')</h3>';
+    html += bugs.length ? findingTable(bugs, "bug")
+      : '<p class="sec-note">No product bugs reproduced in this run.</p>';
+
+    html += '<h3 style="margin-top:22px">Issues &mdash; problems with the testing (' +
+      esc(String(issuesAll.length)) + ')</h3>';
+    html += issues.length ? findingTable(issues, "issue")
+      : '<p class="sec-note">No testing issues in the main list' +
+        (issuesAll.length ? ' — all moved to the backlog by the cap below.' : '.') + '</p>';
+
+    if (total > shown) {
+      html += '<p class="truncation">' + esc(String(shown)) + ' of ' + esc(String(total)) +
+        ' shown, ranked by business risk' +
+        (str(rankedBy) ? ': ' + esc(str(rankedBy)) : '') +
+        '. The rest are in the non-blocking backlog.</p>';
+    }
+    return html + '</section>';
+  }
+
+  function renderCoverage(c) {
+    if (!Object.keys(c).length) return "";
+    var html = '<section><div class="sec-head"><h2>Coverage &amp; health</h2>' +
+      '<span class="sec-note">a floor detector, not a score</span></div>';
+    if (str(c.note)) html += '<p class="sec-note">' + esc(str(c.note)) + '</p>';
+
+    var untested = arr(c.untested);
+    if (untested.length) {
+      html += '<h3 style="margin-top:14px">High-risk code with no test reaching it</h3><ul class="plain">' +
+        untested.map(function (u) {
+          return '<li><div class="f-loc">' + esc(str(u.area)) + '</div>' +
+            '<div class="f-sub">' + esc(str(u.why)) + '</div></li>';
+        }).join("") + '</ul>';
+    }
+
+    var t = obj(c.trust);
+    if (Object.keys(t).length) {
+      html += '<h3 style="margin-top:18px">Test trust</h3><div class="kv">' +
+        ['healthy', 'flaky', 'quarantined', 'broken'].map(function (k) {
+          return t[k] === undefined ? "" :
+            '<div>' + esc(k) + ' <b>' + esc(str(t[k])) + '</b></div>';
+        }).join("") + '</div>';
+      if (str(t.note)) html += '<p class="sec-note" style="margin-top:6px">' + esc(str(t.note)) + '</p>';
+    }
+
+    var q = arr(c.quarantined);
+    if (q.length) {
+      html += '<h3 style="margin-top:18px">Quarantined</h3><ul class="plain">' +
+        q.map(function (x) {
+          return '<li><div class="f-title">' + esc(str(x.name)) + '</div>' +
+            '<div class="f-sub">' + esc(str(x.rate)) +
+            (str(x.since) ? ' · since ' + esc(str(x.since)) : '') + '</div>' +
+            (str(x.note) ? '<div class="f-sub">' + esc(str(x.note)) + '</div>' : '') + '</li>';
+        }).join("") + '</ul>';
+    }
+    return html + '</section>';
+  }
+
+  function renderCharters(list) {
+    if (!list.length) return "";
+    var items = list.map(function (ch) {
+      return '<div class="charter"><span class="cw">Explore</span> ' + esc(str(ch.target)) +
+        ' <span class="cw">with</span> ' + esc(str(ch.resources)) +
+        ' <span class="cw">to discover</span> ' + esc(str(ch.discover)) + '</div>';
+    }).join("");
+    return '<section><div class="sec-head"><h2>Exploratory charters</h2>' +
+      '<span class="sec-note">what a human should go looking at next</span></div>' + items + '</section>';
+  }
+
+  function renderAppendix(a) {
+    var unconfirmed = arr(a.unconfirmed), efp = arr(a.efp), cmds = arr(a.commands);
+    if (!unconfirmed.length && !efp.length && !cmds.length && !str(a.method)) return "";
+
+    var inner = "";
+    if (unconfirmed.length) {
+      inner += '<h3>Unconfirmed — not counted in the bug total (' +
+        esc(String(unconfirmed.length)) + ')</h3><ul class="plain">' +
+        unconfirmed.map(function (u) {
+          var e = evidenceOf(u);
+          return '<li>' + badge("", e.icon, e.word) +
+            ' <span class="f-title">' + esc(str(u.title)) + '</span>' +
+            (str(u.location) ? '<div class="f-loc">' + esc(str(u.location)) + '</div>' : '') +
+            '<div class="reason"><b>Why it did not qualify:</b> ' + esc(str(u.reason)) + '</div></li>';
+        }).join("") + '</ul>';
+    }
+    if (efp.length) {
+      inner += '<h3 style="margin-top:18px">Effective false positives, by check</h3>' +
+        '<p class="reason">A finding counts as an effective false positive when the developer took no ' +
+        'positive action after seeing it. Any check above 10% is demoted out of the main report.</p>' +
+        '<ul class="plain">' + efp.map(function (x) {
+          return '<li><span class="f-title">' + esc(str(x.check)) + '</span> — ' +
+            esc(str(x.rate)) + ' over ' + esc(str(x.observations)) + ' observations · ' +
+            esc(str(x.state)) + '</li>';
+        }).join("") + '</ul>';
+    }
+    if (str(a.method)) {
+      inner += '<h3 style="margin-top:18px">Method</h3><p class="reason">' + esc(str(a.method)) + '</p>';
+    }
+    if (cmds.length) {
+      inner += '<h3 style="margin-top:18px">Every command used in this run</h3><pre><code>' +
+        cmds.map(function (c) { return esc(str(c)); }).join("\n") + '</code></pre>';
+    }
+    return '<section><details class="appendix"><summary>Appendix — unconfirmed items, trust metrics, method</summary>' +
+      '<div class="inner">' + inner + '</div></details></section>';
+  }
+
+  function renderEmpty(reason) {
+    return '<header class="top"><h1>testsquad report</h1></header>' +
+      '<div class="empty" style="margin-top:20px"><h3>No data yet</h3>' +
+      '<p>This is the empty report template. It renders once testsquad writes a run into the ' +
+      '<code>testsquad-data</code> slot.</p>' +
+      (reason ? '<p class="fb-note">' + esc(reason) + '</p>' : '') + '</div>';
+  }
+
+  /* ---------- feedback wiring (local only; no network) ---------- */
+  function wireFeedback(root) {
+    root.addEventListener("click", function (ev) {
+      var btn = ev.target.closest ? ev.target.closest(".fb-btn") : null;
+      if (!btn) return;
+      var box = btn.parentNode;
+      var pressed = btn.getAttribute("aria-pressed") === "true";
+      Array.prototype.forEach.call(box.querySelectorAll(".fb-btn"), function (b) {
+        b.setAttribute("aria-pressed", "false");
+      });
+      btn.setAttribute("aria-pressed", pressed ? "false" : "true");
+      var note = box.querySelector(".fb-note");
+      if (note) {
+        note.textContent = pressed ? "" :
+          "Recorded in .testing/feedback.json — it feeds the effective-false-positive rate for this check.";
+      }
+    });
+  }
+
+  /* ---------- boot ---------- */
+  function boot() {
+    var root = document.getElementById("root");
+    var slot = document.getElementById("testsquad-data");
+    var data = null, reason = "";
+
+    try {
+      var raw = slot ? slot.textContent.trim() : "";
+      if (!raw) {
+        reason = "The data slot is empty.";
+      } else {
+        data = JSON.parse(raw);
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          data = null;
+          reason = "The data slot did not contain a JSON object.";
+        } else if (!Object.keys(data).length) {
+          data = null;
+          reason = "The data slot contained an empty object.";
+        }
+      }
+    } catch (err) {
+      data = null;
+      reason = "The data slot is not valid JSON: " + (err && err.message ? err.message : "parse error");
+    }
+
+    if (!data) { root.innerHTML = renderEmpty(reason); return; }
+
+    var meta = obj(data.meta);
+    var html = "";
+    try {
+      html += renderHeader(meta);
+      html += renderVerdict(obj(data.verdict));
+      html += renderChanged(arr(data.changed));
+      html += renderActions(arr(data.actions));
+      html += renderFindings(obj(data.findings), meta.rankedBy);
+      html += renderCoverage(obj(data.coverage));
+      html += renderCharters(arr(data.charters));
+      html += renderAppendix(obj(data.appendix));
+      html += '<footer>Severity is computed; priority is proposed and needs human confirmation. ' +
+        'Colour is never the only signal — every status carries an icon and a word. ' +
+        (str(meta.previousAt) ? 'Previous report: ' + esc(str(meta.previousAt)) + '. ' : '') +
+        'Generated by testsquad.</footer>';
+    } catch (err2) {
+      root.innerHTML = renderEmpty("The data was present but could not be rendered: " +
+        (err2 && err2.message ? err2.message : "render error"));
+      return;
+    }
+
+    root.innerHTML = html;
+    wireFeedback(root);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot);
+  } else {
+    boot();
+  }
+})();
+</script>
+</body>
+</html>

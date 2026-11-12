@@ -1,0 +1,134 @@
+# testsquad pull-request comment.
+#
+# Copy to .github/workflows/testsquad-pr.yml and edit the two marked steps.
+#
+# Design notes worth reading before changing anything:
+#
+#   * No model runs here. The comment is computed from files in .testing/, so
+#     it is exact, free, and reproducible. It also means a pull request from a
+#     fork cannot cause a model to read attacker-controlled text.
+#
+#   * The `pull_request` trigger gives a READ-ONLY token on fork pull requests,
+#     so the comment step is skipped there rather than failing. We deliberately
+#     do NOT use `pull_request_target`: that runs with full write permissions
+#     with the fork's code in scope, and is the most exploited misconfiguration
+#     in GitHub Actions. A missing comment on a fork PR is a far smaller
+#     problem than a repository compromise. If you need fork comments, upload
+#     the rendered comment as an artifact here and post it from a separate
+#     `workflow_run` workflow that checks out your own default branch.
+#
+#   * It never fails the build. A gate that blocks merges in its first week is
+#     switched off in its second. Turn on gating once the team trusts it.
+
+name: testsquad
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: testsquad-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # the diff and the risk map both need history
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # --- EDIT: your project's setup and test command ----------------------
+      - name: Run tests with coverage
+        continue-on-error: true   # a red suite still produces a useful comment
+        run: |
+          # Keep the line that matches your stack:
+          #   npm ci && npx jest --coverage --coverageReporters=lcov
+          #   pip install -e '.[test]' && pytest --cov --cov-branch --cov-report=xml
+          #   mvn -B test
+          echo "Replace this step with your test command."
+
+      # --- EDIT: point at the coverage file your runner wrote ---------------
+      - name: Normalize coverage
+        if: always()
+        env:
+          COVERAGE_FILE: coverage/lcov.info   # or coverage.xml, coverage.out
+        run: |
+          mkdir -p .testing
+          if [ -f "$COVERAGE_FILE" ]; then
+            python3 scripts/normalize_coverage.py "$COVERAGE_FILE" \
+              --out .testing/coverage-current.json
+          else
+            echo "No coverage at $COVERAGE_FILE - the comment will say"
+            echo "'not measured' rather than inventing a number."
+          fi
+
+      - name: Check nothing points at production
+        if: always()
+        run: |
+          python3 scripts/env_safety_check.py . --out .testing/env-safety.json || true
+          python3 scripts/pr_comment.py --help >/dev/null
+
+      - name: Static flake and meaningless-test gate
+        if: always()
+        run: |
+          python3 scripts/flake_smells.py tests test src \
+            --format text --fail-on block || true
+
+      - name: Render the comment
+        if: always()
+        run: |
+          python3 scripts/pr_comment.py --testing-dir .testing \
+            --out .testing/pr-comment.md
+          cat .testing/pr-comment.md
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testsquad-report
+          path: .testing/
+          retention-days: 14
+
+      - name: Post or update the comment
+        # Skipped on fork PRs, where the token is read-only. See the note above.
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- testsquad:pr-comment -->';
+            const body = fs.readFileSync('.testing/pr-comment.md', 'utf8');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+
+            // Edit our own comment in place. A new comment per push turns the
+            // thread into a changelog nobody reads.
+            const mine = comments.find(c => c.body && c.body.includes(marker));
+            if (mine) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: mine.id, body,
+              });
+              core.info(`Updated comment ${mine.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+              core.info('Created the comment');
+            }

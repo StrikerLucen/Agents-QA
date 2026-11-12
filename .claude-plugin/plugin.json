@@ -1,0 +1,10 @@
+{
+  "name": "testsquad",
+  "displayName": "TestSquad",
+  "version": "0.1.0",
+  "description": "A testing team that proves its work. Profiles your repo, generates agents tailored to it, and never reports a bug it could not reproduce.",
+  "author": { "name": "Thomas Pino" },
+  "license": "MIT",
+  "keywords": ["testing", "qa", "coverage", "mutation-testing", "flaky-tests", "test-generation"],
+  "repository": "https://github.com/thomaspino/testsquad"
+}

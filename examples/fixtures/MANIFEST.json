@@ -1,0 +1,724 @@
+{
+  "schema": "testsquad.fixtures/1",
+  "generated": "2026-11-12",
+  "purpose": "Ground truth for testsquad's eval suite. Every planted defect, decoy, weak test, good test, flaky test, skipped test and config file in examples/fixtures/ is recorded here with the verdict an agent is expected to reach. Decoys carry an explicit proof of correctness: they are the entries that measure the 'zero false alarms' claim, and an agent that reports one as a bug has failed the eval regardless of what else it found.",
+  "verdicts": {
+    "report-as-bug": "The agent must report this as a genuine defect.",
+    "no-finding": "The agent must NOT report this. It is correct code that looks wrong. A report here is a false alarm.",
+    "reject": "The qa-gatekeeper must reject this test: it cannot fail.",
+    "accept": "The qa-gatekeeper must accept this test: real assertions on real behaviour, deterministic.",
+    "flaky": "The agent must classify this as flaky and name the cause in flake_cause.",
+    "report-as-gap": "The agent must report that this area is unguarded despite a green suite.",
+    "unsafe": "scripts/env_safety_check.py must return UNSAFE and the run must be refused.",
+    "safe": "scripts/env_safety_check.py must return SAFE. Flagging it is a false alarm."
+  },
+  "repos": {
+    "node-ts": {
+      "stack": "TypeScript, npm, Vitest",
+      "dependencies_installed": false,
+      "note": "node_modules/ is intentionally absent so 'cannot execute' is distinguishable from 'executes and fails'.",
+      "riskiest_file_expected": "src/cart.ts"
+    },
+    "python-pkg": {
+      "stack": "Python, pytest, coverage",
+      "dependencies_installed": false,
+      "note": ".venv/ is intentionally absent; requirements.txt is valid.",
+      "riskiest_file_expected": "shop/invoice.py"
+    },
+    "java-min": {
+      "stack": "Java 17, Maven, JUnit 5, Mockito",
+      "dependencies_installed": false,
+      "note": "Source and pom.xml only. Nothing here is expected to build; it is meant to be inspected.",
+      "riskiest_file_expected": "src/main/java/com/example/shop/Cart.java"
+    }
+  },
+  "git_history": {
+    "regenerate_with": "examples/fixtures/regen_git_history.sh",
+    "authors": [
+      "Dana Okafor <dana@fixture.example>",
+      "Sam Reyes <sam@fixture.example>"
+    ],
+    "commits_per_repo": 10,
+    "window": "2025-01-13 to 2025-11-03, every date pinned explicitly so time-weighting is deterministic",
+    "deleted_file": "a legacy tax table exists in history and is deleted in the final commit of each repo",
+    "untouched_files": "every file except the hot file and the warm file is created once and never modified",
+    "expected_ranking": "the hot file (L5, 5 bug-fix commits, ~30% relative churn, 2 authors) must rank first in scripts/risk_map.py; the warm file second; everything else capped at L2 because it was never modified"
+  },
+  "items": [
+    {
+      "id": "NODE-BUG-01",
+      "repo": "node-ts",
+      "kind": "bug",
+      "file": "src/cart.ts",
+      "line": 29,
+      "expected_verdict": "report-as-bug",
+      "severity": "S1",
+      "why": "The spec at the top of the file says tax is computed on the UNDISCOUNTED line total. lineTotalCents computes it on the discounted amount instead, so every discounted line under-collects tax. For unitCents=1000, qty=1, discountCents=200, taxRate=0.1 the correct total is 900 (1000 - 200 + 100 tax) and the code returns 880. Money is wrong on real invoices, hence S1. Note that baseCents() and taxCents() in the same file are correct: the defect is that lineTotalCents does not use taxCents()."
+    },
+    {
+      "id": "NODE-BUG-02",
+      "repo": "node-ts",
+      "kind": "bug",
+      "file": "src/money.ts",
+      "line": 9,
+      "expected_verdict": "report-as-bug",
+      "severity": "S2",
+      "why": "splitEvenly truncates and never redistributes the remainder, so the parts do not sum back to the total: splitEvenly(1000, 3) returns [333,333,333] = 999 and one cent vanishes. The spec in the docstring requires the parts to sum to totalCents."
+    },
+    {
+      "id": "NODE-BUG-03",
+      "repo": "node-ts",
+      "kind": "bug",
+      "file": "src/pagination.ts",
+      "line": 9,
+      "expected_verdict": "report-as-bug",
+      "severity": "S3",
+      "why": "pageCount must round up: 10 items at 3 per page is 4 pages. Math.floor gives 3, so the last partial page is unreachable in any UI built on this. Correct whenever total is an exact multiple of size, which is why it survives casual testing."
+    },
+    {
+      "id": "NODE-BUG-04",
+      "repo": "node-ts",
+      "kind": "bug",
+      "file": "src/format.ts",
+      "line": 9,
+      "expected_verdict": "report-as-bug",
+      "severity": "S4",
+      "why": "The sign is placed inside the currency symbol: formatMoney(-500) returns '$-5.00' where the spec requires '-$5.00'. Cosmetic only, no amount is wrong."
+    },
+    {
+      "id": "NODE-DEC-01",
+      "repo": "node-ts",
+      "kind": "decoy",
+      "file": "src/pagination.ts",
+      "line": 19,
+      "expected_verdict": "no-finding",
+      "why": "Reads as a classic off-by-one: the bound mentions `+ size` with a strict `<`, which a scanner pattern-matching on loop bounds flags.",
+      "proof": "The range is half-open [start, start+size). The loop runs for i = start .. start+size-1, which is exactly `size` iterations. Using `<=` would yield size+1 elements, which is the actual bug. tests/good.spec.ts asserts window(items,1,3) === ['b','c','d'] (3 elements) and window(items,0,5) === the whole 5-element array, pinning both ends."
+    },
+    {
+      "id": "NODE-DEC-02",
+      "repo": "node-ts",
+      "kind": "decoy",
+      "file": "src/money.ts",
+      "line": 18,
+      "expected_verdict": "no-finding",
+      "why": "Exact equality against a floating-point literal, the canonical 'never compare floats with ==' finding.",
+      "proof": "0.5 is a dyadic rational (1/2), so it is represented exactly in IEEE-754 binary64 with no rounding error whatsoever, and so are 0.25 and the result of dividing an exactly representable value by a power of two. quarter(2) === 0.5 and quarter(1) === 0.25 hold on every conforming platform. scripts/flake_smells.py agrees: its float-equality rule is suppressed by _exact_in_binary() for dyadic literals, and it reports nothing on tests/good.spec.ts."
+    },
+    {
+      "id": "NODE-DEC-03",
+      "repo": "node-ts",
+      "kind": "decoy",
+      "file": "src/retry.ts",
+      "line": 12,
+      "expected_verdict": "no-finding",
+      "why": "A real wall-clock sleep, which is the single most-reported test smell.",
+      "proof": "This is production code, not a test. An exponential backoff between attempts against a remote service is the documented, intended behaviour of a retry policy -- removing the wait would make the retry useless. No test ever reaches it: withBackoff takes a `sleeper` parameter and tests/good.spec.ts injects a recording no-op, asserting the computed delays [50, 100] without waiting. scripts/flake_smells.py deliberately does not scan non-test files for exactly this reason."
+    },
+    {
+      "id": "NODE-DEC-04",
+      "repo": "node-ts",
+      "kind": "decoy",
+      "file": "src/config.ts",
+      "line": 14,
+      "expected_verdict": "no-finding",
+      "why": "A catch block that discards the error and returns null -- 'swallowed exception' to any linter or reviewer scanning for empty catches.",
+      "proof": "Nothing is swallowed in effect. parseConfig has exactly one caller, loadConfig, directly below it, which converts the null sentinel into a thrown Error. The failure is therefore always surfaced; the sentinel exists so a caller can probe a candidate file without exception control flow. tests/good.spec.ts asserts loadConfig('{not json') throws."
+    },
+    {
+      "id": "NODE-WEAK-01",
+      "repo": "node-ts",
+      "kind": "weak-test",
+      "file": "tests/weak.spec.ts",
+      "line": 7,
+      "expected_verdict": "reject",
+      "why": "Calls cartTotalCents and asserts nothing. It only fails if the code throws, so it buys coverage and no confidence. flake_smells rule: no-assertion (block)."
+    },
+    {
+      "id": "NODE-WEAK-02",
+      "repo": "node-ts",
+      "kind": "weak-test",
+      "file": "tests/weak.spec.ts",
+      "line": 14,
+      "expected_verdict": "reject",
+      "why": "Tautology: both sides are the same literal, so it holds for any implementation. flake_smells rule: tautological-assertion (block)."
+    },
+    {
+      "id": "NODE-WEAK-03",
+      "repo": "node-ts",
+      "kind": "weak-test",
+      "file": "tests/weak.spec.ts",
+      "line": 19,
+      "expected_verdict": "reject",
+      "why": "toBeDefined is the only assertion. pageCount(10,3) returns the wrong number (3 instead of 4) and this test still passes, which is the proof that the oracle is too weak. flake_smells rule: weak-oracle (warn)."
+    },
+    {
+      "id": "NODE-WEAK-04",
+      "repo": "node-ts",
+      "kind": "weak-test",
+      "file": "tests/weak.spec.ts",
+      "line": 24,
+      "expected_verdict": "reject",
+      "why": "A scaffold with the assertion left as a TODO. flake_smells rule: todo-assertion (block)."
+    },
+    {
+      "id": "NODE-WEAK-05",
+      "repo": "node-ts",
+      "kind": "weak-test",
+      "file": "tests/weak.spec.ts",
+      "line": 32,
+      "expected_verdict": "reject",
+      "why": "The mock is configured to return 4200 and the sole assertion is that it returned 4200. No product code is exercised at all; the test passes against an empty implementation. flake_smells rule: mock-return-tautology (block)."
+    },
+    {
+      "id": "NODE-WEAK-06",
+      "repo": "node-ts",
+      "kind": "weak-test",
+      "file": "tests/focus.spec.ts",
+      "line": 5,
+      "expected_verdict": "reject",
+      "why": "A leftover .only silently disables the other two tests in this file, so the suite reports green having run one third of it. flake_smells rule: focused-test (block)."
+    },
+    {
+      "id": "NODE-GOOD-01",
+      "repo": "node-ts",
+      "kind": "good-test",
+      "file": "tests/good.spec.ts",
+      "line": 8,
+      "expected_verdict": "accept",
+      "why": "Three real assertions pinning both ends of the half-open window, including the truncated tail case. Deterministic, no clock, no randomness, no mock."
+    },
+    {
+      "id": "NODE-GOOD-02",
+      "repo": "node-ts",
+      "kind": "good-test",
+      "file": "tests/good.spec.ts",
+      "line": 17,
+      "expected_verdict": "accept",
+      "why": "Asserts exact values that are exactly representable in binary floating point, plus the negative case (isHalf(0.25) is false). Deterministic on every platform."
+    },
+    {
+      "id": "NODE-GOOD-03",
+      "repo": "node-ts",
+      "kind": "good-test",
+      "file": "tests/good.spec.ts",
+      "line": 26,
+      "expected_verdict": "accept",
+      "why": "Asserts the return value, the number of attempts, AND the exact backoff schedule [50,100] through an injected sleeper, so it tests real behaviour without touching the clock."
+    },
+    {
+      "id": "NODE-GOOD-04",
+      "repo": "node-ts",
+      "kind": "good-test",
+      "file": "tests/good.spec.ts",
+      "line": 47,
+      "expected_verdict": "accept",
+      "why": "Covers the error path and asserts the message that propagates. Deterministic."
+    },
+    {
+      "id": "NODE-GOOD-05",
+      "repo": "node-ts",
+      "kind": "good-test",
+      "file": "tests/good.spec.ts",
+      "line": 58,
+      "expected_verdict": "accept",
+      "why": "Asserts both branches of loadConfig: the throw on bad input and the parsed object on good input. Deterministic."
+    },
+    {
+      "id": "NODE-FLAKY-01",
+      "repo": "node-ts",
+      "kind": "flaky",
+      "file": "tests/flaky.spec.ts",
+      "line": 14,
+      "expected_verdict": "flaky",
+      "flake_cause": "order-dependent",
+      "why": "Passes when run alone (`-t 'starts from'`). Fails whenever 'records the visitor it was given' runs first, because that test pushes into the file-level `seen` array and nothing resets it. Discrimination signal: always green in isolation, red in suite order. Note that per RESEARCH.md \u00a719 order dependency is nearly nonexistent in real JavaScript suites because Jest/Vitest isolate each file in its own process -- within a single file it still happens."
+    },
+    {
+      "id": "NODE-FLAKY-02",
+      "repo": "node-ts",
+      "kind": "flaky",
+      "file": "tests/flaky.spec.ts",
+      "line": 19,
+      "expected_verdict": "flaky",
+      "flake_cause": "timing",
+      "why": "Unseeded Math.random with a threshold at 95, so it fails about 5 runs in 100, in isolation and in the suite alike, and never reproducibly. Catching it by rerunning is exactly the detection-power problem in RESEARCH.md \u00a717: 10 reruns find a 5% flake only 40% of the time."
+    },
+    {
+      "id": "NODE-FLAKY-03",
+      "repo": "node-ts",
+      "kind": "flaky",
+      "file": "tests/flaky.spec.ts",
+      "line": 24,
+      "expected_verdict": "flaky",
+      "flake_cause": "environment-only",
+      "why": "new Date(0) is midnight UTC, so it renders as 1/1/1970 only when TZ is UTC or east of it. Under TZ=America/Los_Angeles it is 12/31/1969 and the test fails on every run. Deterministic per environment, which is why the right verdict is 'environment', not 'flaky test' and not 'product bug'. Reproduce: TZ=America/Los_Angeles npx vitest run tests/flaky.spec.ts"
+    },
+    {
+      "id": "NODE-FLAKY-04",
+      "repo": "node-ts",
+      "kind": "flaky",
+      "file": "tests/flaky.spec.ts",
+      "line": 28,
+      "expected_verdict": "report-as-bug",
+      "flake_cause": "none-it-is-a-real-bug",
+      "why": "THE CRITICAL DISCRIMINATION CASE. The name, the sleep and the 'under load' framing all say flake, and a triager skimming the suite will quarantine it. It fails 100% of the time, in isolation, on every machine, because pageCount(10,3) returns 3 and the spec says 4 (NODE-BUG-03). The matrix in agents/qa-gatekeeper.md step 5 must land on 'fails deterministically in isolation -> not flaky, a real bug'. Scoring it as a flake is the worst outcome available and loses NODE-BUG-03."
+    },
+    {
+      "id": "NODE-SKIP-01",
+      "repo": "node-ts",
+      "kind": "skipped",
+      "file": "tests/skipped.spec.ts",
+      "line": 18,
+      "expected_verdict": "report-as-gap",
+      "why": "2 of the 5 tests in this suite are skipped (40%), and both skipped ones are precisely the tests that would catch NODE-BUG-04 and NODE-BUG-02. The suite reports green. An agent that reports 'formatting is covered' without noting the skip ratio has been fooled by exactly the 'green because it is skipped' failure this fixture exists to detect."
+    },
+    {
+      "id": "NODE-SKIP-02",
+      "repo": "node-ts",
+      "kind": "skipped",
+      "file": "tests/skipped.spec.ts",
+      "line": 22,
+      "expected_verdict": "report-as-gap",
+      "why": "The second of the two skips. It is the only test anywhere in the repo that would catch NODE-BUG-02 (the dropped remainder cent)."
+    },
+    {
+      "id": "NODE-CONFIG-01",
+      "repo": "node-ts",
+      "kind": "config",
+      "file": ".env",
+      "line": 7,
+      "expected_verdict": "unsafe",
+      "why": "A fake production environment file: NODE_ENV=production, a live-shaped Stripe key, a production-named Postgres URL with credentials, and a real-looking Sentry DSN. scripts/env_safety_check.py must return UNSAFE (3 CRITICAL: stripe_live_key, remote_database_url, external_hostname) and a test run against this repo must be refused. EVERY VALUE IS FABRICATED: the key is literally 'sk_live_FIXTUREONLYNeverARealKey4242' and the host 'db.prod.fixturecorp-notreal.net' does not resolve. Note for maintainers: the value cannot contain a run of 8+ zeros or 3+ x's, because env_safety_check treats those as a mask and suppresses the finding -- which would silently invalidate this fixture."
+    },
+    {
+      "id": "PY-BUG-01",
+      "repo": "python-pkg",
+      "kind": "bug",
+      "file": "shop/invoice.py",
+      "line": 15,
+      "expected_verdict": "report-as-bug",
+      "severity": "S1",
+      "why": "int() truncates toward zero instead of rounding, and the binary representation of most decimal amounts is slightly below the decimal value: 1.15 * 100 is 114.99999999999999, so cents(1.15) returns 114 and the customer is billed a cent short on every such line. The docstring states rounding half-up explicitly. It is correct for exactly representable amounts such as 2.0 and 0.25, which is why the existing test passes."
+    },
+    {
+      "id": "PY-BUG-02",
+      "repo": "python-pkg",
+      "kind": "bug",
+      "file": "shop/accounts.py",
+      "line": 28,
+      "expected_verdict": "report-as-bug",
+      "severity": "S2",
+      "why": "The guard checks the wrong variable. `if user is None` protects the user reference, but the line that is actually dereferenced is `profile`, which is None for any user created without a profile -- a state the docstring describes as ordinary. contact_email(User('ana')) raises AttributeError instead of returning ''."
+    },
+    {
+      "id": "PY-BUG-03",
+      "repo": "python-pkg",
+      "kind": "bug",
+      "file": "shop/ranges.py",
+      "line": 28,
+      "expected_verdict": "report-as-bug",
+      "severity": "S3",
+      "why": "The stop bound should be len(items), not len(items) - size. As written, chunk() silently drops the final chunk: chunk([1,2,3,4,5], 2) returns [[1,2],[3,4]] and loses 5, and chunk([1,2], 2) returns [] -- the whole input disappears when the input is exactly one chunk long. Contrast shop/ranges.py window(), which is correct (PY-DEC-01)."
+    },
+    {
+      "id": "PY-BUG-04",
+      "repo": "python-pkg",
+      "kind": "bug",
+      "file": "shop/invoice.py",
+      "line": 27,
+      "expected_verdict": "report-as-bug",
+      "severity": "S4",
+      "why": "No singular form: summary_line(1) returns '1 items'. The docstring specifies '1 item'. Cosmetic."
+    },
+    {
+      "id": "PY-DEC-01",
+      "repo": "python-pkg",
+      "kind": "decoy",
+      "file": "shop/ranges.py",
+      "line": 17,
+      "expected_verdict": "no-finding",
+      "why": "`range(start, start + size)` next to a `+ size` bound reads as an off-by-one, especially sitting in the same module as the genuine off-by-one in chunk().",
+      "proof": "range() is half-open by definition: range(start, start+size) yields exactly size values, start .. start+size-1, so window() returns exactly size elements. The min() only clamps the tail at the end of the sequence. tests/test_good.py pins all three cases: a full interior window, the whole sequence, and the clamped tail."
+    },
+    {
+      "id": "PY-DEC-02",
+      "repo": "python-pkg",
+      "kind": "decoy",
+      "file": "shop/config.py",
+      "line": 29,
+      "expected_verdict": "no-finding",
+      "why": "A bare `except:`, which every Python linter flags (E722) and every reviewer reads as a swallowed exception that will also eat KeyboardInterrupt.",
+      "proof": "The handler's last statement is a bare `raise`. A bare raise re-raises the exception currently being handled, with its original type, value and traceback, so nothing is swallowed and KeyboardInterrupt/SystemExit propagate unchanged. The handler only appends the path to FAILURES, a diagnostic breadcrumb. tests/test_good.py proves it: a reader that raises ValueError('disk on fire') still surfaces as ValueError('disk on fire') to the caller."
+    },
+    {
+      "id": "PY-DEC-03",
+      "repo": "python-pkg",
+      "kind": "decoy",
+      "file": "shop/config.py",
+      "line": 39,
+      "expected_verdict": "no-finding",
+      "why": "A mutable default argument -- the best-known Python footgun, and the one a scanner flags unconditionally (B006).",
+      "proof": "The bug in a mutable default is that mutating it persists across calls. This function never mutates `overrides`: it only iterates it, and writes exclusively into `merged`, a fresh dict built by dict(base). The default object is therefore still {} after any number of calls. tests/test_good.py calls it three times, mutates the first result, and asserts the later calls are unaffected."
+    },
+    {
+      "id": "PY-DEC-04",
+      "repo": "python-pkg",
+      "kind": "decoy",
+      "file": "shop/sampling.py",
+      "line": 18,
+      "expected_verdict": "no-finding",
+      "why": "Use of the global `random` module with no seed in sight -- the textbook 'non-deterministic test' finding, and flake_smells' highest-severity flake rule.",
+      "proof": "tests/conftest.py defines an autouse fixture that calls random.seed(1234) before every single test in the suite, so every draw under test is reproducible; production deliberately keeps the entropy. The determinism is asserted directly in test_good.py: the same call after re-seeding returns the identical sample. Reporting this as a flake source would be a false alarm about test infrastructure the reporter did not read."
+    },
+    {
+      "id": "PY-WEAK-01",
+      "repo": "python-pkg",
+      "kind": "weak-test",
+      "file": "tests/test_weak.py",
+      "line": 8,
+      "expected_verdict": "reject",
+      "why": "No assertion at all. flake_smells rule: no-assertion (block)."
+    },
+    {
+      "id": "PY-WEAK-02",
+      "repo": "python-pkg",
+      "kind": "weak-test",
+      "file": "tests/test_weak.py",
+      "line": 13,
+      "expected_verdict": "reject",
+      "why": "Tautology. flake_smells rule: tautological-assertion (block)."
+    },
+    {
+      "id": "PY-WEAK-03",
+      "repo": "python-pkg",
+      "kind": "weak-test",
+      "file": "tests/test_weak.py",
+      "line": 32,
+      "expected_verdict": "reject",
+      "why": "assertIsNotNone is the only assertion. chunk([1,2,3,4,5],2) silently drops an element (PY-BUG-03) and this test still passes, which proves the oracle is too weak. flake_smells rule: weak-oracle (warn)."
+    },
+    {
+      "id": "PY-WEAK-04",
+      "repo": "python-pkg",
+      "kind": "weak-test",
+      "file": "tests/test_weak.py",
+      "line": 18,
+      "expected_verdict": "reject",
+      "why": "Assertion left as a TODO. flake_smells rule: todo-assertion (block)."
+    },
+    {
+      "id": "PY-WEAK-05",
+      "repo": "python-pkg",
+      "kind": "weak-test",
+      "file": "tests/test_weak.py",
+      "line": 26,
+      "expected_verdict": "reject",
+      "why": "The Mock is configured with return_value = 4200 and the only assertion is that it returned 4200. No product code runs. flake_smells rule: mock-return-tautology (block)."
+    },
+    {
+      "id": "PY-GOOD-01",
+      "repo": "python-pkg",
+      "kind": "good-test",
+      "file": "tests/test_good.py",
+      "line": 10,
+      "expected_verdict": "accept",
+      "why": "Three real assertions pinning both ends of the half-open window plus the clamped tail. Deterministic."
+    },
+    {
+      "id": "PY-GOOD-02",
+      "repo": "python-pkg",
+      "kind": "good-test",
+      "file": "tests/test_good.py",
+      "line": 17,
+      "expected_verdict": "accept",
+      "why": "Demonstrates the mutable-default decoy is safe by calling the function repeatedly and mutating a previous result. Deterministic."
+    },
+    {
+      "id": "PY-GOOD-03",
+      "repo": "python-pkg",
+      "kind": "good-test",
+      "file": "tests/test_good.py",
+      "line": 25,
+      "expected_verdict": "accept",
+      "why": "Asserts the exception type AND its message survive the bare except, using an injected reader so no file system is touched. Deterministic."
+    },
+    {
+      "id": "PY-GOOD-04",
+      "repo": "python-pkg",
+      "kind": "good-test",
+      "file": "tests/test_good.py",
+      "line": 33,
+      "expected_verdict": "accept",
+      "why": "Asserts reproducibility by re-seeding and comparing, plus the size and distinctness of the draw. Deterministic on every Python version because it compares two draws rather than hard-coding one."
+    },
+    {
+      "id": "PY-FLAKY-01",
+      "repo": "python-pkg",
+      "kind": "flaky",
+      "file": "tests/test_flaky.py",
+      "line": 15,
+      "expected_verdict": "flaky",
+      "flake_cause": "order-dependent",
+      "why": "Green alone (`pytest -k starts_from`), red after test_records_the_visitor appends to the module-level SEEN list. This is the dominant Python flake cause -- ~59% per RESEARCH.md \u00a719 -- so a Python fixture that omitted it would be testing the wrong taxonomy. Reproduce both ways with pytest -p no:randomly and with a reversed order."
+    },
+    {
+      "id": "PY-FLAKY-02",
+      "repo": "python-pkg",
+      "kind": "flaky",
+      "file": "tests/test_flaky.py",
+      "line": 20,
+      "expected_verdict": "flaky",
+      "flake_cause": "timing",
+      "why": "random.SystemRandom draws from the OS entropy pool and is NOT affected by random.seed, so the conftest fixture cannot make it deterministic. Fails about 5 runs in 100, in isolation and in the suite. Deliberately not a plain random.randrange, which the conftest seed would have made reproducible -- that distinction is itself part of the fixture."
+    },
+    {
+      "id": "PY-FLAKY-03",
+      "repo": "python-pkg",
+      "kind": "flaky",
+      "file": "tests/test_flaky.py",
+      "line": 24,
+      "expected_verdict": "flaky",
+      "flake_cause": "environment-only",
+      "why": "datetime.fromtimestamp(0) converts to LOCAL time, so .hour is 0 only where the local offset at the epoch was UTC+0. Passes under TZ=UTC, fails under TZ=America/New_York on every run. Reproduce: TZ=America/New_York pytest tests/test_flaky.py -k epoch"
+    },
+    {
+      "id": "PY-FLAKY-04",
+      "repo": "python-pkg",
+      "kind": "flaky",
+      "file": "tests/test_flaky.py",
+      "line": 28,
+      "expected_verdict": "report-as-bug",
+      "flake_cause": "none-it-is-a-real-bug",
+      "why": "THE CRITICAL DISCRIMINATION CASE for this repo. The name says 'occasionally' and there is a time.sleep to sell the story, but cents(1.15) returns 114 on every run of every machine (PY-BUG-01), so it fails deterministically in isolation. Correct verdict: a real bug, S1, not a flake. Quarantining it loses PY-BUG-01."
+    },
+    {
+      "id": "PY-SKIP-01",
+      "repo": "python-pkg",
+      "kind": "skipped",
+      "file": "tests/test_invoice.py",
+      "line": 10,
+      "expected_verdict": "report-as-gap",
+      "why": "The one test in the repo that would catch PY-BUG-01 is skipped with a plausible-sounding ticket reference. The remaining three tests in the file all pass, so test_invoice.py looks like healthy coverage of invoice.py while the money bug is entirely unguarded."
+    },
+    {
+      "id": "PY-CONFIG-01",
+      "repo": "python-pkg",
+      "kind": "config",
+      "file": ".env.test",
+      "line": 3,
+      "expected_verdict": "safe",
+      "why": "The negative control for NODE-CONFIG-01. localhost database, sk_test key, APP_ENV=test. scripts/env_safety_check.py must return SAFE here. An env check that flags this is too strict, and per RESEARCH.md a checker above ~10% effective false positives gets switched off."
+    },
+    {
+      "id": "JAVA-BUG-01",
+      "repo": "java-min",
+      "kind": "bug",
+      "file": "src/main/java/com/example/shop/Cart.java",
+      "line": 22,
+      "expected_verdict": "report-as-bug",
+      "severity": "S1",
+      "why": "Integer division truncates and the remainder is never redistributed, so splitBill(1000, 3) returns [333,333,333] summing to 999. The spec in the class javadoc requires the parts to sum back to the total with the remainder cents handed to the earliest payers. Money is lost on every split that does not divide evenly."
+    },
+    {
+      "id": "JAVA-BUG-02",
+      "repo": "java-min",
+      "kind": "bug",
+      "file": "src/main/java/com/example/shop/Inventory.java",
+      "line": 37,
+      "expected_verdict": "report-as-bug",
+      "severity": "S2",
+      "why": "The null guard checks `item` but the expression dereferences `item.location`, which the Item javadoc says is null until the item is put away. locationCode(new Item('SKU', null)) throws NullPointerException instead of returning 'UNASSIGNED'."
+    },
+    {
+      "id": "JAVA-BUG-03",
+      "repo": "java-min",
+      "kind": "bug",
+      "file": "src/main/java/com/example/shop/Ranges.java",
+      "line": 30,
+      "expected_verdict": "report-as-bug",
+      "severity": "S3",
+      "why": "sum() stops one element early, so sum([1,2,3]) returns 3 instead of 6. It is correct only for an empty or single-element array. The genuine off-by-one, placed in the same file as the correct half-open loop in window() (JAVA-DEC-01) so the two must be told apart."
+    },
+    {
+      "id": "JAVA-BUG-04",
+      "repo": "java-min",
+      "kind": "bug",
+      "file": "src/main/java/com/example/shop/Cart.java",
+      "line": 31,
+      "expected_verdict": "report-as-bug",
+      "severity": "S4",
+      "why": "The spec says the currency code comes first ('USD 12.00'); the format string puts the amount first ('12.00 USD'). Cosmetic."
+    },
+    {
+      "id": "JAVA-DEC-01",
+      "repo": "java-min",
+      "kind": "decoy",
+      "file": "src/main/java/com/example/shop/Ranges.java",
+      "line": 21,
+      "expected_verdict": "no-finding",
+      "why": "A `+ size` loop bound in a file that also contains a genuine off-by-one, which is exactly the setup that makes a hasty reviewer flag both.",
+      "proof": "Half-open range [start, start+size): the loop body runs for i = start .. start+size-1, exactly size times. GoodTest.windowReturnsExactlySizeItems pins the interior window, the full-length window and the clamped tail."
+    },
+    {
+      "id": "JAVA-DEC-02",
+      "repo": "java-min",
+      "kind": "decoy",
+      "file": "src/main/java/com/example/shop/Money.java",
+      "line": 15,
+      "expected_verdict": "no-finding",
+      "why": "`==` on a double, the finding every static analyser emits unconditionally.",
+      "proof": "0.25 is 2^-2, exactly representable in IEEE-754 binary64, and halving an exactly representable value by a power of two is exact (barring subnormals). half(0.5) == 0.25 and half(0.25) == 0.125 are exact on every conforming JVM. Compare the correct criticism of `0.1 + 0.2 == 0.3`, which is a different expression: these literals are dyadic."
+    },
+    {
+      "id": "JAVA-DEC-03",
+      "repo": "java-min",
+      "kind": "decoy",
+      "file": "src/main/java/com/example/shop/Backoff.java",
+      "line": 18,
+      "expected_verdict": "no-finding",
+      "why": "Thread.sleep -- the canonical Java async-wait flake smell, and per RESEARCH.md \u00a719 async-wait is 45% of Java flakes, so a Java-tuned scanner is primed to fire here.",
+      "proof": "It is production code implementing a documented exponential backoff, not a wait inside a test. The Sleeper is an injected interface and GoodTest passes a recording lambda, asserting the exact schedule [50, 100] without ever sleeping. No test in this repository calls Backoff.REAL."
+    },
+    {
+      "id": "JAVA-DEC-04",
+      "repo": "java-min",
+      "kind": "decoy",
+      "file": "src/main/java/com/example/shop/Catalog.java",
+      "line": 16,
+      "expected_verdict": "no-finding",
+      "why": "Mutable-looking shared static state on a List field, read by every caller and every test -- the shape that causes order-dependent flakes.",
+      "proof": "The list is wrapped in Collections.unmodifiableList, so add, remove, set and clear all throw UnsupportedOperationException: no caller and no test can mutate it and no state can leak between tests. GoodTest.defaultTagsCannotBeMutatedByAnyCaller asserts the throw directly. scripts/flake_smells.py agrees by construction: its STATIC_MUTABLE_RE requires `static` NOT followed by `final`."
+    },
+    {
+      "id": "JAVA-WEAK-01",
+      "repo": "java-min",
+      "kind": "weak-test",
+      "file": "src/test/java/com/example/shop/WeakTest.java",
+      "line": 14,
+      "expected_verdict": "reject",
+      "why": "No assertion. flake_smells rule: no-assertion (block). Reported at the @Test annotation, not the method: a finding anchors on the earliest line of the declaration, which includes decorators and annotations. Python behaves identically on a decorated test."
+    },
+    {
+      "id": "JAVA-WEAK-02",
+      "repo": "java-min",
+      "kind": "weak-test",
+      "file": "src/test/java/com/example/shop/WeakTest.java",
+      "line": 21,
+      "expected_verdict": "reject",
+      "why": "Tautology. flake_smells rule: tautological-assertion (block)."
+    },
+    {
+      "id": "JAVA-WEAK-03",
+      "repo": "java-min",
+      "kind": "weak-test",
+      "file": "src/test/java/com/example/shop/WeakTest.java",
+      "line": 27,
+      "expected_verdict": "reject",
+      "why": "assertNotNull is the only assertion, and Ranges.sum returns a wrong-but-non-null number (JAVA-BUG-03), so the test passes straight through the bug. flake_smells rule: weak-oracle (warn)."
+    },
+    {
+      "id": "JAVA-WEAK-04",
+      "repo": "java-min",
+      "kind": "weak-test",
+      "file": "src/test/java/com/example/shop/WeakTest.java",
+      "line": 33,
+      "expected_verdict": "reject",
+      "why": "Assertion left as a TODO. flake_smells rule: todo-assertion (block)."
+    },
+    {
+      "id": "JAVA-WEAK-05",
+      "repo": "java-min",
+      "kind": "weak-test",
+      "file": "src/test/java/com/example/shop/WeakTest.java",
+      "line": 42,
+      "expected_verdict": "reject",
+      "why": "Mockito is told thenReturn(4200) and the assertion checks for 4200. It verifies Mockito, not the product. flake_smells rule: mock-return-tautology (block)."
+    },
+    {
+      "id": "JAVA-GOOD-01",
+      "repo": "java-min",
+      "kind": "good-test",
+      "file": "src/test/java/com/example/shop/GoodTest.java",
+      "line": 16,
+      "expected_verdict": "accept",
+      "why": "Real assertions on both ends of the half-open window plus the clamped tail. Deterministic."
+    },
+    {
+      "id": "JAVA-GOOD-02",
+      "repo": "java-min",
+      "kind": "good-test",
+      "file": "src/test/java/com/example/shop/GoodTest.java",
+      "line": 24,
+      "expected_verdict": "accept",
+      "why": "Asserts exact arithmetic on dyadic values including a negative case. Deterministic on every conforming JVM."
+    },
+    {
+      "id": "JAVA-GOOD-03",
+      "repo": "java-min",
+      "kind": "good-test",
+      "file": "src/test/java/com/example/shop/GoodTest.java",
+      "line": 31,
+      "expected_verdict": "accept",
+      "why": "Asserts the result, the attempt count and the exact backoff schedule via an injected Sleeper, so it covers real retry behaviour with no wall-clock wait."
+    },
+    {
+      "id": "JAVA-GOOD-04",
+      "repo": "java-min",
+      "kind": "good-test",
+      "file": "src/test/java/com/example/shop/GoodTest.java",
+      "line": 48,
+      "expected_verdict": "accept",
+      "why": "Asserts the immutability that makes JAVA-DEC-04 safe, plus both branches of tagsFor. Deterministic."
+    },
+    {
+      "id": "JAVA-FLAKY-01",
+      "repo": "java-min",
+      "kind": "flaky",
+      "file": "src/test/java/com/example/shop/FlakyTest.java",
+      "line": 30,
+      "expected_verdict": "flaky",
+      "flake_cause": "order-dependent",
+      "why": "The static SEEN list is written by recordsTheVisitor (@Order(1)) and never reset, so this test is green alone and red in suite order. ~12% of Java flakes per RESEARCH.md \u00a719; the @TestMethodOrder annotation makes the fixture reproducible rather than JVM-dependent."
+    },
+    {
+      "id": "JAVA-FLAKY-02",
+      "repo": "java-min",
+      "kind": "flaky",
+      "file": "src/test/java/com/example/shop/FlakyTest.java",
+      "line": 37,
+      "expected_verdict": "flaky",
+      "flake_cause": "timing",
+      "why": "`new Random()` with no seed is seeded from the clock and the thread, so this fails about 5 runs in 100 with no reproducible trigger, in isolation and in the suite alike."
+    },
+    {
+      "id": "JAVA-FLAKY-03",
+      "repo": "java-min",
+      "kind": "flaky",
+      "file": "src/test/java/com/example/shop/FlakyTest.java",
+      "line": 43,
+      "expected_verdict": "flaky",
+      "flake_cause": "environment-only",
+      "why": "SimpleDateFormat with no explicit TimeZone formats in the JVM default zone, so new Date(0) renders as 1970-01-01 00:00 only under UTC. Fails on every run in any other zone. Reproduce: mvn test -Duser.timezone=America/New_York"
+    },
+    {
+      "id": "JAVA-FLAKY-04",
+      "repo": "java-min",
+      "kind": "flaky",
+      "file": "src/test/java/com/example/shop/FlakyTest.java",
+      "line": 49,
+      "expected_verdict": "report-as-bug",
+      "flake_cause": "none-it-is-a-real-bug",
+      "why": "THE CRITICAL DISCRIMINATION CASE for this repo. Named and shaped like an async-wait flake -- the most common Java flake family, with a Thread.sleep right there to confirm the prejudice -- but splitBill(1000,3) sums to 999 on every run (JAVA-BUG-01), so it fails deterministically in isolation. Correct verdict: real bug, S1. Quarantining it loses JAVA-BUG-01."
+    },
+    {
+      "id": "JAVA-SKIP-01",
+      "repo": "java-min",
+      "kind": "skipped",
+      "file": "src/test/java/com/example/shop/SkippedTest.java",
+      "line": 16,
+      "expected_verdict": "report-as-gap",
+      "why": "Half of SkippedTest is @Disabled, and the disabled half is the only assertion anywhere that the split sums back to the total -- that is, the only guard on JAVA-BUG-01. The remaining test asserts only the array length, so the file looks like coverage of Cart.splitBill while guarding nothing about the money."
+    }
+  ]
+}

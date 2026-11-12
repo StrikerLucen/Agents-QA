@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 60,
+            "command": "f=$(python3 -c \"import json,sys;print(json.load(sys.stdin).get('tool_input',{}).get('file_path',''))\"); case \"$f\" in *.ts|*.tsx|*.js|*.jsx) npx jest --findRelatedTests \"$f\" --passWithNoTests --silent || exit 2 ;; esac"
+          }
+        ]
+      }
+    ]
+  }
+}

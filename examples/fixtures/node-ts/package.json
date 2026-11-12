@@ -1,0 +1,16 @@
+{
+  "name": "@testsquad-fixture/node-ts",
+  "version": "0.0.0",
+  "private": true,
+  "description": "testsquad eval fixture. Planted defects and decoys are recorded in ../MANIFEST.json. Do not 'fix' anything here.",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0",
+    "@vitest/coverage-v8": "^1.6.0"
+  }
+}

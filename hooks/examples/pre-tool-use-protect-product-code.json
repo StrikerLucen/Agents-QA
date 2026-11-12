@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -f \"${CLAUDE_PROJECT_DIR}/.testing/tasks/current\" || exit 0; f=$(python3 -c \"import json,sys;print(json.load(sys.stdin).get('tool_input',{}).get('file_path',''))\"); case \"$f\" in *test*|*spec*|*__tests__*|*/.testing/*) exit 0 ;; *) echo \"testsquad: a testing task is in flight. $f is product code -- report the defect, do not edit it to make a test pass.\" >&2; exit 2 ;; esac"
+          }
+        ]
+      }
+    ]
+  }
+}

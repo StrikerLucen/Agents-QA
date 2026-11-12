@@ -1,0 +1,14 @@
+{
+  "name": "testsquad",
+  "description": "A testing team that proves its work: reproduces every bug it reports, and rejects tests that cannot fail.",
+  "owner": { "name": "Thomas Pino" },
+  "plugins": [
+    {
+      "name": "testsquad",
+      "source": ".",
+      "description": "Profiles your repo, generates testing agents tailored to it, and verifies its own output by execution rather than opinion.",
+      "category": "testing",
+      "tags": ["testing", "qa", "coverage", "mutation-testing", "flaky-tests"]
+    }
+  ]
+}

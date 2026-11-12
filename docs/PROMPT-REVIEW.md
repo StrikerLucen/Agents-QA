@@ -1,0 +1,562 @@
+# Prompt review — adversarial pass
+
+Scope: `agents/*.md` (7), `skills/*/SKILL.md` (16), `templates/agents/*.tmpl` (4), read
+against `docs/RESEARCH.md`, `templates/report/RULES.md`, `templates/report/STYLE.md`,
+`scripts/*.py`, `hooks/`, `templates/ci/testsquad-pr.yml`.
+
+Counts: **5 critical, 5 high, 9 medium, 5 low.** Read-only review; nothing was edited.
+
+---
+
+## Findings, ranked by damage in a real run
+
+### C1. The gatekeeper is forbidden from doing its own decisive step
+
+`agents/qa-gatekeeper.md:39-42`
+
+> 2. **You never run a destructive or outward-facing command.** No `git push`, no
+>    `git commit`, no `rm`, **no writes to any path**, no deploys…
+
+`agents/qa-gatekeeper.md:91-100`
+
+> ### 3. Prove it can fail (this is the decisive step)
+> For each new test, in a **throwaway `git worktree`** … change one line of the
+> production code … Remove the worktree afterwards
+
+Same pair in `templates/agents/ts-qa-gatekeeper.md.tmpl:39` vs `:59-62`.
+
+`git worktree add` writes a directory, editing the production line writes a file, and
+`git worktree remove` is an `rm`. A literal reader obeys rule 2 — it is numbered,
+labelled non-negotiable, and comes first — and silently downgrades fail-proof to a code
+read. That is precisely the failure the whole plugin exists to prevent ("a passing test
+is not evidence until you have seen it fail", `:26-28`), and nothing in the verdict
+format forces the agent to admit it skipped it.
+
+Rewrite rule 2 with the carve-out stated, not implied:
+
+> 2. **Nothing you do changes the working copy, the index, or any remote.** No `git
+>    push`, no `git commit`, no deploys, no network beyond a local test server, and no
+>    write anywhere under the repo root. The one exception is the throwaway
+>    `git worktree` of step 3: you may create it under `$TMPDIR`, edit production files
+>    *inside it*, and remove it. Before you finish, `git status` and
+>    `git worktree list` on the working copy must be unchanged — print both.
+
+### C2. The PR comment — declared the primary surface — reads files nothing writes
+
+`skills/report/SKILL.md:35-54` promises a deterministic comment built from
+`.testing/verification-log.md`, `.testing/coverage-raw.json`,
+`.testing/health-baseline.json` and "the run's findings", via:
+
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pr_comment.py" --testing-dir .testing …
+```
+
+`scripts/pr_comment.py:190-193` actually loads `health-baseline.json`,
+**`coverage-diff.json`**, **`gates.json`**, **`findings.json`**. Three of the four
+filenames are written by no skill, no agent, no script and no CI step. `load()` swallows
+the error (`:45-46`), so the run *succeeds* and emits a comment with the gates, coverage
+delta and findings sections empty.
+
+Damage: the one artifact the design rests on (Infer ~0% vs ~70%, cited in four files)
+ships blank, and does so quietly. Fix in the prompt by naming the real contract: either
+change `report/SKILL.md:51-54` to say which command writes `gates.json`,
+`coverage-diff.json` and `findings.json`, or state that `/testsquad:verify` and
+`/testsquad:diagnose` must emit them — today neither is told to.
+
+### C3. Both protective hooks are permanently disarmed
+
+`hooks/examples/pre-tool-use-protect-product-code.json:9` and
+`hooks/examples/stop-qa-gatekeeper.json:9` both begin:
+
+```
+test -f "${CLAUDE_PROJECT_DIR}/.testing/tasks/current" || exit 0
+```
+
+`skills/test/SKILL.md:18` writes `.testing/tasks/<id>.md` and never
+`.testing/tasks/current`. No file in the repo creates, symlinks or removes it;
+`skills/start/SKILL.md:236` lists only `.testing/tasks/`. So the product-code guard and
+the QA stop-gate exit 0 on every invocation, forever, while `hooks/examples/README.md:57`
+tells the user they are armed "during a testing task".
+
+Fix: `test/SKILL.md` §1 must say *"write `.testing/tasks/<id>.md`, then point
+`.testing/tasks/current` at it; remove `current` in §5 whatever the verdict"* — and §5
+must say it unconditionally, including on BLOCKED, or the guard latches on forever.
+
+### C4. One agent asserts a fact about the user's company that is almost never true
+
+`agents/automation-engineer.md:85-89`
+
+> **This repo's organisation runs a shared test company in production.** Any spec that
+> depends on data it did not create … is **a defect, and you flag it as one**, whether
+> you wrote it or found it.
+
+This is a leftover from one specific organisation, shipped as a universal premise in a
+marketplace plugin. In any other repo the agent will report existing, correct,
+intentionally-seeded fixtures as defects — a wall of false positives in the first run,
+which `agents/reporter.md:30-36` and `skills/plan/SKILL.md:87-98` both identify as the
+fastest way to get the tool switched off.
+
+Rewrite as a conditional with a stated source:
+
+> If `.testing/known-issues.md` or `.testing/conventions.md` records that this project
+> shares a test environment or test tenant, then any spec depending on data it did not
+> create is a defect and you flag it as one, citing the record. If nothing records it,
+> note the assumption instead of asserting it.
+
+### C5. `project-analyst` is told to write a file it has no tool to write
+
+`agents/project-analyst.md:9`
+
+```
+tools: Read, Grep, Glob, Bash
+```
+
+`agents/project-analyst.md:95` — "Write `.testing/profile.json`." Also `:39` "**You
+write only the profile.**" and `:111` "Record a lesson".
+
+With no `Write`, the agent either returns prose and no profile (and every other agent's
+Step 0 then reads a file that does not exist — `unit-test-engineer.md:139`,
+`automation-engineer.md:169`, `debugger.md:73`, `tech-scout.md:144`, `reporter.md:136`),
+or it reaches for `Bash` + heredoc, which hands it unrestricted write access and makes
+"you write only the profile" unenforceable.
+
+Pick one and say it: add `Write` and keep `:39` as the constraint, **or** state "you
+produce the profile JSON in your report; the orchestrator writes it" the way
+`qa-gatekeeper.md:173` already handles lessons. The second is more consistent with
+`docs/RESEARCH.md:246-247` ("workers are read-only where possible").
+
+### H6. Every role exists twice and the two copies have already drifted
+
+`agents/*.md` (7 shipped agents) and `templates/agents/*.tmpl` (4 generated agents)
+restate the same roles. Divergences found:
+
+| Rule | Shipped agent | Generated template |
+|---|---|---|
+| `data-testid` exception to "never edit product code" | `unit-test-engineer.md:82-84`, `automation-engineer.md:72-75` — allowed | `ts-unit-test-engineer…:64`, `ts-automation-engineer…:40` — absent, so forbidden |
+| 5-run stability check | `qa-gatekeeper.md:102-113` | present `:64-69` |
+| Quarantine thresholds (10 obs / 30% / 7d / 30d) | `automation-engineer.md:144-147` | `ts-automation-engineer…:54-63` — "a named owner and a deadline", no numbers |
+| Missing lesson fails the round | `qa-gatekeeper.md:178` "say so: that is a failed round" | `ts-qa-gatekeeper…:112` "**Fail the round**" — stronger |
+
+Worse, the shipped set is largely unreachable: no skill names `project-analyst`,
+`tech-scout` or `reporter` anywhere (`skills/` mentions only `ts-*`, plus one stray bare
+`qa-gatekeeper` at `skills/test/SKILL.md:64` against `ts-qa-gatekeeper` at `:46`). So
+`/testsquad:test` on a repo that never ran `/start` dispatches four agents that do not
+exist.
+
+Decide which set is canonical. The cheapest fix: make `agents/*.md` the single source and
+have the templates be the stack-filled *header* plus `Follow the rules in the testsquad
+<role> agent`, or state in `skills/test/SKILL.md` §2 "if `ts-*` is absent, fall back to
+the plugin agent of the same name".
+
+### H7. Two incompatible stability protocols; the implementer is graded on one it was never given
+
+`agents/automation-engineer.md:126-131`
+
+> burn in **three-way rather than N identical**: once in the same process, once with a
+> simulated time shift, once on a different host or under CPU contention.
+
+`agents/qa-gatekeeper.md:102-110`
+
+> Run each new test **5 times** … Make 2 of the 5 adversarial … **Any disagreement
+> between runs is a rejection**
+
+An automation engineer that does exactly what it is told (3 runs) hands over work the
+gatekeeper will reject for insufficient evidence, burning a full loop round for nothing.
+`unit-test-engineer.md` is given **no** stability requirement at all (`:94-96` covers
+determinism, not repetition) and so is graded against an unstated rule.
+
+Fix: state the gate once — "5 runs, of which ≥2 adversarial (shuffled order in a fresh
+process; under CPU contention); any disagreement is a rejection" — in
+`templates/report/RULES.md` or `.testing/conventions.md`, and have all three agents
+reference it rather than each inventing a count.
+
+### H8. The escalation ladder is unreachable, and the escalation itself is impossible
+
+`skills/test/SKILL.md:74-81`
+
+> - **Rounds 1–3**: resume the *original* implementer …
+> - **Rounds 4–5**: dispatch a *fresh* implementer **on a more capable model** …
+>
+> **Stop early** on any of: **the same failure signature twice**, a time or token
+> budget, or a blocker.
+
+A loop that fails the same way in rounds 1 and 2 trips "same failure signature twice"
+before round 4 ever happens — and repeated failures usually *are* the same signature,
+which is exactly why the ladder was written. Rank order is unstated, so the model picks.
+
+And "a more capable model" has no referent: all four templates and all seven agents are
+pinned `model: opus`.
+
+Rewrite: *"Stop early on: the same failure signature in **three** consecutive rounds, a
+blocker, or the token budget. The signature rule never pre-empts the round-4 hand-off —
+a fresh implementer is the response to repetition, not an alternative to stopping."* And
+replace "more capable model" with "a fresh context, told plainly that two attempts
+failed and it now owns the problem".
+
+### H9. The reporter can demote a check on a single data point
+
+`agents/reporter.md:91-93`
+
+> **Any check above 10% EFP is auto-demoted out of the main report** into the backlog
+
+`skills/report/SKILL.md:110-112`
+
+> any check above **10% effective false positives** **over a rolling window of at least
+> 10 observations** is demoted
+
+One "not useful" click on a check's first finding is 100% EFP by the agent's rule. The
+agent prompt is the one the subagent actually reads. Add the ≥10-observation floor to
+`reporter.md:91` verbatim, and say what happens below the floor ("report the rate,
+demote nothing").
+
+### H10. An agent that cannot ask the user is told to write the file that requires approval
+
+`agents/automation-engineer.md:31-34`
+
+> Read the per-framework threshold from `.testing/conventions.md`; **if none is
+> recorded, record one.**
+
+`skills/learn/SKILL.md:52` — "**Promotion requires the user's approval. Always.**"
+`conventions.md` is the rules file "the agents *enforce*" (`skills/start/SKILL.md:154`)
+and is read unquestioned by every agent on every run (`learn/SKILL.md:19-23`). A subagent
+that cannot prompt (`automation-engineer.md:159-164`) writing a flake threshold into it
+is a self-approved standing rule — the exact erosion `skills/verify/SKILL.md:86-91`
+forbids elsewhere.
+
+Fix: *"…if none is recorded, **propose one in your report** with the evidence; the
+orchestrator takes it through `/testsquad:learn`. Until then use 1% for unit-level and
+10% for browser-level frameworks and say which you used."*
+
+### M11. Gatekeeper's rejection list does not match what the unit engineer is told to avoid
+
+`agents/unit-test-engineer.md:107,113` — under "**What will get your work rejected**":
+
+> - `assertIsNotNone` / `toBeDefined` / `toBeTruthy` as the **only** assertion
+
+`agents/qa-gatekeeper.md:79-81`:
+
+> **Treat as weak and call it out**: the only assertion being `assertIsNotNone` /
+> `toBeDefined` / `toBeTruthy`.
+
+The engineer deletes work the gatekeeper would have accepted with a note. Harmless in
+isolation, but it is evidence the two lists were maintained separately; pick one word
+("reject" or "flag") and use it in both, plus both templates.
+
+### M12. Scout: two budgets, two opposite file-handling rules, two definitions of `adopt`
+
+| Claim | A | B |
+|---|---|---|
+| Web-op budget | `agents/tech-scout.md:71-73`: **12 + up to 3 reserved** for contradictions | `skills/scout/SKILL.md:22`: **12**, no reserve |
+| Radar file | `tech-scout.md:150-151`: "you **update** it, you do not replace it … entries never vanish silently" | `scout/SKILL.md:93`: "**Rewrite** `.testing/tooling-radar.md`, atomically" |
+| `adopt` means | `tech-scout.md:113`: "already trialled **here** successfully" | `scout/SKILL.md:70`: "Proven here, in this repo" (compatible, but the trial precondition is dropped) |
+
+"Rewrite atomically" is about the write mechanism and will be read as "replace the
+contents". Say "rewrite the whole file from the merged old+new entry set; no entry is
+dropped without a dated reason line".
+
+Also `scout/SKILL.md:22` has a stray `**` mid-sentence: `…per run** (searches and
+fetches combined).**`.
+
+### M13. "Every finding must be reproduced" vs 👁 observed in the main list
+
+`skills/depth/SKILL.md:31` — "**Every finding must be reproduced at every level.**"
+`templates/report/RULES.md:18`, `skills/debug/SKILL.md:114`, `agents/debugger.md:158-163`
+— "Only ✅ reproduced **and 👁 observed** reach the main list."
+
+Under `exhaustive`, `agents/debugger.md:96` adds a third reading: "Every finding in the
+report must be reproduced, with no exceptions". A literal agent at exhaustive must drop
+observed items that every other file admits. State the rank: *"the main list admits ✅
+and 👁; depth changes how many strategies you spend trying to turn 👁 into ✅, never what
+qualifies."*
+
+### M14. "Ask once, batched, then unattended" is contradicted three times in the same file
+
+`skills/start/SKILL.md:22-24` — "**Ask once, at the start, batched.** … then the run
+proceeds unattended." Then: `:61-63` (UNSAFE → ask whether to continue), `:128` ("**Show
+the diff and get agreement before writing**" CLAUDE.md), `:177-178` ("**get explicit
+approval**" for the contract). Three further interruptions, all of them correct.
+
+Reword `:22` to what is actually meant: *"**Ask the configuration questions once**, at
+the start, batched. Later stops are approval gates, not questions: safety (step 3),
+writing to `CLAUDE.md` (step 7), and the contract (step 10). Nothing else interrupts."*
+
+### M15. Report artifact names and paths differ between files
+
+| Thing | A | B |
+|---|---|---|
+| Dashboard filename | `start/SKILL.md:203`: `.testing/reports/diagnostic-<date>.html` | `report/SKILL.md:89`: `.testing/reports/dashboard-<date>.html` |
+| PR comment path | `report/SKILL.md:37`: `.testing/reports/pr-comment.md` | `templates/ci/testsquad-pr.yml:91,110`: `.testing/pr-comment.md` |
+| Normalized coverage | `diagnose/SKILL.md:51`: `.testing/coverage-raw.json` | `templates/ci/testsquad-pr.yml:69`: `.testing/coverage-current.json` |
+
+The CI path matters most: `.testing/reports/` is gitignored (`start:242`) and
+`.testing/pr-comment.md` is not, so the CI template commits-eligible artifact escapes the
+ignore rule the design asks for.
+
+Also missing from `start/SKILL.md:219-242` "What gets written": `.testing/tooling-radar.md`
+(written by `/scout`), `.testing/coverage-raw.json` (by `/diagnose`), and
+`.testing/tasks/current` (see C3). `/testsquad:uninstall` enumerates nothing beyond
+`.testing/` wholesale, so this table is the only inventory that exists.
+
+### M16. The reporter's binding contract is an unresolvable path, and the two contracts disagree
+
+`agents/reporter.md:43` and `:133` reference `templates/report/STYLE.md` **without**
+`${CLAUDE_PLUGIN_ROOT}`. Every other reference in the repo uses the variable
+(17 occurrences). Run inside a user's repo, the relative path does not exist, so the
+"binding, not advisory" contract silently fails to load — and `reporter.md:50` explicitly
+forbids restating the rules locally, so the agent has no fallback.
+
+Separately, the two contracts disagree on one hard number:
+`templates/report/RULES.md:28` — "emphasised rows ≤ **max(2, 30% of rows)**";
+`templates/report/STYLE.md:520` (checklist item 5) — "emphasised rows ≤ **30%** of all
+rows". On a 3-row report those differ (2 vs 0). `reporter.md:47` quotes the STYLE
+version. RULES is the better rule; make STYLE match it.
+
+And `report/SKILL.md:25` calls STYLE's checklist "13-point" (correct, `STYLE.md:508-539`)
+while every other skill binds to RULES' **10**-point list (`RULES.md:42-52`). Two
+checklists, both labelled "all must be yes". Say which one the reporter runs and which
+one everyone else runs — or collapse to one.
+
+### M17. `/testsquad:mutate` hand-rolls what `scripts/arid_nodes.py` already does
+
+`skills/mutate/SKILL.md:30-52` specifies one-mutant-per-line, an arid-node suppression
+table, "**Hard cap: 7 mutants per file**", and a feedback loop into
+`.testing/feedback.json`. `scripts/arid_nodes.py` implements exactly that —
+`--max-per-file` default **7** (`:1688`), `--seed` (`:1691`), `--feedback` (`:1693`),
+`--diff` scoping (`:1687`) — and is referenced by **no** skill, agent, hook or CI file.
+
+A model asked to apply a 100+-rule suppression policy by reading prose will apply it
+differently every run; the script is deterministic and seeded. Add the invocation to
+`mutate/SKILL.md` §2 and cut the table down to a one-line description of what the script
+suppresses.
+
+### M18. "A tool-call budget" with no number
+
+`skills/test/SKILL.md:48` — "Give each specialist **one dimension and a tool-call
+budget**." No number is given here or in any agent except `tech-scout.md:71` (12 web
+ops) and `debugger.md:91-96` (minutes). So the rule the research names as *the* fix for
+the zero-output failure mode (`docs/RESEARCH.md:243-245`) is unenforceable for the three
+agents that do the actual work.
+
+Give defaults: *"unit: ≤40 tool calls; automation: ≤60; debugger: the depth budget;
+scout: 12 web ops. State calls used in your report."* Tool calls are countable by the
+agent; wall-clock minutes are not — the debugger's "2 minutes" / "~10 minutes" budgets
+(`debugger.md:91-96`, `depth/SKILL.md:24-29`, `debug/SKILL.md:34-39`) are the one place
+in the design where the enforcement mechanism is a feeling. Add a tool-call equivalent
+beside each row.
+
+### M19. Quarantine thresholds have no data source
+
+`agents/automation-engineer.md:144-147` — "at least **10 observations** before
+classifying anything, a **30% failure rate over a rolling 7-day window** to quarantine,
+and **auto-unquarantine after 30 days clean**."
+
+Nothing stores per-test run history. `start/SKILL.md:219-242` lists no such file;
+`known-issues.md` holds the quarantine register (owner + re-check date), not observation
+counts. A single-run subagent cannot compute a 7-day rolling rate, so it will either
+invent one (violating "never state a number you did not measure", stated in four files)
+or ignore the rule.
+
+Either name the file (`.testing/flake-history.json`, written by `/testsquad:health`) or
+say plainly: *"these are the thresholds a human applies to the register; you propose
+quarantine with the observations you have and state how few they are."*
+
+### M20. "Minor findings are ledgered and deferred" has no definition
+
+`skills/test/SKILL.md:85` — minor is undefined and the deferral is attractive to a
+budget-pressed orchestrator, so "NOT MET on criterion 3" can be reclassified as minor
+and the run closed as done. That is the exact failure `:108-110` says the whole design
+exists to prevent.
+
+Fix: *"Minor means: not attached to any acceptance criterion, and severity S3 or S4. A
+gap against a numbered criterion is never minor."*
+
+### L21–L25 (low)
+
+- **L21.** `skills/upgrade/SKILL.md:70` names `ts-browser-engineer`; no such template
+  exists (`templates/agents/` has 4). Illustrative, but `/start:143` promises per-stack
+  agent selection from a set of four fixed roles — say "the roles that fit the stack,
+  from the four templates" or add the template.
+- **L22.** `agents/qa-gatekeeper.md:173` — "**Append** one file to `.testing/lessons/`
+  only via your report — you do not write files." Self-contradicting in one sentence;
+  make it "Do not write the lesson file. Put the lesson in your report; the orchestrator
+  files it."
+- **L23.** `templates/agents/ts-qa-gatekeeper.md.tmpl:112` — "**Fail the round if the
+  implementer recorded no lesson.**" The verdict is defined as a per-criterion table
+  (`:92-101`); a missing lesson is not a criterion, so this makes the verdict
+  un-derivable from the contract. Report it as a separate `PROCESS: lesson missing`
+  line, not as a criterion failure.
+- **L24.** `README.md:25` — "A test that does not fail when the code under test is broken
+  is **deleted**" vs `unit-test-engineer.md:128-130` "**repair it rather than deleting
+  it**" and `qa-gatekeeper.md:97` "Reject it". Three verbs for one outcome.
+- **L25.** Unfalsifiable instructions, each costing context and checking nothing. With
+  checkable replacements:
+
+  | File:line | Text | Checkable version |
+  |---|---|---|
+  | `qa-gatekeeper.md:169`, `reporter.md:173`, `debugger.md:187` | "Keep it short. A reviewer who writes forty findings gets read as zero." | "Main list ≤10 items (`RULES.md:17`); print `N of M shown`." |
+  | `unit-test-engineer.md:125` | "Write fewer, better tests and be glad when one is rejected" | "Ship no test you have not seen go red under mutation; report the count you discarded." |
+  | `unit-test-engineer.md:97`, `automation-engineer.md:104` | "Follow the repo, not your taste." | "Name the existing test file you matched for layout, naming and assertion style." |
+  | `reporter.md:170`, `qa-gatekeeper.md:165`, `project-analyst.md:105` | "Write for a developer who has not opened this area in six months." | Already covered by `RULES.md:24-25` (symptom-not-cause); delete the restatement. |
+  | `debugger.md:57` | "State the budget you spent." | "State tool calls used of N and elapsed strategies tried of the depth table." |
+
+---
+
+## Contradiction table
+
+| # | Claim A | Claim B | Which should win |
+|---|---|---|---|
+| 1 | `qa-gatekeeper.md:40` "no writes to any path" | `qa-gatekeeper.md:92-100` mutate production code in a worktree | **B**, with A rewritten to carve out `$TMPDIR` worktrees and require a clean `git status` + `git worktree list` |
+| 2 | `report/SKILL.md:51-54` PR comment sources | `scripts/pr_comment.py:190-193` reads `coverage-diff/gates/findings.json` | **The script** — it is deterministic; name a writer for each file in the skills |
+| 3 | `hooks/examples/*:9` require `.testing/tasks/current` | `test/SKILL.md:18` writes only `tasks/<id>.md` | **The hooks** — `/test` must maintain `current` |
+| 4 | `automation-engineer.md:126-131` three-way burn-in | `qa-gatekeeper.md:102-110` 5 runs, 2 adversarial | **B** (it is the gate); state it once, centrally |
+| 5 | `unit-test-engineer.md:113` lone-truthy assertion = rejected | `qa-gatekeeper.md:79-81` = "weak, call it out" | **B** — the grader defines the bar; the engineer should avoid it, not police it |
+| 6 | `reporter.md:91` demote above 10% EFP | `report/SKILL.md:111` only after ≥10 observations | **B** |
+| 7 | `automation-engineer.md:34` "record one" into `conventions.md` | `learn/SKILL.md:52` promotion needs user approval, always | **B** — agent proposes, `/learn` promotes |
+| 8 | `test/SKILL.md:81` stop on same signature twice | `test/SKILL.md:77` rounds 4–5 fresh implementer | **Escalation first**: raise the stop rule to three consecutive identical signatures |
+| 9 | `depth/SKILL.md:31` every finding reproduced | `RULES.md:18` / `debug/SKILL.md:114` 👁 observed allowed in main list | **B** — depth buys strategies, not admission criteria |
+| 10 | `tech-scout.md:150` "update it, never replace" | `scout/SKILL.md:93` "Rewrite … atomically" | **A** on semantics, **B** on mechanism |
+| 11 | `tech-scout.md:71-73` 12 + 3 reserved ops | `scout/SKILL.md:22` 12 ops | **A** (the reserve exists for a named purpose) |
+| 12 | `RULES.md:28` emphasis ≤ max(2, 30%) | `STYLE.md:520` emphasis ≤ 30% | **A** |
+| 13 | `report/SKILL.md:25` 13-point checklist (STYLE) | `RULES.md:42-52` 10-point checklist | **One list** — fold the 3 STYLE-only items (accessibility, ranking-by-cost, feedback control) into RULES and retire the second |
+| 14 | `start/SKILL.md:22` "ask once, then unattended" | `start/SKILL.md:61,128,177` three approval gates | **The gates**; reword the promise |
+| 15 | `start/SKILL.md:203` `diagnostic-<date>.html` | `report/SKILL.md:89` `dashboard-<date>.html` | **B** |
+| 16 | `diagnose/SKILL.md:51` `coverage-raw.json` | `templates/ci/…yml:69` `coverage-current.json` | **A** |
+| 17 | `unit-test-engineer.md:82-84` testid exception | `ts-unit-test-engineer…:64` no exception | **A**, and port it to both templates |
+| 18 | `README.md:25` non-discriminating test is deleted | `unit-test-engineer.md:128` repair, don't delete | **B** |
+
+---
+
+## Broken references
+
+Checked every `${CLAUDE_PLUGIN_ROOT}/…` path (17), every `scripts/*.py` invocation
+against its `argparse` signature, every `.testing/…` path (27 distinct), and every
+agent name used in a skill.
+
+| Reference | In | Status |
+|---|---|---|
+| `templates/report/STYLE.md` (no `${CLAUDE_PLUGIN_ROOT}`) | `agents/reporter.md:43`, `:133` | **Unresolvable** from a user repo |
+| `.testing/tasks/current` | `hooks/examples/pre-tool-use-protect-product-code.json:9`, `stop-qa-gatekeeper.json:9`, `hooks/examples/README.md:57,65,81` | **Never created** by any skill |
+| `.testing/coverage-diff.json`, `.testing/gates.json`, `.testing/findings.json` | `scripts/pr_comment.py:191-193` | **Never written** by any component |
+| `.testing/coverage-current.json`, `.testing/pr-comment.md` | `templates/ci/testsquad-pr.yml:69,91,110` | Written by CI only; **do not match** `coverage-raw.json` / `reports/pr-comment.md` used by the skills |
+| `ts-browser-engineer` | `skills/upgrade/SKILL.md:70` | **No template** exists |
+| `ts-unit-test-engineer`, `ts-automation-engineer`, `ts-debugger`, `ts-qa-gatekeeper` | `skills/test/SKILL.md:43-46`, `plan/SKILL.md:71`, `debug/SKILL.md:14` | Exist **only after** `/testsquad:start`; no fallback stated |
+| `project-analyst`, `tech-scout`, `reporter` | — | **Referenced by no skill at all** |
+| `scripts/arid_nodes.py` | — | Exists, implements `mutate`'s rules, **invoked nowhere** |
+| `${CLAUDE_PLUGIN_ROOT}/scripts/{env_safety_check,risk_map,flake_smells,normalize_coverage,pr_comment,session_context}.py` | `start:56,109`, `health:83`, `verify:58`, `diagnose:50`, `report:36`, `hooks.json:8` | **Sound** — all exist, all flags match `argparse` |
+| `${CLAUDE_PLUGIN_ROOT}/stacks/<stack>.md`, `/templates/agents/`, `/templates/report/{RULES.md,dashboard.html}` | `project-analyst:62`, `start:73,141,204`, `upgrade:48`, `report:90`, + 4 more | **Sound** |
+
+---
+
+## Context-waste candidates
+
+`scripts/validate_plugin.py:240-244` sets the ceilings (agents 3,500 / skills 3,000 /
+templates 1,600 / RULES 1,200 tokens). The validator currently passes with **0
+warnings**, so nothing is over budget — but two agents are within ~10% of the ceiling
+(`automation-engineer.md` ~3,183, `debugger.md` ~3,031) and the headroom is spent on
+prose that is duplicated elsewhere.
+
+| Candidate | Where | Est. saving |
+|---|---|---|
+| The flake/real-bug matrix, verbatim 5 times | `qa-gatekeeper.md:119-124`, `debugger.md:137-142`, `debug/SKILL.md:74-79`, `ts-debugger…:42-48`, `ts-qa-gatekeeper…:73-78` | ~**550 tok** — keep it in `RULES.md` and `debugger.md`; the others cite it |
+| `debug/SKILL.md:87-105` restates the four statistics `debugger.md:18-36` already carries (84%, 1-in-6, 18x/90%/25%, `1−(1−p)ⁿ`) | both files load together on `/testsquad:debug` | ~**345 tok** |
+| `automation-engineer.md:14-40` "Why you are built this way" — four paragraphs of arithmetic that change no action | | ~**300 tok** (compress to 3 bullets; full derivation already in `RESEARCH.md:417-443`) |
+| "You cannot ask questions" section, 7 near-identical copies | `qa-gatekeeper:55-58`, `unit-test-engineer:132-135`, `automation-engineer:159-164`, `debugger:61-66`, `tech-scout:133-138`, `reporter:123-129`, `project-analyst:50-53` | ~**350 tok** (one sentence each: "You cannot prompt. Take the conservative reading and state the assumption.") |
+| Lesson-recording boilerplate + "a lesson without evidence is a rumour", 7 copies | all agents, "Last step" | ~**300 tok** (the five fields are specified authoritatively in `learn/SKILL.md:30-40`) |
+| Severity scale `S1 data loss · S2 … · S4 cosmetic` spelled out 4+ times | `qa-gatekeeper:156`, `unit-test-engineer:153-155`, `automation-engineer:189-190`, `debugger:179-180` | ~**100 tok** (defined in `RULES.md:31`) |
+| `mutate/SKILL.md:34-46` suppression table | superseded by `scripts/arid_nodes.py` | ~**180 tok** |
+
+Total realistic: **~2,100 tokens** across the files that load at task time — and the
+larger win is that each deleted copy is one fewer place to drift (see C4, H6, H7, M12).
+
+Examples longer than the rule they illustrate: `advise/SKILL.md:64-98` (five worked
+examples, ~420 tok, for five one-line rules) and `upgrade/SKILL.md:63-80` (an 18-line
+sample output for "say what changed"). Both are defensible as format specs; neither is
+free.
+
+---
+
+## Strongest and weakest
+
+**Strongest: `skills/depth/SKILL.md`.** 990 tokens, and every rule in it is falsifiable.
+It defines the levels in minutes and strategy counts rather than adjectives (`:24-29`),
+then spends its remaining length closing its own loophole: `:41-62` states that depth
+governs investigation and never verification, enumerates the six things it may not change,
+and declares an agent that reads the setting to skip a verification step a **defect worth
+reporting as a bug in the plugin** (`:54`). `:64-71` then closes the second-order
+loophole — a short findings list read as good news under a shallow setting. It is the only
+file here that models how its own instruction will be abused and pre-empts it. Its one
+flaw is M13.
+
+**Weakest: `agents/automation-engineer.md`.** 3,183 tokens — the largest file in the
+loaded set — and the least trustworthy per token:
+
+- `:85` asserts a fact about the reader's organisation that is false in nearly every repo
+  it will run in, and converts that falsehood into a defect-reporting instruction (C4).
+- `:144-147` gives four numeric thresholds it has no data to evaluate (M19).
+- `:34` instructs it to write the repo's law file without approval, from a context that
+  cannot ask for approval (H10).
+- `:126-131` specifies a stability protocol the grader will reject (H7).
+- `:14-40` spends ~480 tokens on compounding-probability arithmetic that changes no
+  decision the agent makes.
+- Of its ~2,075 words, the genuinely operational content — the level-selection table
+  (`:54-60`), the seven non-negotiables, the static flake checklist (`:110-124`) — is
+  maybe half. The static checklist at `:110-124` is the best thing in the file and is
+  the part most likely to be skimmed, because it sits behind 100 lines of preamble.
+
+Runner-up weakest: `agents/project-analyst.md` — shortest agent (1,552 tok), good rules,
+and it cannot perform its single named output (C5).
+
+---
+
+## What I checked and found sound
+
+- **Script references.** All 6 invoked scripts exist and every flag used in a skill
+  matches the script's `argparse` (`--out`, `--format text`, `--strip-prefix`,
+  `--testing-dir`). No fabricated flags anywhere.
+- **Context budgets.** `python3 scripts/validate_plugin.py` → "Validation passed: 26
+  component(s) checked, 0 warning(s)." Every agent, skill, template and RULES.md is under
+  its ceiling, and the "no agent reads a stack playbook at task time" check passes
+  (`validate_plugin.py:288-300`) — only `project-analyst` references `stacks/`, correctly
+  exempted.
+- **Environment-safety gating.** Stated identically and in the same direction in
+  `start:26-28,53-68`, `health:18-27`, `diagnose:38-41`, `debug:19-24`, `mutate:116-118`,
+  `advise:115-116`, `verify:28`, `project-analyst:41-43`. No file grants an exception.
+- **Install permission.** Never granted implicitly; "cannot execute + the exact command"
+  is the uniform fallback in `start:103`, `health:23-27`, `diagnose:38-41`, `debug:22-24`.
+  `preferences:33-51` adds scoped, 30-day, early-revalidated approvals and a correct list
+  of never-remembered actions. This is the most coherent cross-file mechanism in the
+  plugin.
+- **Secrets.** `start:61`, `preferences:80-82`, `report:61-62`, `RULES.md:33` all say key
+  names and redacted previews only, and `preferences:80` goes further (no hash). No file
+  contradicts it.
+- **"Never a number you did not measure."** Consistent and identically scoped in
+  `reporter:57-60`, `project-analyst:31-33`, `report:102-107`, `advise:111-113`,
+  `RULES.md:30`. `report:103` ("You measure nothing") is correctly the strongest form.
+- **Coverage discipline.** Floor-detector framing and the uncovered/covered asymmetry are
+  stated the same way in `diagnose:117-129`, `reporter:61-67`, `start:171-173`,
+  `RULES.md:34`. No file offers coverage as a headline.
+- **Severity computed / priority proposed.** Consistent in all four writing agents, both
+  relevant templates, and `RULES.md:31`. The evals check it (`claim-04`).
+- **Evidence badges.** The four-level ladder and the "never counted in the bug total"
+  clause agree in `debugger:156-166`, `debug:114-116`, `RULES.md:18-20`,
+  `ts-debugger…:63-66`. Only the depth interaction (M13) is loose.
+- **First-install backlog rule.** `plan:86-98`, `report:67-69`, `RULES.md:36-40` agree:
+  counted, labelled pre-existing, non-blocking. Rationale identical, no drift.
+- **Mutation policy.** "On demand only, never gate on a score, gate per test" holds across
+  `mutate:19-21,80-89` and `diagnose:102-113`. The diff-scoping flag table
+  (`mutate:69-78`) is the most falsifiable table in the repo — each row names a flag that
+  can be checked against the tool's docs, including the StrykerJS `--incremental` vs
+  `--since` correction.
+- **Uninstall/upgrade safety.** `.local.md` precedence, version stamps, marker-block
+  boundaries, "stop if markers are damaged", hand-edit detection, schema migration with
+  `legacy` preservation and a refusal to downgrade — `uninstall:24-41` and `upgrade:36-57`
+  agree with each other and with `start:147-152` and `templates/agents/README.md:25-34`.
+  No contradiction found in the reversibility story.
+- **The gatekeeper's independence design.** `test:66-69` (fresh context, reads the frozen
+  contract, re-runs commands) matches `qa-gatekeeper:43-49` exactly, including the
+  "read the summary last, if at all" ordering. `CANNOT VERIFY` is routed to the
+  orchestrator in both (`test:104-106`, `qa-gatekeeper:161-163`) with the same reason.
+- **The verify skill's anti-erosion rule** (`verify:76-96`) is the best-argued rule in the
+  plugin and has no counterpart that weakens it: no other file permits lowering a
+  threshold, and `preferences:86-90` routes threshold changes to `decisions.md` the same
+  way.

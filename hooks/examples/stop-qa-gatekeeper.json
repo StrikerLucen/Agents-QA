@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 600,
+            "command": "test -f \"${CLAUDE_PROJECT_DIR}/.testing/tasks/current\" || exit 0; out=$(npx jest --onlyChanged --silent 2>&1) || { echo \"testsquad QA gate: changed-file tests are red. Fix or report NOT MET with evidence before finishing.\" >&2; echo \"$out\" | tail -40 >&2; exit 2; }; python3 \"${CLAUDE_PLUGIN_ROOT}\"/scripts/flake_smells.py test/ --format text >&2 || exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: claim-04-seeded-bugs-node
+context:
+  scaffold_script: fixture.sh
