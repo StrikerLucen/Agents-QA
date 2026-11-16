@@ -324,9 +324,32 @@ class ConcurrentWriters(AtomicIOCase):
         with open(target, encoding="utf-8") as fh:
             self.assertIn(fh.read(), documents.values())
 
-    def test_the_surviving_file_after_a_race_is_one_whole_writers_output(self):
+    def test_the_surviving_file_is_one_whole_output_published_not_rewritten(self):
+        # The sibling above watches the NAME while the race runs. This one
+        # watches the INODE, which is the other half of the guarantee and the
+        # half no reader can see: bytes that have already been published under
+        # the name are never written to again. os.replace cannot touch them --
+        # it points the name at a new inode and leaves the old one frozen --
+        # whereas any truncate-in-place writer rewrites the very file a reader
+        # already has open.
+        #
+        # This test needs that assertion to have any teeth. Measured
+        # 2026-11-16: with write_text_atomic replaced by a plain truncating
+        # open() -- no temp file, no os.replace -- the two assertions this test
+        # used to end on passed 10 runs out of 10, because the last writer to
+        # finish completes its write anyway (so the survivor is whole) and a
+        # writer that creates no temp file cannot leave one behind (so the
+        # leftover check is vacuous). Both are kept, and neither is the point.
         target = self.path("report.json")
         documents = {w: self._document(w) for w in range(self.WRITERS)}
+        # Deliberately not one of `documents`, so "unchanged" cannot be
+        # satisfied by accident at the end of a race between the four of them.
+        baseline = json.dumps({"writer": "baseline", "tail": "baseline"}) + "\n"
+        atomic_io.write_text_atomic(target, baseline)
+        published = os.open(target, os.O_RDONLY)
+        self.addCleanup(os.close, published)
+        published_inode = os.fstat(published).st_ino
+
         start = threading.Barrier(self.WRITERS)
 
         def writer(index):
@@ -345,6 +368,25 @@ class ConcurrentWriters(AtomicIOCase):
             survivor = fh.read()
         self.assertIn(survivor, documents.values())
         self.assertEqual(self.leftover_temps(), [])
+
+        # 100 writes later, the file this fd refers to still holds exactly the
+        # bytes it held before the race started. Nothing about this depends on
+        # timing: a writer that truncates in place rewrites this inode every
+        # round, so it ends up holding one of `documents` instead, and
+        # `baseline` is not among them.
+        os.lseek(published, 0, os.SEEK_SET)
+        frozen = os.read(published, os.fstat(published).st_size + 1)
+        self.assertEqual(frozen.decode("utf-8"), baseline,
+                         "a file already published under this name was "
+                         "rewritten in place; a reader holding it open saw "
+                         "the bytes change underneath it")
+        # The fd above keeps the old inode alive, so the filesystem cannot have
+        # recycled its number: a different one here means the name was
+        # republished rather than the file rewritten.
+        self.assertNotEqual(published_inode, os.stat(target).st_ino,
+                            "the destination name still points at the inode it "
+                            "did before the race, so no rename happened and "
+                            "every write went through the live file")
 
 
 # --------------------------------------------------------------------------

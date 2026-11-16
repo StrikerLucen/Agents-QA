@@ -6,8 +6,11 @@ about behaviour rather than about a mocked subprocess. Expected values are
 derived from the fixture by hand.
 """
 
+import contextlib
+import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -328,6 +331,217 @@ class TestScoring(RiskMapTest):
         trimmed = rm.build(self._tmp.name, since=None,
                            excludes=rm.DEFAULT_EXCLUDES + ("hot.py",))
         self.assertNotIn("src/hot.py", {f["path"] for f in trimmed["files"]})
+
+
+# --------------------------------------------------------------------------
+# what is NOT in the map
+# --------------------------------------------------------------------------
+
+class TestUnrankedFilesAreNamed(unittest.TestCase):
+    """A tracked file that cannot be counted must not vanish from the map.
+
+    F10: `chmod 000 bad.py` produced one ranked file, an empty
+    `skipped_files` and an empty `warnings` -- a map missing a third of the
+    repository, rendered exactly like a complete one. Only the over-ceiling
+    case was ever recorded; unreadable, binary, gone-from-disk and broken
+    symlinks each fell through a bare `continue`.
+
+    `skills/diagnose/SKILL.md` tells a reader "an empty risk map means no
+    data, not no risk". A silently INCOMPLETE map is worse: it is the list a
+    team ranks its testing effort against.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._cleanup)
+        self.repo = Repo(self._tmp.name)
+
+    def _cleanup(self):
+        # chmod 000 would otherwise defeat the cleanup on some platforms.
+        # Order is irrelevant here: every file gets the same chmod.
+        for root, _dirs, names in os.walk(self._tmp.name):  # testsquad:ignore fs-order -- cleanup
+            for name in sorted(names):
+                try:
+                    os.chmod(os.path.join(root, name), stat.S_IRUSR | stat.S_IWUSR)
+                except OSError:
+                    pass
+        self._tmp.cleanup()
+
+    def _two_file_history(self):
+        self.repo.write("good.py", 10)
+        self.repo.write("bad.py", 10)
+        self.repo.commit("initial commit")
+        self.repo.write("good.py", 20)
+        self.repo.write("bad.py", 20)
+        self.repo.commit("fix: touch both")
+
+    def _skipped(self, result):
+        return {s["file"]: s["reason"] for s in result["skipped_files"]}
+
+    def test_an_unreadable_tracked_file_is_named_not_dropped(self):
+        self._two_file_history()
+        target = os.path.join(self._tmp.name, "bad.py")
+        os.chmod(target, 0)
+        if os.access(target, os.R_OK):  # running as root, or a lenient FS
+            self.skipTest("chmod 000 did not make the file unreadable here")
+        result = rm.build(self._tmp.name, since=None)
+
+        self.assertNotIn("bad.py", [f["path"] for f in result["files"]],
+                         "an unreadable file cannot be scored")
+        self.assertIn("bad.py", self._skipped(result),
+                      "...and a file that cannot be scored must still be "
+                      "named: absent from the ranking reads as low risk")
+        self.assertIn("unreadable", self._skipped(result)["bad.py"])
+        self.assertTrue(result["warnings"],
+                        "the JSON consumer only reads warnings and files")
+        self.assertEqual(result["summary"]["files_skipped"], 1)
+        self.assertEqual(result["summary"]["files_ranked"],
+                         len(result["files"]))
+
+    def test_a_complete_map_and_an_incomplete_one_do_not_look_alike(self):
+        # The whole point. Both runs rank exactly one file; only one of them
+        # read everything it was asked to.
+        self._two_file_history()
+        self.repo.remove("bad.py")
+        self.repo.commit("chore: drop it")
+        complete = rm.build(self._tmp.name, since=None)
+
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        second = Repo(other.name)
+        second.write("good.py", 10)
+        second.write("bad.py", 10)
+        second.commit("initial commit")
+        second.write("good.py", 20)
+        second.write("bad.py", 20)
+        second.commit("fix: touch both")
+        target = os.path.join(other.name, "bad.py")
+        os.chmod(target, 0)
+        if os.access(target, os.R_OK):
+            self.skipTest("chmod 000 did not make the file unreadable here")
+        incomplete = rm.build(other.name, since=None)
+
+        self.assertEqual([f["path"] for f in complete["files"]], ["good.py"])
+        self.assertEqual([f["path"] for f in incomplete["files"]], ["good.py"])
+        # Same ranking, and these are the four places they must differ.
+        self.assertEqual(complete["skipped_files"], [])
+        self.assertEqual(complete["warnings"], [])
+        self.assertEqual(complete["summary"]["files_skipped"], 0)
+        self.assertTrue(incomplete["skipped_files"])
+        self.assertTrue(incomplete["warnings"])
+        self.assertEqual(incomplete["summary"]["files_skipped"], 1)
+        # ...and in the text a human actually reads.
+        self.assertEqual(self._render(complete), "")
+        self.assertIn("NOT ranked", self._render(incomplete))
+        self.assertIn("bad.py", self._render(incomplete))
+
+    def _render(self, result):
+        buf = io.StringIO()
+        rm.render_skipped(result, buf)
+        return buf.getvalue()
+
+    def test_a_binary_file_says_it_was_binary(self):
+        self.repo.write("good.py", 10)
+        with open(os.path.join(self._tmp.name, "blob.bin"), "wb") as fh:
+            fh.write(b"\x7fELF\x00\x00payload\n")
+        self.repo.commit("initial commit")
+        self.repo.write("good.py", 20)
+        with open(os.path.join(self._tmp.name, "blob.bin"), "wb") as fh:
+            fh.write(b"\x7fELF\x00\x00payload2\n")
+        self.repo.commit("fix: touch both")
+        result = rm.build(self._tmp.name, since=None)
+        self.assertIn("binary", self._skipped(result).get("blob.bin", ""))
+
+    def test_a_tracked_file_deleted_from_the_working_tree_says_so(self):
+        # `git rm` would drop it from ls-files; this is the other case -- git
+        # still tracks it, the file is simply not there.
+        self._two_file_history()
+        os.remove(os.path.join(self._tmp.name, "bad.py"))
+        result = rm.build(self._tmp.name, since=None)
+        self.assertIn("missing from the working tree",
+                      self._skipped(result).get("bad.py", ""))
+
+    def test_a_broken_symlink_says_its_target_is_missing(self):
+        self.repo.write("good.py", 10)
+        link = os.path.join(self._tmp.name, "dangling.link")
+        os.symlink("/nonexistent/target", link)
+        self.repo.commit("initial commit")
+        self.repo.write("good.py", 20)
+        self.repo.commit("fix: touch it")
+        result = rm.build(self._tmp.name, since=None)
+        reason = self._skipped(result).get("dangling.link", "")
+        self.assertIn("symbolic link", reason)
+        self.assertIn("does not exist", reason)
+
+    def test_an_over_ceiling_file_still_names_the_ceiling(self):
+        # The one case that was already reported. It must keep its hint.
+        self._two_file_history()
+        result = rm.build(self._tmp.name, since=None, max_file_bytes=20)
+        reasons = self._skipped(result)
+        self.assertTrue(reasons, "a 20-byte ceiling skips everything")
+        self.assertIn("--max-file-bytes", next(iter(reasons.values())))
+        self.assertTrue(any("ceiling" in w for w in result["warnings"]),
+                        result["warnings"])
+        # Nothing was scoreable, and the reason is not "this repo is quiet":
+        # the files that would have been scored were never read.
+        self.assertTrue(any("skipped_files" in w for w in result["warnings"]),
+                        result["warnings"])
+
+    def test_a_small_ceiling_is_not_reported_as_zero_megabytes(self):
+        # `max_bytes // (1024*1024)` printed "0MB ceiling" -- a number nobody
+        # measured, in the sentence that is supposed to explain the skip.
+        self.assertNotIn("0MB", rm.oversize_reason(1000))
+        self.assertIn("1000 bytes", rm.oversize_reason(1000))
+        self.assertEqual(rm.human_bytes(2 * 1024 * 1024), "2MB")
+
+    def test_a_non_ascii_path_is_ranked_rather_than_quietly_lost(self):
+        # git quotes it as "\303\274nicode.py" by default, which names no
+        # file on disk: the file was unreadable, unranked and unmentioned.
+        name = "\u00fcnicode.py"
+        self.repo.write(name, 10)
+        self.repo.write("good.py", 10)
+        self.repo.commit("initial commit")
+        self.repo.write(name, 20)
+        self.repo.write("good.py", 20)
+        self.repo.commit("fix: touch both")
+        result = rm.build(self._tmp.name, since=None)
+        self.assertIn(name, [f["path"] for f in result["files"]])
+        self.assertEqual(result["skipped_files"], [])
+
+    def test_nothing_skipped_stays_completely_silent(self):
+        # A check that speaks when there is nothing to say gets switched off,
+        # and takes the real signal with it.
+        self._two_file_history()
+        result = rm.build(self._tmp.name, since=None)
+        self.assertEqual(result["skipped_files"], [])
+        self.assertEqual(result["warnings"], [])
+        self.assertEqual(result["summary"]["files_skipped"], 0)
+        self.assertEqual(self._render(result), "")
+
+    def test_the_cli_prints_the_unranked_files_in_both_modes(self):
+        self._two_file_history()
+        target = os.path.join(self._tmp.name, "bad.py")
+        os.chmod(target, 0)
+        if os.access(target, os.R_OK):
+            self.skipTest("chmod 000 did not make the file unreadable here")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(rm.main([self._tmp.name, "--since", ""]), 0)
+        self.assertIn("bad.py", err.getvalue())
+        self.assertIn("NOT ranked", err.getvalue())
+
+        with tempfile.TemporaryDirectory() as out_dir:
+            out = os.path.join(out_dir, "risk.json")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(err):
+                self.assertEqual(
+                    rm.main([self._tmp.name, "--since", "", "--out", out]), 0)
+            self.assertIn("bad.py", err.getvalue())
+            self.assertIn("NOT ranked", err.getvalue())
+            with open(out) as fh:
+                self.assertTrue(json.load(fh)["skipped_files"])
 
 
 class TestPercentile(unittest.TestCase):

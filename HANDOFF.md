@@ -39,7 +39,7 @@ produced by running the commands above, not by recollection.**
 |---|---|
 | Tests | **902, all passing** (1 skip, 2 expected failures) |
 | Plugin validation | **passes**, 26 components, 0 warnings, 0 could not be validated |
-| Own flake gate on own code | **exit 0** (9 block findings on a pristine clone) |
+| Own flake gate on own code | **exit 0 now.** A clone of `e9bdf9b` gives 9 `no-assertion` block findings and exit 1 — all 9 were false positives (assertions delegated to a `timed()` helper the rule cannot see), fixed on this branch |
 | Agents / skills / stacks | 7 / 16 / 10 |
 | Eval cases | 27, with 81 graders, over 11 claims |
 | Evals ever run | **No.** `evals/SCORECARD.md` is still a template |
@@ -113,13 +113,16 @@ did not know about are too.
 2. **Run `claude plugin validate --strict`.** Never done. `scripts/validate_plugin.py`
    is a stand-in, not a substitute. Same blocker.
 3. **Decisions that are yours, not an agent's** — each was deliberately left:
-   - **`RecursionError` escapes `ast.parse`** in `arid_nodes.py:614` and
-     `flake_smells.py:976`, killing the run, though both docstrings promise they never
-     raise. Latent, not live: the new line ceilings cover the known input, but a deeply
-     nested *multi-line* expression has short lines and no ceiling touches it. A bare
-     `except` that falls back to the regex scanner silently would be the same
-     silence-looks-like-success defect in new clothes — it needs a decision about what
-     to **report**.
+   - *(closed)* `RecursionError` escaping `ast.parse` is fixed at all three production
+     sites — `arid_nodes.py`, `flake_smells.py`, `project_state.py` — each reporting an
+     explicit "could not parse" signal rather than falling back silently. CI found it;
+     every local macOS run passed, because the depth is the C stack, not the Python
+     limit. Measured on the 3.9.6 floor: there is **no RecursionError window at all**,
+     it goes from accepting 260,937 frames straight to SIGSEGV, so raising the limit
+     converts a catchable exception into an uncatchable crash. Two unguarded sites
+     remain in `tests/test_integration.py` and `tests/test_fixture_manifest.py`, both
+     parsing the test module's own source — a clarity nit, not this defect class, since
+     a raise there is a loud test error rather than a silent wrong number.
    - **`flake_smells`'s `no-assertion` rule cannot see an assertion delegated to a
      same-file helper.** 9 of 9 findings on this repo were false positives: a **100%
      rate** against the project's own ~10% switch-off threshold. The fix is intra-file
@@ -136,6 +139,11 @@ did not know about are too.
      catch, stated by the agent that declined to build it: the analyst is a prompt, not
      a process, so nothing *forces* it to call the reader, and a reader nobody must
      invoke is a second contract on top of the first.
+   - **The consent contract is pinned on one side only.** `tests/test_consent_contract.py`
+     now asserts the analyst's scope-and-expiry rules (granted + unexpired + command
+     listed → those commands only). But `skills/start/SKILL.md` is the side that *prints*
+     the command list the user agrees to, and nothing asserts that what it shows is the
+     list the analyst later matches against. Two halves of one gate, pinned separately.
 4. **Smaller, well-specified cleanups** — each found and reported today, none urgent:
    - `test_robustness.py:386/529/553/1279/1483` skip when `arid_nodes.py` is absent.
      Those are missing-*production-code* skips, not platform guards, and should fail

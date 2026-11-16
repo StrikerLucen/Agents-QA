@@ -51,6 +51,45 @@ MARKERS = tuple(a + b for a, b in (
 ))
 MARKER_XFAIL = MARKERS[3]
 
+# The one ceiling this script does not set and cannot raise -- the same one
+# documented at length in arid_nodes.py and flake_smells.py, which hit it
+# first. CPython builds the Python AST objects from the C parse tree with a
+# recursive C function, so a deeply NESTED expression costs C stack and past
+# some depth `ast.parse` raises `RecursionError`. That depth is NOT
+# `sys.getrecursionlimit()`, it moves with the platform and the thread, and on
+# this repo's declared floor (CPython 3.9.6, macOS, main thread) there is no
+# RecursionError window at all. Those depths were measured for arid_nodes.py,
+# by bisecting child processes, and are quoted here rather than re-measured:
+# 260,937 nested terms accepted, dead by 262,500 (SIGSEGV, rc -11), with the
+# macOS crash report naming "Thread stack size exceeded due to excessive
+# recursion". See the block above arid_nodes.AST_TOO_DEEP for the full table.
+# So `sys.setrecursionlimit()` and `threading.stack_size()` are
+# both the wrong knob here: they would trade a catchable exception for an
+# uncatchable crash. Catching RecursionError at the call site needs no depth
+# guess, which is why it is the fix.
+#
+# Residual risk, stated plainly: on an interpreter whose AST builder has no
+# counter a deep enough file still kills the process, and nothing here can
+# catch that. What this script controls is that where the interpreter DOES
+# raise, the state report survives -- and says so. This is the script a fresh
+# session runs when nothing else can be trusted; a traceback here leaves the
+# reader with no numbers at all, and a quiet fallback leaves them with numbers
+# they would wrongly believe.
+AST_TOO_DEEP = "ast-nesting-too-deep"
+AST_TOO_DEEP_REASON = (
+    "ast.parse raised RecursionError: expression nesting is too deep for "
+    "CPython's AST builder on this interpreter and stack. No flag raises this "
+    "ceiling -- it is the C stack, not sys.setrecursionlimit, and it moves "
+    "between platforms. The AST pass did NOT run on this file."
+)
+AST_TOO_DEEP_LOST = (
+    "the decorated test's NAME, and the certainty that each hit is a real "
+    "decorator rather than the string quoted in prose or a docstring; a line "
+    "scan ran instead, so this file's " + MARKER_XFAIL + " count is a text "
+    "match and not a measurement -- it cannot see a decorator reached through "
+    "an alias or a line continuation, and it counts one that is only quoted"
+)
+
 # The test suite is run exactly the way HANDOFF.md documents it: module names
 # taken from tests/test_*.py, with tests/ as the working directory. Discovery
 # finds a slightly different set, and two different numbers for "the suite"
@@ -220,15 +259,37 @@ def section_inventory() -> dict:
     }
 
 
-def _xfail_tests(text: str) -> "list[dict] | None":
-    """(line, test name) for every function actually decorated with
-    expectedFailure, via the parser rather than a text match -- the decorator
-    is also quoted in prose in these files, and a docstring is not a defect.
-    Returns None when the file does not parse, so the caller can fall back."""
+def _xfail_tests(text: str) -> "tuple[list[dict] | None, str | None]":
+    """(hits, why_not) -- hits is (line, test name) for every function actually
+    decorated with expectedFailure, via the parser rather than a text match --
+    the decorator is also quoted in prose in these files, and a docstring is
+    not a defect. hits is None when the file does not parse, so the caller can
+    fall back to a line scan.
+
+    `why_not` exists because those refusals are not one thing. A SyntaxError is
+    an ordinary, expected state: the file is half-written, the line scan is the
+    right answer and saying so on every run would be noise. A RecursionError is
+    not: nothing about the file is wrong, the limit is the interpreter's C
+    stack (see AST_TOO_DEEP above), it differs per platform, and the caller
+    MUST be able to tell the reader that the count for that file came out of a
+    text match rather than the parser. Falling back silently there would be the
+    same silence-looks-like-success defect this script exists to measure.
+
+    This function never raises. The docstring used to promise that while the
+    code only caught SyntaxError and ValueError, so a deeply nested expression
+    anywhere in the scanned tree killed section_markers() and with it the whole
+    state report.
+    """
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError):
-        return None
+        return None, "syntax-error"
+    except RecursionError:
+        # Caught here and NOT re-raised, but the caller is handed the reason so
+        # it can name the file in ast_unparsed_files and mark the total as not
+        # exact. Catch-and-continue on its own would be silence in a fix's
+        # clothes.
+        return None, AST_TOO_DEEP
     found = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -238,13 +299,14 @@ def _xfail_tests(text: str) -> "list[dict] | None":
             name = getattr(target, "attr", None) or getattr(target, "id", None)
             if name == "expectedFailure":
                 found.append({"line": dec.lineno, "test": node.name})
-    return found
+    return found, None
 
 
 def section_markers() -> dict:
     by_file: "dict[str, dict]" = {}
     totals = {m: 0 for m in MARKERS}
     expected_failures: "list[dict]" = []
+    ast_unparsed: "list[dict]" = []
 
     for dirpath, dirnames, filenames in os.walk(ROOT):
         dirnames[:] = [d for d in dirnames if d not in SCAN_SKIP_DIRS]
@@ -270,11 +332,26 @@ def section_markers() -> dict:
                         counts[marker] += 1
                         totals[marker] += 1
 
-            xfails = _xfail_tests(text) if ext == ".py" else []
+            xfails, why = _xfail_tests(text) if ext == ".py" else ([], None)
             if xfails is None:  # unparseable python: say what was seen, not what it means
-                xfails = [{"line": i + 1, "test": None}
+                xfails = [{"line": i + 1, "test": None, "counted_by": "line-scan",
+                           "why_unnamed": why}
                           for i, line in enumerate(text.splitlines())
                           if line.lstrip().startswith(MARKER_XFAIL)]
+                if why == AST_TOO_DEEP:
+                    # A half-written file (syntax-error) is expected and stays
+                    # a silent fallback. This is not that: the file is valid
+                    # Python the interpreter could not build an AST for, the
+                    # count below is a text match, and the reader has to be
+                    # able to tell those apart from a parsed, measured count.
+                    ast_unparsed.append({
+                        "file": rel,
+                        "stage": "ast",
+                        "fell_back_to": "line-scan",
+                        "reason": AST_TOO_DEEP_REASON,
+                        "not_measured": AST_TOO_DEEP_LOST,
+                        "line_scan_hits": len(xfails),
+                    })
             for hit in xfails:
                 counts[MARKER_XFAIL] += 1
                 totals[MARKER_XFAIL] += 1
@@ -285,8 +362,15 @@ def section_markers() -> dict:
 
     return {
         "totals": totals,
+        # False means at least one .py was counted by the line scanner because
+        # its AST could not be built, so `totals` for MARKER_XFAIL is a text
+        # match for those files. A consumer that reads `totals` without reading
+        # this flag is reading a number nobody measured.
+        "totals_exact": not ast_unparsed,
         "by_file": dict(sorted(by_file.items())),
         "expected_failures": expected_failures,
+        "ast_unparsed_files": ast_unparsed,
+        "files_ast_unparsed": len(ast_unparsed),
     }
 
 
@@ -504,13 +588,25 @@ def render(state: dict) -> str:
     m = state["markers"]
     add(_hdr("Unfinished markers"))
     totals = ", ".join(f"{k} {v}" for k, v in m["totals"].items())
+    unparsed = m.get("ast_unparsed_files") or []
     add(f"  {totals}")
+    if unparsed:
+        # The one number on this line that is NOT a measurement has to say so
+        # where the number is, not in a footnote further down.
+        add(f"  NOT EXACT: the {MARKER_XFAIL} total includes "
+            f"{sum(d['line_scan_hits'] for d in unparsed)} hit(s) from "
+            f"{len(unparsed)} file(s) counted WITHOUT the AST pass — see below")
     for path, counts in m["by_file"].items():
         add(f"    {path}: " + ", ".join(f"{k}×{v}" for k, v in counts.items()))
     if m["expected_failures"]:
         add(f"  documented known defects ({MARKER_XFAIL}):")
         for ef in m["expected_failures"]:
             add(f"    {ef['file']}:{ef['line']}  {ef['test'] or '(name unreadable)'}")
+    for d in unparsed:
+        add(f"  COULD NOT PARSE, counted WITHOUT the AST pass: {d['file']}")
+        add(f"    {d['reason']}")
+        add(f"    fell back to a {d['fell_back_to']} that found "
+            f"{d['line_scan_hits']} hit(s); not measured: {d['not_measured']}")
 
     # findings
     f = state["findings"]

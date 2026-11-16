@@ -14,15 +14,28 @@ cd tests && ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest
 python3 scripts/validate_plugin.py . --strict
 ```
 
-**Re-measured 2026-11-12, after the S2-3 and S3-2 work below:** `873 tests, OK (skipped=1,
-expected failures=1)`, and the validator prints `Validation passed: 26 component(s)
-checked, 0 warning(s), 0 could not be validated.` *(An earlier version of this block said
-"539 tests, OK (2 expected failures)". That was the count on the day of the original
-review; the suite has grown since and the shape of the result changed from 2 expected
-failures to 1 skip + 1 expected failure.)*
+**Re-measured 2026-11-16** (fixtures regenerated first with
+`cd examples/fixtures && ./regen_git_history.sh`, as `CLAUDE.md` requires):
+
+```
+Ran 922 tests in 33.801s
+OK (skipped=1, expected failures=1)
+
+Validation passed: 26 component(s) checked, 0 warning(s), 0 could not be validated.
+```
+
+*This block has now held three different counts — "539 tests, OK (2 expected failures)" at
+the original review, "873" dated 2026-11-12, and 922 today. The validator's 26 components
+is unchanged and was re-confirmed. **Do not trust any of these numbers; re-run the two
+commands.** The suite moved by 49 tests between the previous re-measurement and this one,
+which is why `CLAUDE.md` tells you to measure rather than read.*
 
 **On locations in this document.** Where a finding cites a file, it quotes an anchor phrase
-rather than, or as well as, a line number. `skills/start/SKILL.md` was reordered twice on
+rather than, or as well as, a line number. *This policy was stated but only partly
+followed: the "Edits made by this review" table and several `**Where:**` lines carried bare
+line numbers into files this branch then grew by hundreds of lines, and every one of them
+had rotted by 2026-11-16. They have been converted to anchors. Remaining bare line numbers
+in this document were spot-checked and should still be treated as approximate.* `skills/start/SKILL.md` was reordered twice on
 2026-11-12 — once *mid-session*, between two reads taken minutes apart while this document
 was being revised — and every bare line number into it in the previous draft had drifted.
 Line numbers here are a convenience, not an identifier; the quoted phrase is the identifier.
@@ -42,7 +55,7 @@ Line numbers here are a convenience, not an identifier; the quoted phrase is the
 | S3-3 | S3 | `dashboard.html` data slot has no `</script>` escaping contract | no — design call |
 | S4-1 | S4 | Unquoted path placeholders in skill command templates | yes |
 | S4-2 | S4 | Worktree mutation flow has no stated location, cleanup-on-interrupt, or "never the real working copy" invariant in most agents | no |
-| S4-3 | S4 | `pr_comment.py` interpolates finding fields into Markdown without escaping; `repro` can break out of its fence | no |
+| S4-3 | S4 | `pr_comment.py` interpolates finding fields into Markdown without escaping; `repro` can break out of its fence | **yes — fixed on this branch**, see S4-3 |
 | S4-4 | S4 | CI artifact uploads all of `.testing/`, including `env-safety.json` and absolute paths | no |
 | S4-5 | S4 | `risk_map.TEST_PATTERN` is quadratic in path length | no |
 
@@ -312,11 +325,26 @@ problem, and `pretest` is still unflagged by any detector. A user who clicks thr
 gate gets no signal that this particular command is categorically different from a slow
 test. Fixes 1 and 2 below stand as written.
 
-**One gap this finding should not be closed without recording.** Step 5 says the agreement is
-*"Record[ed] … in `.testing/preferences.json`"*, and `agents/project-analyst.md` depends on
-reading it to decide static-vs-executing — but **no key name is specified and no script
-validates it**. Two files promise a record whose schema does not exist. Pin the key before
-this is exercised, or the analyst will guess. (Also tracked in `HANDOFF.md` §4.)
+**~~One gap this finding should not be closed without recording.~~ CLOSED 2026-11-16.**
+This said that step 5 records the agreement in `.testing/preferences.json` but that "no key
+name is specified and no script validates it". Both halves are now false:
+
+- **The key is pinned.** `skills/start/SKILL.md`, anchor: *"Record it under
+  `consent.execute_repo_commands` in `.testing/preferences.json`, in the shape
+  `agents/project-analyst.md` defines under "The consent record" — the only definition;
+  never restate it here."* `agents/project-analyst.md` carries the JSON shape under
+  `"execute_repo_commands"`, and states the fail-closed behaviour for a malformed one.
+- **A script validates it.** `tests/test_consent_contract.py` exists for exactly this —
+  `KEY = "execute_repo_commands"`, and
+  `test_the_key_path_is_consent_execute_repo_commands` asserts the full
+  `consent.execute_repo_commands` path, with a sibling test asserting the value carries
+  `state`, `commands`, `decided` and `expires`. It parses the shape **out of
+  `agents/project-analyst.md` itself**, so the prompt and the contract cannot drift apart
+  silently.
+
+`skills/start/SKILL.md` also states the silence contract this review cares about most:
+*"**A missing or malformed record is not consent**: it fails closed to the static pass and
+is reported as unreadable, never as agreement."* Nothing is owed to `HANDOFF.md` §4 here.
 
 ### The two halves still open
 
@@ -340,8 +368,10 @@ I said I would ship (3) even if nothing else shipped. (3) shipped.
 
 ## S3-1 — Source snippets are published verbatim, with no redaction
 
-**Where:** `scripts/flake_smells.py:1122-1131`; `scripts/arid_nodes.py:1492`,
-`1509-1535`, `1662-1668`.
+**Where:** `scripts/flake_smells.py`, anchors `snippet = raw.strip()` /
+`snippet = snippet[:97] + "..."` / `"snippet": snippet,`; `scripts/arid_nodes.py`, anchors
+`"snippet": (raw[0].strip()[:97] if raw else ""),` and `snippet = scan.snippet(i)`.
+*(Line numbers removed 2026-11-16 — the four previously given were all wrong.)*
 
 Both emit up to 100 characters of source verbatim as `snippet`. There is no credential
 filter on that path — unlike `env_safety_check.py`, which is scrupulous about it.
@@ -360,6 +390,15 @@ that fires on that line), but the mechanism is plain in the code and the asymmet
 patterns and `looks_live_secret()` already exist in `env_safety_check.py` and could move
 to a small shared module. Replace a matching run with `[redacted]` and keep the rest of
 the line. Left alone because it touches two scripts' output schema and their tests.
+
+> **Status 2026-11-16 — still open at the source, now mitigated at one of the three
+> outlets.** `grep -n "redact" scripts/flake_smells.py scripts/arid_nodes.py` → **no
+> matches**; both still emit the 100-character `snippet` verbatim (anchors: `snippet =
+> raw.strip()` then `snippet[:97] + "..."` in `flake_smells.py`, and `(raw[0].strip()[:97]
+> if raw else "")` in `arid_nodes.py`). What *has* changed is that `scripts/pr_comment.py`
+> now redacts on the way into the PR comment (see S4-3), so the public-CI-log outlet is
+> covered for findings that route through it. `.testing/` on disk and the uploaded
+> artifact are not. **Do not read S4-3 as closing this.**
 
 ---
 
@@ -443,8 +482,10 @@ security: adding these rules pushed three files to their context ceilings — re
 
 ## S3-3 — The dashboard's data slot has no escaping contract
 
-**Where:** `templates/report/dashboard.html:177-179` (the slot),
-`skills/report/SKILL.md:90`.
+**Where:** `templates/report/dashboard.html`, anchor
+`<script id="testsquad-data" type="application/json">` (the slot); `skills/report/SKILL.md`.
+**Re-verified still open 2026-11-16:** `grep -n "</script>" skills/report/SKILL.md` → no
+matches; nothing instructs the agent to escape it.
 
 The renderer itself is **clean** — see the checked-clean list below; every interpolation
 goes through `esc()`. The gap is one level up: the agent writes the run's JSON into a
@@ -475,24 +516,26 @@ The `env_safety_check.py` and `risk_map.py` invocations in `skills/start/SKILL.m
 one in `skills/diagnose/SKILL.md`, showed `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/x.py" <repo> …`, with the plugin root
 quoted and the substituted path not. An agent copying the template verbatim breaks on any
 path containing a space — and a path is not always a safe string. Quoted all three.
-`skills/health/SKILL.md:83` takes `<test paths>`, plural, where quoting each element is
+`skills/health/SKILL.md` takes `<test paths>`, plural, where quoting each element is
 the agent's job; left as is.
 
 ## S4-2 — The worktree mutation flow is under-specified
 
-**Where:** `agents/unit-test-engineer.md:89-91`, `agents/automation-engineer.md:97-100`,
-`agents/debugger.md:117-118`, `agents/qa-gatekeeper.md:92-99`,
-`templates/agents/ts-qa-gatekeeper.md.tmpl:59-61`,
-`templates/agents/ts-unit-test-engineer.md.tmpl:70-71`.
+**Where:** `agents/unit-test-engineer.md`, `agents/automation-engineer.md`,
+`agents/debugger.md`, `agents/qa-gatekeeper.md`,
+`templates/agents/ts-qa-gatekeeper.md.tmpl`, `templates/agents/ts-unit-test-engineer.md.tmpl`
+— the worktree-mutation passages in each. **Re-verified still open 2026-11-16**; in
+particular `templates/knowledge/task-contract.md` still carries the `git stash pop fix`
+row quoted below (`grep -n "stash" templates/knowledge/task-contract.md` → 1 hit).
 
 The invariant is right and is stated — mutate in a throwaway worktree so the working copy
-is never touched — but only `agents/qa-gatekeeper.md:99` says *"including if you are
+is never touched — but only `agents/qa-gatekeeper.md` says *"including if you are
 interrupted"*, and none of them says **where** the worktree goes or gives the literal
 `git worktree add` / `git worktree remove --force` pair. An agent improvising the location
 can create it inside the repository, where the next `git status` shows it and the next
 glob-based rule walks into it.
 
-`templates/knowledge/task-contract.md:23` is worse, and contradicts the rule outright:
+`templates/knowledge/task-contract.md` is worse, and contradicts the rule outright:
 
 ```
 | 2 | Each new test fails on the unfixed code | `git stash pop fix && npx jest <file>` | every new test red |
@@ -509,15 +552,33 @@ checked before reporting done, and a non-empty result is a failure of the task, 
 footnote. Then replace the `git stash` example in the task contract with the worktree
 form. Left alone: it is six coordinated instruction edits.
 
-## S4-3 — `pr_comment.py` does not escape finding fields
+## S4-3 — `pr_comment.py` does not escape finding fields — **FIXED**
 
-**Where:** `scripts/pr_comment.py:145-153`.
+> **CLOSED 2026-11-16, and the fix went further than this finding asked.**
+> `scripts/pr_comment.py` now carries `_escape_md()`, anchor
+> *`text = text.replace("|", "\\|").replace("`", "\\`")`*, with the reasoning in its
+> docstring (*"a quote, backticks open code spans that swallow the rest of the row"*), and
+> a separate path-cell helper that drops backticks outright rather than escaping them —
+> anchor *"Escaping a backtick inside a code span does not work, so they are dropped"*,
+> which is the correct call and not one this finding made.
+>
+> Beyond the escaping, the script also gained a `redact()` pass over comment-bound strings,
+> built on `env_safety_check`'s own patterns (it imports it as `_esc` and reuses
+> `VENDOR_TOKEN_RES`, `AWS_KEY_RE`, `STRIPE_LIVE_RE`, `AZURE_CONN_RE`) plus an
+> entropy-and-charset `_secret_shaped()` check. **That is S3-1's recommended fix —
+> "the vendor-prefix patterns … already exist in `env_safety_check.py` and could move to a
+> small shared module" — applied at the PR-comment boundary.** S3-1 itself is still open:
+> see its entry.
+
+**Where (as found):** `scripts/pr_comment.py`, the findings-table interpolation.
 
 `title`, `file`, `line` and `repro` are interpolated into Markdown unescaped. A `|` in a
 title breaks the table; `repro` is placed between bare ``` fences, so a value containing
 ``` escapes the fence and can inject arbitrary Markdown — including a second
 `<!-- testsquad:pr-comment -->` marker, which would confuse the
-find-and-update logic at `templates/ci/testsquad-pr.yml:121`.
+find-and-update logic in `templates/ci/testsquad-pr.yml` (anchor
+`const marker = '<!-- testsquad:pr-comment -->';`). **Both halves are now escaped —
+see the status box above.**
 
 Low severity because the input is `.testing/findings.json` from the checked-out branch,
 and the posting step is skipped on forks — so this is same-repo only, inside an existing
@@ -526,7 +587,9 @@ trust boundary. Still worth a `.replace("|", "\\|")` on the table cells and a ch
 
 ## S4-4 — CI uploads all of `.testing/`
 
-**Where:** `templates/ci/testsquad-pr.yml:94-100`.
+**Where:** `templates/ci/testsquad-pr.yml`, anchor `path: .testing/` under
+`uses: actions/upload-artifact@v4`. **Re-verified still open 2026-11-16** — the upload is
+still the whole directory.
 
 `path: .testing/` sweeps up `env-safety.json`, which carries key names, 4-character value
 prefixes and `"repo": "<absolute path>"`. With S2-2 fixed the prefixes are the intended
@@ -537,7 +600,8 @@ JSON specifically rather than the whole directory.
 
 ## S4-5 — `risk_map.TEST_PATTERN` is quadratic in path length
 
-**Where:** `scripts/risk_map.py:63-70`.
+**Where:** `scripts/risk_map.py`, anchor `TEST_PATTERN = re.compile(`. **Re-verified still
+open 2026-11-16.**
 
 Found by the regex fuzz: ~2 s on a 41,600-character string, scaling quadratically. It is
 applied to paths from `git ls-files`, and filesystems cap a path well below that, so it
@@ -641,8 +705,12 @@ a path from input data.
 
 **The example hooks are correctly quoted.** `hooks/examples/*.json` extract a file path
 through `python3 -c` and then use it as `"$f"` inside `case` and as a quoted argument to
-`npx jest`. No `eval`, no unquoted expansion. They are opt-in, and
-`hooks/examples/README.md` is unusually clear about what each one costs.
+`npx jest`. No `eval`, no unquoted expansion. They are opt-in. ~~`hooks/examples/README.md`
+is unusually clear about what each one costs.~~ — **that file does not exist**;
+`ls hooks/examples/` returns three `.json` files and no prose. Corrected 2026-11-16. The
+quoting finding stands and was re-read from the JSON. **The documentation gap is real and
+is not recorded anywhere else: three opt-in hooks ship with no prose telling a user what
+they do, what they cost, or that they must be opted into.**
 
 **Uninstall is well specified.** `skills/uninstall/SKILL.md` requires the version stamp as
 well as the `ts-` prefix before deleting an agent; protects `ts-*.local.md`; refuses to
@@ -706,24 +774,41 @@ not committed; it is reproducible from the description above in about twenty lin
 
 ## Edits made by this review
 
-| File | Lines | Change |
+*Line numbers removed 2026-11-16: **all nine rows had rotted**, some by 200+ lines, because
+these files grew substantially on this branch (`flake_smells.py` +261, `env_safety_check.py`
++108, `session_context.py` +133). Each edit is now identified by the symbol or anchor it
+introduced, every one of which was re-confirmed present with `grep -n` on 2026-11-16.*
+
+| File | Anchor — all verified present | Change |
 |---|---|---|
-| `scripts/flake_smells.py` | 771-785 | `MAX_TAUTOLOGY_LINE` + `_is_tautology()`, with the reasoning in a comment |
-| `scripts/flake_smells.py` | 1386 | call `_is_tautology()` instead of the raw pattern loop |
-| `scripts/flake_smells.py` | 1468-1476 | `MAX_LINE_CHARS = 2000` and why |
-| `scripts/flake_smells.py` | 1495-1497 | `read_lines` truncates overlong lines; line numbering unchanged |
-| `scripts/env_safety_check.py` | 474-495, 506 | `safe_key()`, applied in `Finding.__init__` |
-| `scripts/session_context.py` | 61-69 | `clip()` |
-| `scripts/session_context.py` | 105-109 | `stack` and `test_cmd` clipped, with the reason |
-| `skills/start/SKILL.md` | 56, 109 | quote the `<repo>` placeholder |
-| `skills/diagnose/SKILL.md` | 50 | quote the `<report file>` placeholder |
+| `scripts/flake_smells.py` | `MAX_TAUTOLOGY_LINE = 400`, `def _is_tautology(line: str) -> bool:` | the cap + helper, with the reasoning in a comment |
+| `scripts/flake_smells.py` | `if _is_tautology(scan.block_line(block, n))]` | call `_is_tautology()` instead of the raw pattern loop |
+| `scripts/flake_smells.py` | `MAX_LINE_CHARS = 2000` | the per-line cap and why |
+| `scripts/flake_smells.py` | `def read_lines_bounded(path: str, *, max_bytes: int = MAX_FILE_BYTES,` | overlong lines truncated; line numbering unchanged. (Since renamed from `read_lines`; `read_lines` still exists beside it as the unbounded form) |
+| `scripts/env_safety_check.py` | `def safe_key(key: str) -> str:`, applied at `key=safe_key(key),` | `safe_key()`, applied in `Finding.__init__` |
+| `scripts/session_context.py` | `def clip(value) -> str:` | `clip()` |
+| `scripts/session_context.py` | `stack = clip(profile.get("stack") or profile.get("language"))` | `stack` and `test_cmd` clipped, with the reason |
+| `skills/start/SKILL.md` | `"${CLAUDE_PLUGIN_ROOT}/scripts/env_safety_check.py" "<repo>"` and the `risk_map.py` line | quote the `<repo>` placeholder |
+| `skills/diagnose/SKILL.md` | `"${CLAUDE_PLUGIN_ROOT}/scripts/normalize_coverage.py" "<report file>"` | quote the `<report file>` placeholder |
 
 No behaviour outside these paths was changed. The project's own fixtures and tests were
 not modified; all adversarial cases were run in a temp directory.
 
-**The one thing I would change before this goes public:** make `/testsquad:start` show the
-user the verbatim test command it discovered and get agreement before it executes it the
-first time (S2-3, fix 3). The plugin already does exactly this for the `CLAUDE.md` diff,
-which is a far smaller risk. Right now the one action with real blast radius — running a
-string taken out of a stranger's `package.json` — is the one that happens without being
-shown.
+**~~The one thing I would change before this goes public~~ — done, and this paragraph
+contradicted the body of its own document.** It asked for `/testsquad:start` to show the
+user the verbatim test command and get agreement before first execution (S2-3, fix 3), as
+though it were outstanding. **S2-3 above already records that fix as shipped** — *"**Done**
+— this is now step 5"* — and the summary table records S2-3 as "**yes, by consent gate** —
+`/start` step 5". Three statements, one of them stale, in one document. Corrected
+2026-11-16; `skills/start/SKILL.md` step 5 carries the gate, anchor *"Say what is being
+agreed to: **these run code written by whoever wrote this repository, as you, on this
+machine.**"*
+
+**The one thing I would change before this goes public, restated against the current
+tree:** the two remaining halves of S2-3 — a `remote_code_in_test_command` detector at
+CRITICAL, and scanning the npm lifecycle scripts, not only `test`. Verified still open:
+`grep -n "remote_code_in_test_command\|preinstall\|postinstall\|pretest"
+scripts/env_safety_check.py` → **no matches**; `curl … | sh` in a test command still
+reports as `MEDIUM network_in_test_command` and exits 0. A user who clicks through the
+consent gate still gets no signal that this command is categorically different from a slow
+test.

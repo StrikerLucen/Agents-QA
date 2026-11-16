@@ -53,8 +53,21 @@ python3 ../../scripts/flake_smells.py node-ts python-pkg java-min
 `tests/good.spec.ts`, `tests/test_good.py` and `GoodTest.java`. A finding on a
 good test is a false positive, which matters more here than a miss.
 
-To check the scripts themselves: `python3 -m unittest discover -s tests` —
-484 tests, ~1.3s.
+To check the scripts themselves, from the repository root:
+
+```sh
+cd examples/fixtures && ./regen_git_history.sh   # required on a fresh clone
+cd ../../tests && ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest
+```
+
+Measured 2026-11-16: **922 tests, `OK (skipped=1, expected failures=1)`, 33.8s.** Re-run
+it rather than trusting that number — the suite has gained hundreds of tests in single
+sessions, so any count written here goes stale quickly.
+
+**Do not use `python3 -m unittest discover -s tests`.** It is not equivalent: it reports
+10 failures on a clean tree, because the test modules import each other by bare module
+name and `discover` gives them a different import root. The `ls | xargs` form above is
+the supported one.
 
 ### The agent check
 
@@ -134,10 +147,22 @@ measure flakiness. Budget roughly three suite runs plus a coverage run, plus
 model time. On a monorepo it prints its estimated time and token cost before any
 long stage and waits.
 
-The plugin's own context cost is measurable: the always-on session preamble is
-~150 tokens (578 characters on a filled-in repo; a test caps it at 1,500), and a
-`/testsquad:test` run loads roughly 6,000 tokens of plugin — the skill (~1,250),
-the report rules (~790), and the 2–4 agents it selects (~2,100–3,200 each).
+The plugin's own context cost is measurable, so here it is measured rather than
+estimated. All figures below are from 2026-11-16, using the same `size // 4` estimator
+`scripts/validate_plugin.py` enforces its budgets with.
+
+The always-on session preamble: **555 characters, ~139 tokens**, on a `.testing/` holding
+a stack profile, a health baseline, three conventions and one known issue. It scales with
+those files, so your repo will differ — **the number that does not differ is the ceiling**,
+which `tests/test_integration.py` enforces at **2,000 characters** (anchor: *"the session
+preamble is {0} characters and is charged on every request in this repo"*), fed ten
+conventions and six 200-character blockers to prove the caps hold under hostile input.
+
+A `/testsquad:test` run loads the skill (**1,890 tokens**) plus the report rules
+(**957**) plus the 2–4 agents it selects, which range from **2,398** (`unit-test-engineer`)
+to **3,486** (`automation-engineer`). That is **~5,200 tokens at the two-agent floor and
+~15,300 at the four-agent ceiling** — not a single figure, because the whole point of
+selecting 2–4 specialists rather than all 7 is that the cost varies.
 
 ### When the answer is bad news
 

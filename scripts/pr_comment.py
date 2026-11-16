@@ -618,14 +618,27 @@ def render(data) -> str:
 # entry point
 # --------------------------------------------------------------------------
 
-# The ways a `--data` file can fail to be usable. They are different facts
-# about the world, so they get different sentences: "I could not read it", "I
-# read it and it is empty" and "I read it and it is the wrong shape" are three
-# states, and one message covering all three is the same conflation as a
-# headline calling an unread input clean -- one layer up.
+# The ways a file can fail to be usable. They are different facts about the
+# world, so they get different sentences. "It is not there", "it is there and
+# I could not read a byte of it", "I read it and it is not JSON", "I read it
+# and it is empty" and "I read it and it is the wrong shape" are five states,
+# and one message covering several of them is the same conflation as a
+# headline calling an unread input clean -- one layer up. "I could not read
+# it" said about a file that read perfectly well sends the reader to look for
+# a permissions problem that is not there; said about a file that is simply
+# absent, it sends them to look for a corruption that is not there either.
+#
+# `DATA_ABSENT` is spelled differently from `INPUT_ABSENT` on purpose: these
+# are facts about a *file*, those are facts about an input inside one, and two
+# enums sharing a string value is how a wrong comparison passes quietly.
+DATA_ABSENT = "no-such-file"
 DATA_UNREADABLE = "unreadable"
+DATA_MALFORMED = "malformed"
 DATA_NOT_AN_OBJECT = "not-an-object"
 DATA_EMPTY = "empty"
+# The sixth, and the only one that is a judgement about content rather than
+# about the file: readable, non-empty, correctly shaped, and not this tool's
+# data at all.
 DATA_FOREIGN = "foreign"
 
 # The keys this renderer reads. A `--data` object carrying none of them is not
@@ -645,10 +658,49 @@ INPUT_SOURCES = {
 }
 RENDERED_INPUTS = tuple(INPUT_SOURCES)
 
-# The three answers to "did this input run?".
+# The four answers to "did this input run?".
 INPUT_RAN = "ran"
 INPUT_ABSENT = "absent"
 INPUT_NULL = "null"
+INPUT_NO_KEYS = "no-keys"
+
+# `gates.json` and `findings.json` wrap their rows under a key, so a file that
+# is not this consumer's input is already caught by that key being absent.
+# `health-baseline.json` and `coverage-diff.json` *are* the object: there is
+# no wrapper to miss, so before this, every shape counted as "ran" -- and a
+# plausible file whose verdict sits one level down
+# (`{"health": {"verdict": "RED"}, "commit": "abc"}`) rendered the bold "No
+# new findings on this change." and a full coverage table over a RED suite.
+#
+# This is not an invented schema. It is exactly the keys this renderer reads
+# and acts on, which is the same rule the other two files already follow:
+#
+#   * `verdict` is the only key under `health` that changes the output. It
+#     gates the health line, the RED headline and the withholding of the
+#     coverage table; the counts beside it are read only once it is there.
+#     `session_context.py` already treats a baseline with no top-level
+#     `verdict` as "records no verdict ... not the same as a healthy suite",
+#     so this is the existing cross-script contract, not a new one.
+#   * the five coverage fields are the entire coverage section, and they are
+#     the five in the example `skills/diagnose/SKILL.md` gives its writer.
+#
+# Presence, never truthiness -- the same false-positive line the rest of this
+# classifier holds. `{"line_pct": null}` is a measurement that was not taken:
+# it renders "not measured" and counts as having run. Only a file with none
+# of these keys is one this comment cannot read anything out of.
+INPUT_REQUIRED_KEYS = {
+    "health": ("verdict",),
+    "coverage": ("line_pct", "base_line_pct", "branch_pct",
+                 "base_branch_pct", "uncovered_changed_lines"),
+}
+
+# What to call that absence, per input, in the one sentence the reader acts
+# on. Named rather than generic: "it records no verdict" tells the writer
+# which field to add, and "it is not the shape this comment reads" does not.
+MISSING_KEYS_PHRASE = {
+    "health": 'records no "verdict"',
+    "coverage": "records no coverage figure (line_pct, branch_pct, …)",
+}
 
 
 def input_outcome(data: dict, key: str) -> str:
@@ -667,11 +719,24 @@ def input_outcome(data: dict, key: str) -> str:
     stays silent. Only a key that is absent, or explicitly `null`, was never
     supplied. A notice that fired on every clean run would be worse than the
     bug it was added for.
+
+    The one exception is `INPUT_REQUIRED_KEYS`, and it is the same rule rather
+    than a second one: for the two inputs that *are* the object, "the key this
+    comment reads is there" is spelled out field by field, because there is no
+    wrapper key for its absence to show up in. A value of the wrong type keeps
+    its existing malformed notice instead -- `{"health": "GREEN"}` has
+    supplied something, and reporting one fault through two channels is how a
+    reader learns to ignore both.
     """
     if key not in data:
         return INPUT_ABSENT
-    if data[key] is None:
+    value = data[key]
+    if value is None:
         return INPUT_NULL
+    required = INPUT_REQUIRED_KEYS.get(key)
+    if required and isinstance(value, dict) \
+            and not any(k in value for k in required):
+        return INPUT_NO_KEYS
     return INPUT_RAN
 
 
@@ -694,7 +759,14 @@ def account_for_inputs(data: dict, describe) -> tuple:
     return read, missing
 
 DATA_ERRORS = {
-    DATA_UNREADABLE: "error: could not read {path}",
+    DATA_ABSENT: ("error: no such file: {path} — there is nothing to read, "
+                  "and a comment rendered from nothing is not an all-clear."),
+    DATA_UNREADABLE: ("error: could not read {path} — the file is there, but "
+                      "its bytes could not be read as text (permissions, a "
+                      "directory, a non-UTF-8 encoding, or an I/O error)."),
+    DATA_MALFORMED: ("error: read {path}, but it is not valid JSON — nothing "
+                     "could be parsed out of it. Check it with "
+                     "`python3 -m json.tool`."),
     DATA_EMPTY: ("error: read {path}, but it is empty — there is nothing to "
                  "report, and an empty comment is not an all-clear."),
     DATA_NOT_AN_OBJECT: ("error: read {path}, but it is not a JSON object — "
@@ -705,21 +777,46 @@ DATA_ERRORS = {
                    "{found}."),
 }
 
+# The same facts, worded for one file among four under `--testing-dir`, where
+# the sentence is a bullet in the comment rather than the whole refusal.
+# `DATA_ABSENT` is not here: an absent file is named with the command that
+# writes it ("run X"), not with a complaint about the file.
+FILE_PROBLEM_PHRASE = {
+    DATA_UNREADABLE: "unreadable",
+    DATA_MALFORMED: "not valid JSON",
+    DATA_NOT_AN_OBJECT: "not a JSON object",
+}
+
 
 def read_json_object(path: str):
     """`(object, problem)` — the parsed top-level object, or which failure.
 
     `problem` is None when the file parsed to an object (including an empty
     one, which is a question for the caller, not for the parser), and
-    otherwise `DATA_UNREADABLE` or `DATA_NOT_AN_OBJECT`. Keeping those two
-    apart is what lets `main()` say which happened instead of blaming the
-    reader for a file it read perfectly well.
+    otherwise one of `DATA_ABSENT`, `DATA_UNREADABLE`, `DATA_MALFORMED` or
+    `DATA_NOT_AN_OBJECT`. Keeping those four apart is what lets the callers
+    say which happened instead of blaming the reader for a file it read
+    perfectly well, or blaming the writer for a file that was never there.
+
+    `ENOENT` rather than an `os.path.exists()` pre-check: the open has
+    already happened, so there is no window between the question and the
+    answer, and a file deleted mid-run reports absence rather than a race.
+    `UnicodeDecodeError` is a `ValueError`, so it is caught ahead of the JSON
+    errors — a UTF-16 file is bytes this reader cannot read, not JSON that
+    failed to parse.
     """
     try:
         with open(path, encoding="utf-8") as fh:
             blob = json.load(fh)
-    except (OSError, json.JSONDecodeError, ValueError, RecursionError):
+    except FileNotFoundError:
+        return None, DATA_ABSENT
+    except UnicodeDecodeError:
         return None, DATA_UNREADABLE
+    except OSError as exc:
+        return None, (DATA_ABSENT if exc.errno == errno.ENOENT
+                      else DATA_UNREADABLE)
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        return None, DATA_MALFORMED
     if not isinstance(blob, dict):
         return None, DATA_NOT_AN_OBJECT
     return blob, None
@@ -758,11 +855,13 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if args.data:
-        # Three distinguishable refusals, all exit 2. The exit code is the
-        # same because the answer is the same -- refusing beats rendering a
+        # Six distinguishable refusals, all exit 2. The exit code is the same
+        # because the answer is the same -- refusing beats rendering a
         # reassuring comment over a file that holds nothing -- but the
         # sentence is not, because "I could not read it" said about a file
-        # that read perfectly well sends the reader to the wrong problem.
+        # that read perfectly well sends the reader to the wrong problem, and
+        # said about a file that is not there sends them to a corruption that
+        # does not exist either.
         data, problem = read_json_object(args.data)
         if problem is None and not data:
             problem = DATA_EMPTY
@@ -789,6 +888,12 @@ def main(argv: list[str] | None = None) -> int:
         name = os.path.basename(args.data) or args.data
 
         def describe(key, outcome):
+            if outcome == INPUT_NO_KEYS:
+                # Supplied, and still not readable by this comment. Naming
+                # the field is the difference between a notice the assembler
+                # can act on and one it can only be annoyed by.
+                return (f'"{key}" {MISSING_KEYS_PHRASE[key]} in {name} — '
+                        f"supply it, or rerun {INPUT_SOURCES[key][1]}")
             why = "is null" if outcome == INPUT_NULL else "is absent"
             return (f'"{key}" {why} in {name} — supply it, or rerun '
                     f"{INPUT_SOURCES[key][1]}")
@@ -809,20 +914,23 @@ def main(argv: list[str] | None = None) -> int:
         # diagnosable: "no findings" and "nobody looked" render identically,
         # and the second one shipped as the first is the worst output this
         # tool could produce -- a reassuring comment that means nothing.
-        data, file_problem, absent = {}, {}, []
+        data, file_problem = {}, {}
         for key in RENDERED_INPUTS:
             filename, producer = INPUT_SOURCES[key]
             path = os.path.join(args.testing_dir, filename)
-            if not os.path.exists(path):
-                absent.append(filename)
+            blob, problem = read_json_object(path)
+            if problem == DATA_ABSENT:
                 file_problem[key] = f"{filename} (run {producer})"
                 continue
-            blob = read_object(path)
-            if blob is None:
-                # Present but unreadable is not "ran and found nothing". It
-                # has to be declared exactly as loudly as an absent file, or
-                # four broken files render as a clean bill of health.
-                file_problem[key] = f"{filename} (unreadable — rerun {producer})"
+            if problem is not None:
+                # Present but unusable is not "ran and found nothing". It has
+                # to be declared exactly as loudly as an absent file, or four
+                # broken files render as a clean bill of health -- and which
+                # way it is broken decides what the reader does next, so the
+                # same five states the `--data` refusal distinguishes are
+                # distinguished here too.
+                file_problem[key] = (f"{filename} ({FILE_PROBLEM_PHRASE[problem]}"
+                                     f" — rerun {producer})")
                 continue
             # gates.json and findings.json wrap their rows under their own
             # key; health-baseline.json and coverage-diff.json *are* the
@@ -845,6 +953,11 @@ def main(argv: list[str] | None = None) -> int:
             if key in file_problem:
                 return file_problem[key]
             filename, producer = INPUT_SOURCES[key]
+            if outcome == INPUT_NO_KEYS:
+                # The file with no wrapper key, so there is no `"x" key is
+                # absent` to say. Name the field the renderer reads instead.
+                return (f"{filename} (readable, but it "
+                        f"{MISSING_KEYS_PHRASE[key]} — rerun {producer})")
             why = "is null" if outcome == INPUT_NULL else "is absent"
             return (f'{filename} (readable, but its "{key}" key {why} '
                     f"— rerun {producer})")
@@ -853,11 +966,21 @@ def main(argv: list[str] | None = None) -> int:
         # "everything ran and found nothing", and only this scan knows.
         read, missing = account_for_inputs(data, describe)
 
-        # Unchanged, and deliberately still keyed on *file absence* alone: an
-        # empty .testing/ is nothing to report, while four files that exist
-        # and disappoint still render a comment saying so.
-        if len(absent) == len(RENDERED_INPUTS):
-            print("error: no testsquad data in "
+        # Keyed on what was *measured*, not on what happened to be on disk.
+        # It used to be `every file is absent`, which made four corrupt
+        # files exit 0 while four missing ones exited 2 -- the same "Nothing
+        # was measured on this change." body either way, and the worse
+        # polarity of the two: `skills/report/SKILL.md` drives this from a
+        # shell step, so a CI job branching on the exit code read four
+        # unreadable inputs as success.
+        #
+        # `read == 0` is the same count the headline already uses to decide
+        # that nothing was measured, so the exit code and the sentence can no
+        # longer disagree. It is not a wider refusal than it looks: one
+        # usable input out of four is a partial run, which still renders and
+        # still exits 0, exactly as before.
+        if read == 0:
+            print("error: no usable testsquad data in "
                   f"{args.testing_dir}. Nothing to report.\n  missing: "
                   + "\n           ".join(missing), file=sys.stderr)
             return 2

@@ -24,6 +24,7 @@ committed. Platform-dependent cases skip rather than fail.
 
 import ast
 import contextlib
+import io
 import json
 import os
 import re
@@ -32,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from unittest import mock
@@ -44,6 +46,7 @@ import env_safety_check as esc  # noqa: E402
 import flake_smells as fsm  # noqa: E402
 import normalize_coverage as ncov  # noqa: E402
 import pr_comment as prc  # noqa: E402
+import project_state as pstate  # noqa: E402
 import risk_map as rmap  # noqa: E402
 import session_context as sctx  # noqa: E402
 import validate_plugin as vplug  # noqa: E402
@@ -182,8 +185,9 @@ def ast_depth_raises_here(kb=AST_RECURSION_DEPTH_KB, depth=20_000):
 def scan_on_a_thin_stack(script, call, kb=AST_RECURSION_DEPTH_KB):
     """Run `call` in a child process on a thread with a small C stack.
 
-    `script` is "arid_nodes" or "flake_smells"; `call` is the expression to
-    evaluate against it. Returns (returncode, parsed_json_or_None, stderr).
+    `script` is a module name under scripts/ ("arid_nodes", "flake_smells",
+    "project_state"); `call` is the expression to evaluate against it, bound to
+    `mod`. Returns (returncode, parsed_json_or_None, stderr).
     A child that dies instead of returning is the whole point of using one.
     """
     body = textwrap.dedent("""
@@ -1308,8 +1312,174 @@ class ConcurrencyTests(TempMixin, unittest.TestCase):
                    "normalize_coverage.py", "pr_comment.py",
                    "project_state.py", "risk_map.py"]
 
+    # Enough rounds that a truncation window of a millisecond or two is
+    # sampled, few enough that seven writers stay well under two seconds.
+    ATOMIC_ROUNDS = 5
+
+    def _probe_inputs(self):
+        """The smallest input that makes each writer produce a report.
+
+        Built once per test: a source tree with one test file and one .env, a
+        large LCOV report, a --data blob and a one-commit git repository.
+        """
+        src = self.path("probe/src")
+        os.makedirs(src, exist_ok=True)
+        self.write("probe/src/test_probe.py",
+                   "import unittest\n\n\nclass T(unittest.TestCase):\n"
+                   "    def test_a(self):\n        self.assertEqual(1, 1)\n")
+        self.write("probe/src/.env", "API_KEY=abc123\nHOST=api.acme.com\n")
+        # Deliberately large: the wider the document, the wider the window a
+        # truncate-then-write leaves open, and the more of this test's value
+        # survives on a machine faster than the one it was written on.
+        big_lcov = self.write("probe/big.info", "".join(
+            "SF:src/f%d.py\n%send_of_record\n"
+            % (i, "".join("DA:%d,%d\n" % (n, n % 2) for n in range(1, 60)))
+            for i in range(300)))
+        data = self.write("probe/data.json", json.dumps(
+            {"health": {"verdict": "GREEN"}, "coverage": {"totals": {}}}))
+        repo = init_repo(self.path("probe/repo"))
+        self.write("probe/repo/a.py", "def f():\n    return 1\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "seed")
+        os.makedirs(self.path("probe/out"), exist_ok=True)
+        return src, big_lcov, data, repo
+
+    def _out_writer_probes(self):
+        """(script name, run) for every one of the seven `--out` writers.
+
+        In-process rather than by subprocess: `main(argv)` reaches the same
+        writer either way, and seven writers times six interpreter startups
+        would buy nothing but seconds. `project_state`'s ROOT is pointed at
+        the fixture for the reason its own tests do it -- measuring the live
+        repository here would make this test depend on the branch, the dirty
+        list and on whatever another process is writing right now.
+        """
+        self.assertIsNotNone(
+            arid, "arid_nodes.py is missing from scripts/, so one of the "
+                  "seven --out writers cannot be exercised at all")
+        src, big_lcov, data, repo = self._probe_inputs()
+
+        def project_state(out):
+            with mock.patch.object(pstate, "ROOT", src):
+                return pstate.main(["--no-tests", "--out", out])
+
+        return [
+            ("arid_nodes.py", lambda out: arid.main([src, "--out", out])),
+            ("env_safety_check.py", lambda out: esc.main([src, "--out", out])),
+            ("flake_smells.py", lambda out: fsm.main([src, "--out", out])),
+            ("normalize_coverage.py",
+             lambda out: ncov.main([big_lcov, "--out", out])),
+            ("pr_comment.py",
+             lambda out: prc.main(["--data", data, "--out", out])),
+            ("project_state.py", project_state),
+            ("risk_map.py", lambda out: rmap.main([repo, "--out", out])),
+        ]
+
+    def _write_one_report(self, name, run, out):
+        """Run the writer once, quietly, and return the size it left behind.
+
+        The size is the test's floor: a writer that produced nothing would
+        otherwise make every comparison below trivially true.
+        """
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            run(out)
+        self.assertTrue(os.path.exists(out),
+                        f"{name} --out wrote no file at all, so this test "
+                        "would have measured nothing")
+        size = os.path.getsize(out)
+        self.assertGreater(size, 0, f"{name} --out wrote an empty report")
+        return size
+
+    def assert_never_observed_truncated(self, name, run):
+        """Rewrite the destination while a reader samples it, and assert the
+        reader never caught it short.
+
+        The oracle is a size, not a parse, because two of the seven write text
+        rather than JSON: `write_text_atomic` renames a finished temp file
+        onto the destination, so the smallest size a reader can ever observe
+        is the size of a whole report. `open(path, "w")` holds it at zero
+        bytes and then at a prefix -- however the truncation is reached, and
+        whatever else is called afterwards.
+        """
+        out = self.path("probe/out/%s" % name)
+        floor = self._write_one_report(name, run, out)
+        seen = {"min": None, "missing": 0, "reads": 0}
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    with open(out, "rb") as fh:
+                        size = len(fh.read())
+                except FileNotFoundError:
+                    seen["missing"] += 1
+                    continue
+                seen["reads"] += 1
+                if seen["min"] is None or size < seen["min"]:
+                    seen["min"] = size
+
+        watcher = threading.Thread(target=reader)
+        watcher.start()
+        try:
+            for _ in range(self.ATOMIC_ROUNDS):
+                floor = min(floor, self._write_one_report(name, run, out))
+        finally:
+            stop.set()
+            watcher.join()
+
+        # Guard the guard: a reader that never ran would observe nothing and
+        # report it as nothing wrong.
+        self.assertGreater(
+            seen["reads"], self.ATOMIC_ROUNDS,
+            f"the reader sampled {name}'s destination {seen['reads']} times, "
+            "which is too few for this test to have measured anything")
+        self.assertEqual(
+            seen["missing"], 0,
+            f"{name}'s --out destination disappeared {seen['missing']} "
+            "time(s) mid-write; os.replace() never unlinks it, so something "
+            "else is writing that path")
+        self.assertGreaterEqual(
+            seen["min"], floor,
+            f"a reader saw {name}'s --out destination holding "
+            f"{seen['min']} bytes while the smallest complete report it "
+            f"writes is {floor}: the destination is truncated before the new "
+            "report is written, so a parallel agent reading it gets half a "
+            "document, or none of one, and nothing reports an error")
+
+    def test_every_out_writer_never_shows_a_reader_a_truncated_file(self):
+        """The behavioural half, and the one that can actually fail.
+
+        `skills/start/SKILL.md` promises parallel agents "cannot clobber each
+        other or leave a half-written baseline". That is a claim about what a
+        concurrent reader observes, so it is asserted by concurrently reading:
+        each writer rewrites its destination while a reader samples it, and
+        the smallest size ever observed must still be a whole report.
+
+        Its predecessor, kept below as a lint, was two regexes over source
+        text. A truncation reached through a local variable --
+        `_dest = args.out; open(_dest, "w")` -- satisfies both of them, so the
+        whole suite stayed green over a writer that really did clobber its
+        destination for 50ms on every run. A grep is a lint; only a reader can
+        testify about what a reader sees.
+        """
+        probes = self._out_writer_probes()
+        self.assertEqual(
+            [name for name, _ in probes], self.OUT_WRITERS,
+            "every --out writer must be exercised here, not just listed")
+        for name, run in probes:
+            with self.subTest(writer=name):
+                self.assert_never_observed_truncated(name, run)
+
     def test_every_out_writer_is_atomic(self):
-        """FIXED: all seven `--out` writers go through atomic_io.
+        """The lint half: all seven `--out` writers go through atomic_io.
+
+        This is a source scan, and a source scan cannot see a truncation that
+        goes through a variable, a helper or a second file -- it was measured
+        surviving exactly that. It is kept because it names the offending
+        script and fails on the naive conversion the moment it lands, before
+        anyone has to reason about a race. The test above it is the one that
+        can testify about behaviour.
 
         A plain `open(path, "w")` truncates first and writes after, so two
         agents told to write the same .testing/ file -- which is what the
@@ -1453,26 +1623,34 @@ class ResourceBoundTests(unittest.TestCase):
                               f"{name} has no summary counter for files "
                               "whose AST could not be built")
 
-    @unittest.expectedFailure
     def test_every_ast_parse_site_guards_against_recursion(self):
-        """OPEN DEFECT, reported rather than fixed -- it is outside this
-        branch's ownership (scripts/arid_nodes.py, scripts/flake_smells.py).
+        """FIXED. Was @unittest.expectedFailure while one site was open.
 
-        `scripts/project_state.py:_xfail_tests()` has the identical bug the
-        two scanners just had: it wraps `ast.parse` in
-        `except (SyntaxError, ValueError)` and its docstring promises it
+        `scripts/project_state.py:_xfail_tests()` had the identical bug the
+        two scanners had: it wrapped `ast.parse` in
+        `except (SyntaxError, ValueError)` while its docstring promised it
         "Returns None when the file does not parse, so the caller can fall
-        back". RecursionError is not caught, so a deeply nested expression in
-        any scanned .py propagates out of section_markers() and takes down the
+        back". RecursionError was not caught, so a deeply nested expression in
+        any scanned .py propagated out of section_markers() and took down the
         whole state report -- the script whose entire purpose is to measure
-        the project when nothing else can be trusted.
+        the project when nothing else can be trusted. Reproduced before the
+        fix both by forcing ast.parse to raise and by parsing a genuinely
+        20,000-deep expression on a 512KB thread stack in a child process.
 
-        Marked expectedFailure, per this file's convention, so it shows up in
-        the run summary rather than hiding in a passing assertion. When
-        project_state.py is fixed this turns into an unexpected success and
-        the marker can go.
+        The decorator was removed in the same change as the fix: a defect that
+        is fixed while its test still says expectedFailure reports as an
+        unexpected success, which reads like a failure in the run summary.
+
+        This is the whole-directory sweep. It is deliberately derived from the
+        tree rather than hard-coded, so the NEXT script to call ast.parse is
+        covered by it on the day it lands.
         """
-        for name in self._ast_parse_scripts():
+        sites = self._ast_parse_scripts()
+        # Guard the guard: a glob that matched nothing would pass every
+        # assertion below without executing one of them.
+        self.assertIn("project_state.py", sites)
+        self.assertGreaterEqual(len(sites), 3, sites)
+        for name in sites:
             with self.subTest(script=name):
                 self.assertIn("except RecursionError", self.source(name),
                               f"{name} calls ast.parse without catching "
@@ -1528,6 +1706,193 @@ class ResourceBoundTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# project_state.py and the ast.parse depth ceiling
+# --------------------------------------------------------------------------
+
+class ProjectStateAstTests(TempMixin, unittest.TestCase):
+    """The state report is what a fresh session reads when nothing else can
+    be trusted, so it has two jobs here and both are asserted below: survive
+    a file whose AST cannot be built, and never print a count taken from one
+    as though it had been measured.
+
+    Every measurement below is taken over this test's own throwaway tree.
+    `collect()` against the live repository would be ambient state, not
+    behaviour: it walks and reads every file in the checkout -- including the
+    ones another process may be half-way through writing -- shells out to git
+    for the branch and the dirty list, and runs the repository's own
+    `scripts/validate_plugin.py` as a subprocess. A test built on that passes
+    on CI's clean checkout and fails on a developer's dirty one, which is the
+    worst polarity: it teaches the developer to ignore the result.
+    """
+
+    # The ROOT the module computed at import time -- the real repository.
+    # Captured once, so the assertions below can say what was NOT measured.
+    LIVE_ROOT = pstate.ROOT
+
+    def collect_fixture(self, forced_recursion=False):
+        """`collect()` over this test's tree, with ROOT patched for the whole
+        call rather than for one section of it. Tests never run the project's
+        own suite, so skip_tests is not optional here."""
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(pstate, "ROOT", self.tmp))
+            if forced_recursion:
+                stack.enter_context(forced_ast_recursion_error())
+            return pstate.collect(skip_tests=True)
+
+    def assert_measured_the_fixture(self, state, rendered):
+        """Guard the decoupling itself.
+
+        Without this, moving any part of the measurement back outside the ROOT
+        patch would not fail here -- it would fail somewhere else, on one run
+        in five, only when the tree happened to be dirty. These three
+        assertions turn that into an immediate, named failure.
+        """
+        self.assertEqual(state["root"], self.tmp,
+                         "the report was taken over the wrong tree")
+        self.assertNotIn(self.LIVE_ROOT, rendered,
+                         "the rendered report names the real repository, so "
+                         "this test measured the live working tree instead of "
+                         "its own fixture")
+        self.assertFalse(state["validator"]["ran"],
+                         "collect() executed the repository's own "
+                         "validate_plugin.py as a subprocess; the fixture has "
+                         "no scripts/ and that section must report NOT RUN")
+        self.assertIn("validate_plugin.py", state["validator"]["reason"])
+
+    def test_project_state_reports_the_file_it_could_not_parse(self):
+        """Catching it is half. Silence must never look like success.
+
+        A bare `except RecursionError: return None` would make the state
+        report survive and print a `@unittest.expectedFailure` total that LOOKS
+        like every other measured number on the page, while being a text match
+        over a file the parser refused. This is the script a fresh session runs
+        when nothing else can be trusted, so that number has to be labelled at
+        the point it is printed.
+        """
+        # Deliberately a file with a REAL decorator in it: the line scanner
+        # does find it, so the count is not zero and not wrong -- it is
+        # unverified, which is a different thing and has to read differently.
+        self.write("test_deep.py",
+                   "import unittest\n\n\n@unittest.expectedFailure\n"
+                   "def test_x():\n    y = " + "a + " * 400 + "1\n"
+                   "    assert y\n")
+        state = self.collect_fixture(forced_recursion=True)
+        markers = state["markers"]
+
+        self.assertEqual([d["file"] for d in markers["ast_unparsed_files"]],
+                         ["test_deep.py"],
+                         "a file whose AST could not be built must be NAMED, "
+                         "not quietly handed to the line scanner")
+        self.assertEqual(markers["files_ast_unparsed"], 1)
+        self.assertFalse(markers["totals_exact"],
+                         "a total that includes a line-scan estimate must not "
+                         "claim to be exact")
+        entry = markers["ast_unparsed_files"][0]
+        self.assertEqual(entry["stage"], "ast")
+        self.assertEqual(entry["fell_back_to"], "line-scan")
+        self.assertIn("RecursionError", entry["reason"])
+        self.assertIn("nesting", entry["reason"])
+        self.assertIn("did NOT run", entry["reason"])
+        self.assertIn("sys.setrecursionlimit", entry["reason"],
+                      "the reason must name the limit that does NOT control "
+                      "this, or a reader will try to raise it")
+        self.assertTrue(entry["not_measured"],
+                        "the record has to say what was lost, not only that "
+                        "something was")
+        # The fallback really ran: the decorator was counted, the file was not
+        # dropped, and the hit says how it was found and why it has no name.
+        self.assertEqual(entry["line_scan_hits"], 1)
+        self.assertEqual(markers["totals"][pstate.MARKER_XFAIL], 1)
+        hit = markers["expected_failures"][0]
+        self.assertEqual(hit["file"], "test_deep.py")
+        self.assertIsNone(hit["test"])
+        self.assertEqual(hit["counted_by"], "line-scan")
+        self.assertEqual(hit["why_unnamed"], pstate.AST_TOO_DEEP)
+
+        # And in the rendered report, where a human decides the run went fine.
+        rendered = pstate.render(state)
+        self.assert_measured_the_fixture(state, rendered)
+        self.assertIn("NOT EXACT", rendered)
+        self.assertIn("COULD NOT PARSE, counted WITHOUT the AST pass: "
+                      "test_deep.py", rendered)
+        self.assertIn("did NOT run", rendered)
+
+    def test_project_state_still_reports_exactly_when_everything_parses(self):
+        """The other half of the pair, and the reason the first one means
+        anything: the same tree, parsed, must come back exact and silent.
+
+        Without this, `totals_exact: False` and a COULD NOT PARSE block could
+        be printed unconditionally and every assertion above would still pass.
+        """
+        self.write("test_deep.py",
+                   "import unittest\n\n\n@unittest.expectedFailure\n"
+                   "def test_x():\n    y = 1\n    assert y\n")
+        state = self.collect_fixture()
+        markers = state["markers"]
+        self.assertEqual(markers["ast_unparsed_files"], [])
+        self.assertEqual(markers["files_ast_unparsed"], 0)
+        self.assertTrue(markers["totals_exact"])
+        self.assertEqual(markers["totals"][pstate.MARKER_XFAIL], 1)
+        # Parsed means NAMED: that is what the AST pass buys over a text match.
+        self.assertEqual(markers["expected_failures"],
+                         [{"file": "test_deep.py", "line": 4, "test": "test_x"}])
+        rendered = pstate.render(state)
+        self.assert_measured_the_fixture(state, rendered)
+        self.assertNotIn("NOT EXACT", rendered)
+        self.assertNotIn("COULD NOT PARSE", rendered)
+
+    def test_project_state_does_not_announce_a_half_written_file(self):
+        """A SyntaxError stays a silent fallback, on purpose.
+
+        Half-written files are an ordinary state in a working tree, a line
+        scan is the right answer for one, and announcing it on every run would
+        put noise in the one report that has to stay readable. The hit still
+        carries `why_unnamed` so a JSON consumer can tell the two apart; what
+        it must not do is set off the NOT EXACT alarm.
+        """
+        self.write("test_broken.py",
+                   "@unittest.expectedFailure\ndef test_x(:\n    pass\n")
+        with mock.patch.object(pstate, "ROOT", self.tmp):
+            markers = pstate.section_markers()
+        self.assertEqual(markers["ast_unparsed_files"], [])
+        self.assertTrue(markers["totals_exact"])
+        self.assertEqual(markers["totals"][pstate.MARKER_XFAIL], 1)
+        self.assertEqual(markers["expected_failures"][0]["why_unnamed"],
+                         "syntax-error")
+
+    def test_project_state_really_does_survive_a_too_deep_file(self):
+        """The forced test proves the reporting; this proves the catch.
+
+        A real RecursionError out of a real ast.parse, in a child process on a
+        small stack, because on an interpreter without the AST-construction
+        counter the alternative to catching it is the process dying -- and
+        finding THAT out in-process would end the run.
+        """
+        if not ast_depth_raises_here():
+            self.skipTest(
+                "this interpreter does not raise RecursionError from "
+                "ast.parse at a 512KB stack -- it crashes instead, so there "
+                "is no catchable behaviour here to assert. Measured on "
+                "CPython 3.9.6: SIGBUS, exit 138. The forced-RecursionError "
+                "test covers the reporting path on this platform.")
+        self.write("test_deep.py",
+                   "import unittest\n\n\n@unittest.expectedFailure\n"
+                   "def test_x():\n    y = " + "a + " * 20_000 + "1\n")
+        rc, out, err = scan_on_a_thin_stack(
+            "project_state",
+            "(setattr(mod, 'ROOT', %r), mod.section_markers())[1]" % self.tmp)
+        self.assertEqual(rc, 0, f"child died instead of returning: {err}")
+        self.assertIsNotNone(out, f"child produced no JSON: {err}")
+        self.assertNotIn("raised", out,
+                         "section_markers() must never raise -- _xfail_tests' "
+                         f"docstring promises it: {out.get('raised')}")
+        self.assertEqual(
+            [d["file"] for d in out["result"]["ast_unparsed_files"]],
+            ["test_deep.py"])
+        self.assertFalse(out["result"]["totals_exact"])
+
+
+# --------------------------------------------------------------------------
 # ReDoS
 # --------------------------------------------------------------------------
 
@@ -1561,13 +1926,35 @@ class ReDoSTests(TempMixin, unittest.TestCase):
                       "the value is longer than MAX_HOST_SCAN_CHARS, so the "
                       "scanner must say it only looked at the head")
 
-    def _email_sub_cost(self, n):
-        # real_hosts_in() is the hot path; drive it through the public scanner
-        # so the measurement is of a real scan, not of one regex.
-        line = "A=" + "a" * n + "\n"
-        start = time.monotonic()
-        esc.scan_text(line, rel=".env", kind="env")
-        return time.monotonic() - start
+    def _dotted_scan_cost(self, pairs, reps):
+        r"""Seconds to scan `reps` values of `pairs` dotted labels.
+
+        Dotted, not a flat run of letters. The flat `"a" * n` this probe used
+        to feed never reaches the host path at all: `scan_value` only calls
+        `real_hosts_in` -- and through it `EMAIL_RE.sub` and `BARE_HOST_RE` --
+        for a value that looks like it could hold a host. So the old probe
+        timed the part of `scan_text` that was never the defect, and stayed
+        green with the lookbehind, the label bound and MAX_HOST_SCAN_CHARS all
+        removed at once. `"a." * pairs + "_"` is the worst case those three
+        guards exist for: a dotted run that can never end in a usable TLD, so
+        every retry walks what is left of it.
+
+        `reps` is what makes the measurement resolvable on a fast machine.
+        Repeating the same scan costs a multiple of the same shape, so the
+        ratio below is unchanged by it -- unlike skipping, which just stops
+        asking the question.
+        """
+        line = "A=" + "a." * pairs + "_\n"
+        start = time.perf_counter()
+        for _ in range(reps):
+            esc.scan_text(line, rel=".env", kind="env")
+        return time.perf_counter() - start
+
+    # 8,001 and 16,001 characters: both past MAX_HOST_SCAN_CHARS (4096), which
+    # is the point -- with the ceiling in place the extra length costs almost
+    # nothing, and without it the quadratic reappears.
+    LINEARITY_PAIRS = 4_000
+    LINEARITY_FLOOR = 0.02   # seconds a measurement must reach to be readable
 
     def test_env_safety_check_cost_is_linear_in_value_length(self):
         r"""FIXED: EMAIL_RE.sub() was quadratic in the length of a config value.
@@ -1577,28 +1964,48 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         no '@' the engine restarts at every offset and scans to the end each
         time, so cost grows with the square of the value's length.
 
-        Measured here: 8k chars ~0.3s, 16k ~1.2s, 40k ~1.9s, 60k ~4.2s -- each
-        doubling costs four times as much. env_safety_check.py's own ceiling is
-        MAX_BYTES = 2MB, so a single 2MB line in a .env -- a minified blob, a
-        base64 payload, a generated fixture -- is fully within what the script
-        will accept and would take on the order of twenty minutes.
+        Measured when it was broken: 8k chars ~0.3s, 16k ~1.2s, 40k ~1.9s, 60k
+        ~4.2s -- each doubling costing four times as much. env_safety_check.py's
+        own ceiling is MAX_BYTES = 2MB, so a single 2MB line in a .env -- a
+        minified blob, a base64 payload, a generated fixture -- is fully within
+        what the script will accept and would take on the order of twenty
+        minutes.
 
         This is the gate that runs BEFORE the test command. Hanging it does not
         fail safe; it stops the run with no verdict at all.
-        SHOULD: anchor or bound EMAIL_RE (a `(?<![A-Za-z0-9._%+-])` lookbehind,
-        or a length cap on the local part), or skip values over a few kB.
 
         Asserted as a growth ratio rather than an absolute time so the test
         says something about the algorithm and not about this machine.
+        Measured fixed, on the machine of record (2026-11-16, CPython 3.14,
+        best of three): 8,001 chars 32.8ms, 16,001 chars 43.4ms, ratio 1.23 --
+        sublinear, because the host scan stops at MAX_HOST_SCAN_CHARS. The
+        3.0 ceiling sits well above that and well below the ~3.9 a scanner
+        with those guards removed measures on the same two payloads.
+
+        There is deliberately no skip here. The version that skipped when the
+        small measurement came in under 20ms was the only skip in the whole
+        suite, which is to say it never ran on this machine at all.
         """
-        small = max(self._email_sub_cost(8_000) for _ in range(3))
-        large = max(self._email_sub_cost(16_000) for _ in range(3))
-        if small < 0.02:
-            self.skipTest("machine too fast to measure the ratio reliably")
-        # Linear would be ~2x for a doubled input. Observed: ~4x.
+        reps = 1
+        for _ in range(14):
+            small = min(self._dotted_scan_cost(self.LINEARITY_PAIRS, reps)
+                        for _ in range(3))
+            if small >= self.LINEARITY_FLOOR:
+                break
+            reps *= 2
+        else:
+            self.fail(
+                "could not scale this probe to a measurable cost: "
+                f"{reps} repeats of a {2 * self.LINEARITY_PAIRS + 1}-character "
+                f"value still ran in under {self.LINEARITY_FLOOR}s. The "
+                "measurement is the test, so this is a failure, not a skip.")
+        large = min(self._dotted_scan_cost(2 * self.LINEARITY_PAIRS, reps)
+                    for _ in range(3))
+        # Linear would be ~2x for a doubled input. Broken, it is ~4x.
         self.assertLess(large / small, 3.0,
                         f"doubling the value length cost {large / small:.1f}x "
-                        f"({small:.3f}s -> {large:.3f}s): superlinear")
+                        f"({small:.3f}s -> {large:.3f}s over {reps} repeat(s)): "
+                        "superlinear")
 
     def test_env_safety_check_on_hyphen_and_url_runs_stays_bounded(self):
         # The shapes that are NOT quadratic, pinned so the fix for the one

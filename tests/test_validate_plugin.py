@@ -354,6 +354,59 @@ class SilentHoleTests(PluginTreeMixin, unittest.TestCase):
                         f"a skill directory with no SKILL.md passed: "
                         f"{report.errors!r}")
 
+    def test_a_file_where_a_skill_directory_should_be_is_reported(self):
+        """The same glob misses this too, and `not os.path.isdir(sub)` used to
+        skip it before the SKILL.md rule could run. A skill replaced by a file
+        vanished from the run: 26 components checked became 25, in silence."""
+        shutil.rmtree(self.path("skills/one"))
+        self.write("skills/one", "I was a skill directory once")
+        report = vp.validate(self.tmp)
+        hits = [e for e in report.errors if "skills/one" in e]
+        self.assertTrue(hits, f"a file in place of a skill passed: "
+                              f"{report.errors!r}")
+        self.assertIn("is a file, not a directory", hits[0])
+        self.assertSurvivors(report, "two/SKILL.md", "alpha.md")
+
+    def test_a_dangling_symlink_where_a_skill_should_be_is_reported(self):
+        shutil.rmtree(self.path("skills/one"))
+        os.symlink(self.path("skills/nowhere"), self.path("skills/one"))
+        report = vp.validate(self.tmp)
+        hits = [e for e in report.errors if "skills/one" in e]
+        self.assertTrue(hits, f"a dangling skill symlink passed: "
+                              f"{report.errors!r}")
+        self.assertIn("resolves to nothing", hits[0])
+
+    def test_a_symlink_loop_where_a_skill_should_be_is_reported(self):
+        loop = self.path("skills/one")
+        shutil.rmtree(loop)
+        os.symlink(loop, loop)
+        report = vp.validate(self.tmp)
+        self.assertTrue([e for e in report.errors if "skills/one" in e],
+                        f"a looping skill symlink passed: {report.errors!r}")
+
+    def test_a_vanished_skill_is_reported_like_its_sibling(self):
+        """One rule, two shapes. A directory with no SKILL.md and a file where
+        the directory should be both mean the same thing to the loader -- the
+        skill does not exist -- so they are both errors and both say why in
+        the same words. The hole was in an existing rule, not a missing one."""
+        os.makedirs(self.path("skills/ghost"))
+        shutil.rmtree(self.path("skills/one"))
+        self.write("skills/one", "not a directory")
+        report = vp.validate(self.tmp)
+        said = [e for e in report.errors
+                if "skills/ghost" in e or "skills/one" in e]
+        self.assertEqual(len(said), 2, report.errors)
+        for message in said:
+            self.assertIn("will not load as a skill and no other check in "
+                          "this run looked at it", message)
+
+    def test_a_dotfile_under_skills_is_not_mistaken_for_a_skill(self):
+        """The false-positive guard. .DS_Store and .gitkeep are real and are
+        not components; the rule skipped dotfiles before and still does."""
+        self.write("skills/.DS_Store", b"\x00\x01")
+        self.write("skills/.gitkeep", "")
+        self.assertBaselineIsClean()
+
     def test_a_utf16_agent_still_gets_a_verdict(self):
         # Decoding succeeds, so this one is judged on its contents rather than
         # reported as unreadable. Pinned because the two must not be confused.
@@ -585,10 +638,13 @@ class BudgetCoverageTests(PluginTreeMixin, unittest.TestCase):
 
 class EncodingGuaranteeTests(PluginTreeMixin, unittest.TestCase):
     """The validator accepts UTF-8 (BOM or not) and BOM-marked UTF-16. Whether
-    the real plugin loader does is unmeasured -- `claude plugin validate` has
-    never run here -- so a non-UTF-8 component gets a WARNING that says the
-    uncertainty out loud. An error would assert knowledge nobody has; silence
-    would assert the opposite. See the note in check_markdown_component()."""
+    the real plugin loader does is still unmeasured. `claude plugin validate
+    --strict` has now been run on this repo and passes, and that settles
+    nothing here: it validates the marketplace manifest, so it has never
+    opened an agent or a skill, let alone judged one's encoding. So a non-UTF-8
+    component gets a WARNING that says the uncertainty out loud. An error would
+    assert knowledge nobody has; silence would assert the opposite. See the
+    note in check_markdown_component()."""
 
     def test_a_utf16_agent_is_warned_about_by_encoding(self):
         self.write("agents/bravo.md", good_agent("bravo").encode("utf-16"))
@@ -683,6 +739,146 @@ class HooksPresenceTests(PluginTreeMixin, unittest.TestCase):
         # absent, which is the legitimate shape for most plugins.
         self.assertFalse(os.path.exists(self.path("hooks")))
         self.assertBaselineIsClean()
+
+
+class HooksShapeTests(PluginTreeMixin, unittest.TestCase):
+    """How deep the hooks check goes, and the line it stops at.
+
+    `{"hooks": 7}` passed: the wrapper key existed, and presence was all that
+    was checked, so a file that cannot possibly load printed the same summary
+    as a working one. One level further is decided by the JSON type alone --
+    an event map is a mapping, and an int, list, string or null is not -- so
+    it is a fact rather than a guess.
+
+    It stops there on purpose. Event NAMES cannot be validated without a list
+    of them, and the nine plugin hooks.json files installed on this machine
+    use nine distinct names between them, including PostToolUseFailure,
+    StopFailure, UserPromptExpansion and PermissionRequest; a hardcoded list
+    would reject a legitimate plugin as soon as a tenth ships. Each event's
+    VALUE cannot be validated without asserting what the loader rejects, and
+    nobody here has run it on a bad one -- `claude plugin validate --strict`
+    passes on this repo but validates the marketplace manifest only. That is
+    full schema validation, and it is how a check earns false positives.
+    """
+
+    def _hooks(self, text: str):
+        self.write("hooks/hooks.json", text)
+        return vp.validate(self.tmp)
+
+    def test_a_hooks_wrapper_that_is_a_number_is_an_error(self):
+        report = self._hooks('{"hooks": 7}')
+        hits = [e for e in report.errors if "hooks.json" in e]
+        self.assertTrue(hits, f"a hooks file that cannot load passed: "
+                              f"{report.errors!r}")
+        self.assertIn("must be an object mapping event names", hits[0])
+
+    def test_a_hooks_wrapper_that_is_a_list_or_null_is_an_error(self):
+        for body in ('{"hooks": []}', '{"hooks": null}', '{"hooks": "all"}'):
+            with self.subTest(body=body):
+                report = self._hooks(body)
+                self.assertTrue([e for e in report.errors if "hooks.json" in e],
+                                f"{body} passed: {report.errors!r}")
+
+    def test_the_bad_wrapper_does_not_cost_any_other_component(self):
+        report = self._hooks('{"hooks": 7}')
+        self.assertSurvivors(report, "alpha.md", "bravo.md", "one/SKILL.md")
+        self.assertEqual([m for m in report.unvalidated if "hooks" in m], [],
+                         "a wrong-shaped wrapper is understood, not unjudgeable")
+
+    def test_an_event_map_is_accepted_without_judging_its_contents(self):
+        """The false-positive guard, and the stated limit. An event name this
+        script has never heard of must pass: real plugins ship names it does
+        not know, and rejecting one would be asserting knowledge of a loader
+        that has never been run here."""
+        self.write("hooks/hooks.json", json.dumps(
+            {"hooks": {"SomeFutureEvent": [{"hooks": [
+                {"type": "command", "command": "echo hi"}]}],
+                "PostToolUseFailure": "not even a list"}}))
+        self.assertBaselineIsClean()
+
+    def test_an_empty_event_map_is_deliberately_left_silent(self):
+        """It loads; it simply does nothing. This validator has no way to tell
+        a placeholder from a mistake, and a warning it cannot justify is the
+        false positive that gets the whole check switched off."""
+        self.write("hooks/hooks.json", '{"hooks": {}}')
+        self.assertBaselineIsClean()
+
+
+# --------------------------------------------------------------------------
+# hole 3: an empty component directory is legitimate; an unlistable one is not
+# --------------------------------------------------------------------------
+
+class ComponentDirectoryTests(PluginTreeMixin, unittest.TestCase):
+    """glob() swallows the error from a directory it cannot list and returns
+    [], so a mode-000 agents/ deleted every agent from the run and the run
+    passed. Measured on this repo: 26 components checked became 19, with no
+    error, no warning and nothing unvalidated -- byte-for-byte what an
+    agents/ emptied of its seven files prints. A plugin that ships no agents
+    is legitimate and must stay silent; a plugin whose agents/ cannot be
+    opened is seven components with no verdict."""
+
+    def test_an_unlistable_agents_directory_is_reported(self):
+        os.chmod(self.path("agents"), 0o000)
+        self.addCleanup(os.chmod, self.path("agents"), 0o700)
+        if os.access(self.path("agents"), os.R_OK):
+            self.skipTest("running as a user that ignores file permissions")
+        report = vp.validate(self.tmp)
+        hits = self.assertUnvalidated(report, "agents")
+        self.assertIn("could not be listed", " ".join(hits))
+        self.assertSurvivors(report, "one/SKILL.md", "two/SKILL.md")
+
+    def test_an_unlistable_agents_directory_fails_the_run(self):
+        os.chmod(self.path("agents"), 0o000)
+        self.addCleanup(os.chmod, self.path("agents"), 0o700)
+        if os.access(self.path("agents"), os.R_OK):
+            self.skipTest("running as a user that ignores file permissions")
+        # Not --strict: an unknown verdict is already a failure.
+        self.assertEqual(vp.main([self.tmp]), 1)
+
+    def test_an_empty_agents_directory_stays_silent(self):
+        """The false-positive guard, and the whole judgement in one test. A
+        plugin may ship no agents at all. If this ever goes red the check has
+        started reporting a legitimate plugin, which costs more than the miss
+        it was closing."""
+        for name in self.AGENTS:
+            os.remove(self.path(f"agents/{name}.md"))
+        report = vp.validate(self.tmp)
+        self.assertEqual(report.errors, [])
+        self.assertEqual(report.warnings, [])
+        self.assertEqual(report.unvalidated, [])
+
+    def test_an_absent_agents_directory_is_still_only_a_warning(self):
+        # The other legitimate shape, and it was already handled: absent is a
+        # warning about layout, not a component with no verdict.
+        shutil.rmtree(self.path("agents"))
+        report = vp.validate(self.tmp)
+        self.assertEqual(report.unvalidated, [])
+        self.assertTrue([w for w in report.warnings if "agents" in w],
+                        report.warnings)
+
+    def test_an_unlistable_skills_directory_is_reported_by_its_own_check(self):
+        """check_skill_directories() has to list skills/ anyway, so it owns
+        this one and agents/ is not probed twice. Asserting the specific
+        wording is what distinguishes its own handler from guarded() papering
+        over it with 'could not be checked'."""
+        os.chmod(self.path("skills"), 0o000)
+        self.addCleanup(os.chmod, self.path("skills"), 0o700)
+        if os.access(self.path("skills"), os.R_OK):
+            self.skipTest("running as a user that ignores file permissions")
+        report = vp.validate(self.tmp)
+        hits = self.assertUnvalidated(report, "skills")
+        self.assertIn("could not be listed", " ".join(hits))
+        self.assertEqual(len(hits), 1,
+                         f"one unlistable directory, one report: {hits!r}")
+        self.assertSurvivors(report, "alpha.md", "bravo.md", "charlie.md")
+
+    def test_an_empty_skills_directory_stays_silent(self):
+        for name in self.SKILLS:
+            shutil.rmtree(self.path(f"skills/{name}"))
+        report = vp.validate(self.tmp)
+        self.assertEqual(report.errors, [])
+        self.assertEqual(report.warnings, [])
+        self.assertEqual(report.unvalidated, [])
 
 
 if __name__ == "__main__":

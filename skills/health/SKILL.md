@@ -103,6 +103,15 @@ number and say why.
 Write `.testing/health-baseline.json`, stamped with the commit SHA, so the dashboard can
 show whether the suite is getting slower or flakier over time.
 
+The `"verdict"` must be **top-level** and one of `GREEN`, `AMBER`, `RED` —
+`{"verdict": "RED", "commit_sha": "…", …}` — never nested under another object and never
+`{}`. It is the one key the PR comment reads here, and `scripts/session_context.py` reads
+the same key from the same file, so this is an existing cross-script contract.
+`{"health": {"verdict": "RED"}}` reads as a baseline recording *no* verdict, which is how
+a RED suite once rendered "No new findings on this change." under a full coverage table.
+If you did not assess health at all, write **no file** — an absent `health-baseline.json`
+is reported as "run `/testsquad:health`", which is the true fact.
+
 Report in the house style: the verdict in one line, then what is wrong in order of
 consequence, each with the command that demonstrates it. State consequences, not
 taxonomy — *"the suite passes, but 40% of it never runs"*, not *"skip count: 112"*.

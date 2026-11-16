@@ -97,7 +97,10 @@ The output is a list of **named, untested, high-risk things**:
 
 If `risk-map.json` carries `warnings` or is empty, say so plainly. **An empty risk map
 means no data, not no risk** — a shallow clone or a squashed history produces one, and
-reporting it as "nothing risky found" is a lie by omission.
+reporting it as "nothing risky found" is a lie by omission. Read `skipped_files` and
+`summary.files_skipped` next to `summary.files_ranked` and name any skip: a map that
+ranks what it could read and silently omits what it could not looks complete, and
+testing effort gets aimed at exactly that list.
 
 ## Step 4 — Mutation: available, not run
 
@@ -141,6 +144,12 @@ heading that says "the lines this PR changed" is a wrong number, not a spare one
 {"line_pct": 83.0, "base_line_pct": 71.0, "branch_pct": 60.0,
  "base_branch_pct": null, "uncovered_changed_lines": 4}
 ```
+
+The PR comment counts this file as having run only if it carries at least one of
+`line_pct`, `base_line_pct`, `branch_pct`, `base_branch_pct` or
+`uncovered_changed_lines` — presence is what is checked, so write them even where the
+value is `null`, which renders as "not measured" and is correct. A file carrying none of
+them is reported as recording no coverage figure.
 
 Derive it from `coverage-raw.json`: take its `files[]` entries whose `path` the diff
 touched, and intersect each one's `uncovered_lines` with the lines the diff added or

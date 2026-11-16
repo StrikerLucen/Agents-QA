@@ -525,8 +525,14 @@ class ExistingBehaviourStillHolds(unittest.TestCase):
             self.assertFalse(os.path.exists(out))
 
     def test_a_malformed_input_file_does_not_produce_a_reassuring_comment(self):
-        """The worst possible output: every file present but unreadable, and a
-        comment that says 'no new findings' with nothing to indicate why."""
+        """The worst possible output: every file present but unusable, and a
+        comment that says 'no new findings' with nothing to indicate why.
+
+        It renders no comment at all now, and exits 2. The body was already
+        honest -- "Nothing was measured on this change." -- but the exit code
+        said success, and `skills/report/SKILL.md` runs this from a shell
+        step where that is the half a CI job reads.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             testing = os.path.join(tmp, ".testing")
             os.makedirs(testing)
@@ -535,14 +541,19 @@ class ExistingBehaviourStillHolds(unittest.TestCase):
                 with open(os.path.join(testing, name), "w", encoding="utf-8") as fh:
                     fh.write("[]")
             out = os.path.join(tmp, "c.md")
-            self.assertEqual(0, prc.main(["--testing-dir", testing, "--out", out]))
-            with open(out, encoding="utf-8") as fh:
-                body = fh.read()
-        self.assertIn(prc.MARKER, body)
-        # The assertion this test was named for, and did not make: a comment
-        # is still rendered, but its headline says nothing was measured.
-        self.assertNotIn("No new findings", headline(body))
-        self.assertIn("Nothing was measured", headline(body))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(2, prc.main(
+                    ["--testing-dir", testing, "--out", out]))
+            self.assertFalse(os.path.exists(out),
+                             "a refusal must not leave a comment behind")
+        message = err.getvalue()
+        self.assertIn("no usable testsquad data", message)
+        for name in ("health-baseline.json", "coverage-diff.json",
+                     "gates.json", "findings.json"):
+            self.assertIn(f"{name} (not a JSON object", message,
+                          "the refusal has to name every file and say what "
+                          "was wrong with it")
 
     def test_unmeasured_coverage_is_words_not_a_number(self):
         body = prc.render({"coverage": {"line_pct": None, "branch_pct": None}})
@@ -691,20 +702,53 @@ class TheHeadlineNeverClaimsAnAllClear(unittest.TestCase):
                 ["--testing-dir", os.path.join(tmp, "nope"), "--out", out]))
             self.assertFalse(os.path.exists(out))
 
-    def test_every_input_present_but_unreadable_says_nothing_was_measured(self):
+    def test_every_input_present_but_unreadable_is_a_refusal_not_a_comment(self):
         """The worst case the script's own comment names: four files on disk,
-        none of them parseable, and -- before the fix -- a comment reading
-        "No new findings on this change." with no notice of any kind."""
+        none of them parseable, and -- before the first fix -- a comment
+        reading "No new findings on this change." with no notice of any kind.
+
+        Then it rendered an honest "Nothing was measured on this change." and
+        **exited 0**, while the same four inputs merely *absent* exited 2.
+        Same measurement, two answers, and the exit code is the half a CI
+        step can branch on. Both are a refusal now, keyed on the count of
+        inputs that produced something rather than on what was on disk.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             testing = self.make_testing(tmp, corrupt={
                 name: "{not json" for name in VALID_INPUTS})
-            body = self.run_main(testing)
-        line = headline(body)
-        self.assert_not_an_all_clear(line)
-        self.assertIn("Nothing was measured", line)
-        self.assertIn("not an all-clear", line)
+            out = os.path.join(tmp, "pr-comment.md")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(2, prc.main(
+                    ["--testing-dir", testing, "--out", out]))
+            self.assertFalse(os.path.exists(out))
+        message = err.getvalue()
+        self.assertIn("no usable testsquad data", message)
         for name in VALID_INPUTS:
-            self.assertIn(name, body, "the unreadable file must be named")
+            self.assertIn(name, message, "the unusable file must be named")
+            self.assertIn("rerun", message, "and its remedy with it")
+
+    def test_corrupt_and_absent_inputs_reach_the_same_exit_code(self):
+        """F7 stated as the property rather than the case: four inputs that
+        measured nothing exit the same way whether the files were missing or
+        merely unusable. The sentences differ -- the remedies differ -- but
+        the code a CI job branches on must not."""
+        with tempfile.TemporaryDirectory() as tmp:
+            corrupt = self.make_testing(tmp, corrupt={
+                name: "{not json" for name in VALID_INPUTS})
+            absent = os.path.join(tmp, "empty-testing")
+            os.makedirs(absent)
+            errs = []
+            for testing in (corrupt, absent):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(2, prc.main(["--testing-dir", testing]))
+                errs.append(err.getvalue())
+        self.assertIn("not valid JSON", errs[0])
+        self.assertNotIn("not valid JSON", errs[1])
+        self.assertIn("(run /testsquad:health)", errs[1],
+                      "an absent file is named with the command that writes "
+                      "it, not with a complaint about the file")
 
     def test_nothing_ran_is_reachable_through_render_alone(self):
         line = headline(prc.render({"missing_inputs": ["gates.json"],
@@ -728,10 +772,11 @@ class TheHeadlineNeverClaimsAnAllClear(unittest.TestCase):
         whose JSON parses fine but whose top level is a list. `load()` returns
         {} for both, which is indistinguishable from 'ran, found nothing'
         unless main() keeps them apart."""
-        for text, label in (("{not json", "malformed JSON"),
-                            ("[1, 2, 3]", "a top-level list"),
-                            ('"a string"', "a top-level string"),
-                            ("", "an empty file")):
+        for text, label, phrase in (
+                ("{not json", "malformed JSON", "not valid JSON"),
+                ("[1, 2, 3]", "a top-level list", "not a JSON object"),
+                ('"a string"', "a top-level string", "not a JSON object"),
+                ("", "an empty file", "not valid JSON")):
             for name in VALID_INPUTS:
                 with self.subTest(shape=label, input=name):
                     with tempfile.TemporaryDirectory() as tmp:
@@ -740,8 +785,10 @@ class TheHeadlineNeverClaimsAnAllClear(unittest.TestCase):
                     self.assert_not_an_all_clear(
                         headline(body),
                         f"{name} held {label} and the headline read clean")
-                    self.assertIn("unreadable", body)
-                    self.assertIn(name, body)
+                    # Named on the bullet, not just in the boilerplate
+                    # sentence above it -- which is what this assertion used
+                    # to match, so it would have passed on any wording.
+                    self.assertIn(f"> - {name} ({phrase} — rerun", body)
 
     # -- state 3c: partial runs, and what outranks what --------------------
 
@@ -870,9 +917,12 @@ class AReadableInputMissingItsKeyIsNotAnEmptyResult(unittest.TestCase):
     FINDINGS_ABSENT = ('> - findings.json (readable, but its "findings" key is '
                        "absent — rerun /testsquad:test or :debug)")
 
-    def body_for(self, overrides, drop=()):
+    def body_for(self, overrides, drop=(), utf16=()):
         """The rendered comment for a .testing/ of the four real inputs, with
-        `overrides` replacing some of them and `drop` leaving some out."""
+        `overrides` replacing some of them, `drop` leaving some out, and
+        `utf16` writing some as UTF-16 — valid JSON in bytes this reader
+        cannot decode, which is "unreadable" without needing a permission
+        bit, and so reads the same for root and for everyone else."""
         with tempfile.TemporaryDirectory() as tmp:
             testing = os.path.join(tmp, ".testing")
             os.makedirs(testing)
@@ -881,8 +931,12 @@ class AReadableInputMissingItsKeyIsNotAnEmptyResult(unittest.TestCase):
             for name, blob in blobs.items():
                 if name in drop:
                     continue
-                with open(os.path.join(testing, name), "w",
-                          encoding="utf-8") as fh:
+                path = os.path.join(testing, name)
+                if name in utf16:
+                    with open(path, "wb") as fh:
+                        fh.write(json.dumps(blob).encode("utf-16"))
+                    continue
+                with open(path, "w", encoding="utf-8") as fh:
                     if isinstance(blob, str):
                         fh.write(blob)
                     else:
@@ -977,29 +1031,136 @@ class AReadableInputMissingItsKeyIsNotAnEmptyResult(unittest.TestCase):
 
     # -- the three per-input states must read differently ------------------
 
-    def test_absent_unreadable_and_wrong_shape_are_three_different_lines(self):
+    def test_absent_unreadable_and_wrong_shape_are_four_different_lines(self):
         """The house rule applied per input: "it is not there", "I could not
-        read it" and "I read it and it is not what I read" must never render
-        as the same sentence."""
-        body = self.body_for({"health-baseline.json": "{not json",
-                              "gates.json": {"name": "coverage"}},
-                             drop=("coverage-diff.json",))
-        self.assertIn("> - coverage-diff.json (run /testsquad:diagnose)", body)
+        read a byte of it", "I read it and it is not JSON" and "I read it and
+        it does not carry the key" must never render as the same sentence.
+
+        All four at once means nothing was measured, so this reads them off
+        the refusal rather than off a comment — the same sentences either
+        way, because `describe()` produces both. The rendered-bullet form of
+        each is asserted by the tests above and below this one.
+
+        `health-baseline.json` is written as UTF-16 for the unreadable case:
+        bytes this reader cannot turn into text at all, which needs no
+        permission bit and so behaves the same for every user running it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            testing = os.path.join(tmp, ".testing")
+            os.makedirs(testing)
+            with open(os.path.join(testing, "health-baseline.json"), "wb") as fh:
+                fh.write(json.dumps({"verdict": "GREEN"}).encode("utf-16"))
+            with open(os.path.join(testing, "coverage-diff.json"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("{not json")
+            with open(os.path.join(testing, "gates.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"name": "coverage"}, fh)
+            # findings.json is simply not written.
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(2, prc.main(["--testing-dir", testing]))
+        message = err.getvalue()
+        self.assertIn("findings.json (run /testsquad:test or :debug)", message)
+        self.assertIn("health-baseline.json (unreadable — rerun "
+                      "/testsquad:health)", message)
+        self.assertIn("coverage-diff.json (not valid JSON — rerun "
+                      "/testsquad:diagnose)", message)
+        self.assertIn(self.GATES_ABSENT.replace("> - ", ""), message)
+        self.assertNotIn("gates.json (unreadable", message)
+        self.assertNotIn("health-baseline.json (not valid JSON", message)
+
+    def test_an_unreadable_input_beside_a_usable_one_is_named_in_the_body(self):
+        """The same sentence in the surface that gets published, so the
+        refusal and the comment cannot drift apart."""
+        body = self.body_for({}, utf16=("health-baseline.json",))
         self.assertIn("> - health-baseline.json (unreadable — rerun "
                       "/testsquad:health)", body)
-        self.assertIn(self.GATES_ABSENT, body)
+        self.assertNotIn("No new findings", headline(body))
+
+    def test_a_file_that_is_a_json_list_says_so_rather_than_unreadable(self):
+        """The fifth state. `[]` in gates.json read perfectly well; telling
+        its author it was unreadable sent them to look for corruption in a
+        file their editor would format without complaint."""
+        body = self.body_for({"gates.json": "[]"})
+        self.assertIn("> - gates.json (not a JSON object — rerun "
+                      "/testsquad:verify)", body)
         self.assertNotIn("gates.json (unreadable", body)
 
-    def test_nothing_usable_at_all_says_nothing_was_measured(self):
+    def test_nothing_usable_at_all_is_a_refusal(self):
         """Two files that parse and carry no key, and nothing else on disk: a
-        run where every input was readable and none of it was usable still
-        must not produce an all-clear."""
-        body = self.body_for({"gates.json": {"name": "coverage"},
-                              "findings.json": {"count": 0}},
-                             drop=("health-baseline.json",
-                                   "coverage-diff.json"))
-        self.assertIn("Nothing was measured", headline(body))
-        self.assertIn("not an all-clear", headline(body))
+        run where every input was readable and none of it was usable.
+
+        It used to render the honest "Nothing was measured on this change."
+        and exit 0. The body was never the problem; the exit code was. Zero
+        inputs measured is zero inputs measured however the files failed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            testing = os.path.join(tmp, ".testing")
+            os.makedirs(testing)
+            for name, blob in (("gates.json", {"name": "coverage"}),
+                               ("findings.json", {"count": 0})):
+                with open(os.path.join(testing, name), "w",
+                          encoding="utf-8") as fh:
+                    json.dump(blob, fh)
+            out = os.path.join(tmp, "c.md")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(2, prc.main(
+                    ["--testing-dir", testing, "--out", out]))
+            self.assertFalse(os.path.exists(out))
+        message = err.getvalue()
+        self.assertIn("no usable testsquad data", message)
+        self.assertIn('gates.json (readable, but its "gates" key is absent',
+                      message)
+
+    # -- the two files that *are* the object, and have no key to miss -------
+
+    def test_a_health_baseline_with_no_verdict_is_surfaced(self):
+        """F5, reported verbatim: a plausible `health-baseline.json` whose
+        verdict sits one level down under its own `health` wrapper. Every
+        key-presence check passed, because the whole file is assigned to
+        `health` — so a RED suite rendered "No new findings on this change."
+        under a full coverage table."""
+        body = self.body_for({"health-baseline.json": {
+            "health": {"verdict": "RED"}, "commit": "abc"}})
+        self.assertNotIn("No new findings", headline(body))
+        self.assertIn('> - health-baseline.json (readable, but it records no '
+                      '"verdict" — rerun /testsquad:health)', body)
+
+    def test_a_coverage_diff_with_no_coverage_figure_is_surfaced(self):
+        """The same hole in the other unwrapped file. `{"files": [...]}` is
+        a coverage document; it is not the one this section reads."""
+        body = self.body_for({"coverage-diff.json": {
+            "files": [{"path": "a.py"}], "generated_at": "2026-11-16"}})
+        self.assertNotIn("No new findings", headline(body))
+        self.assertIn("> - coverage-diff.json (readable, but it records no "
+                      "coverage figure", body)
+        # The section still renders, and every cell in it reads "not
+        # measured" -- no number is invented from a file that holds none.
+        # What changed is that the reader is now told which file that was.
+        self.assertNotIn("0.0%", body)
+        self.assertIn("not measured", body)
+
+    def test_a_health_baseline_carrying_only_its_verdict_stays_silent(self):
+        """The false-positive boundary, and the reason the required key is
+        `verdict` and nothing else: the one field this renderer acts on is
+        enough. A baseline with no commit, no counts and no timestamp is
+        still a verdict this comment can publish."""
+        body = self.body_for({"health-baseline.json": {"verdict": "GREEN"}})
+        self.assertEqual(CLEAN_HEADLINE, headline(body))
+        self.assertNotIn("health-baseline.json", body)
+
+    def test_a_coverage_figure_of_null_still_counts_as_having_run(self):
+        """Presence, never truthiness — the rule the whole coverage chain
+        follows. `null` is a measurement that was not taken, which renders
+        "not measured"; it is not a file that never ran."""
+        body = self.body_for({"coverage-diff.json": {
+            "line_pct": None, "base_line_pct": None, "branch_pct": None,
+            "base_branch_pct": None}})
+        self.assertEqual(CLEAN_HEADLINE, headline(body))
+        self.assertNotIn("coverage-diff.json", body)
+        self.assertIn("not measured", body)
 
     def test_a_key_of_the_wrong_type_keeps_its_existing_malformed_notice(self):
         """The boundary of the change: `{"gates": "none"}` has the key, so it
@@ -1034,18 +1195,73 @@ class TheDataRefusalSaysWhichFailureItWas(unittest.TestCase):
             self.assertEqual(expect_rc, rc)
             return err.getvalue().strip(), path
 
-    def test_an_unreadable_file_still_says_it_could_not_be_read(self):
-        message, path = self.refuse("{not json")
-        self.assertEqual(f"error: could not read {path}", message)
+    def refuse_bytes(self, blob, expect_rc=2):
+        """`(stderr, path)` for a --data file holding exactly these bytes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "d.json")
+            with open(path, "wb") as fh:
+                fh.write(blob)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(expect_rc, prc.main(["--data", path]))
+            return err.getvalue().strip(), path
 
-    def test_a_file_that_is_not_there_says_it_could_not_be_read(self):
+    def test_a_file_that_is_not_valid_json_says_that_and_not_unreadable(self):
+        """It read fine. Calling it unreadable sent its author looking for a
+        permissions problem that was not there, which is the same conflation
+        one layer up -- and the one this file's own comment had already
+        written down while the code still made it."""
+        message, path = self.refuse("{not json")
+        self.assertEqual(
+            f"error: read {path}, but it is not valid JSON — nothing could "
+            "be parsed out of it. Check it with `python3 -m json.tool`.",
+            message)
+        self.assertNotIn("could not read", message)
+
+    def test_a_file_that_is_not_there_says_so_rather_than_blaming_the_read(self):
+        """The other half of the same conflation: an absent file sent the
+        reader to look for a corruption that does not exist either. The
+        remedy is to produce the file, and the sentence has to say so."""
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "nope.json")
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 self.assertEqual(2, prc.main(["--data", path]))
-            self.assertEqual(f"error: could not read {path}",
-                             err.getvalue().strip())
+            self.assertEqual(
+                f"error: no such file: {path} — there is nothing to read, "
+                "and a comment rendered from nothing is not an all-clear.",
+                err.getvalue().strip())
+            self.assertNotIn("could not read", err.getvalue())
+
+    def test_a_file_whose_bytes_are_not_text_is_the_one_called_unreadable(self):
+        """UTF-16: valid JSON, and not bytes this reader can decode. This is
+        what "could not read it" is reserved for now."""
+        message, path = self.refuse_bytes(
+            json.dumps({"gates": []}).encode("utf-16"))
+        self.assertEqual(
+            f"error: could not read {path} — the file is there, but its "
+            "bytes could not be read as text (permissions, a directory, a "
+            "non-UTF-8 encoding, or an I/O error).", message)
+
+    @unittest.skipIf(os.geteuid() == 0, "root can read anything")
+    def test_a_file_this_process_may_not_open_is_unreadable_too(self):
+        """The canonical case, kept beside the UTF-16 one because they are
+        the same fact about the world and must read the same."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "d.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"gates": []}')
+            os.chmod(path, 0o000)
+            # chmod back inside the temporary directory's lifetime, or a
+            # 0o000 fixture defeats the cleanup and leaks the tree.
+            try:
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(2, prc.main(["--data", path]))
+            finally:
+                os.chmod(path, 0o600)
+        self.assertIn("could not read", err.getvalue())
+        self.assertNotIn("not valid JSON", err.getvalue())
 
     def test_an_empty_object_says_it_was_read_and_is_empty(self):
         message, path = self.refuse("{}")
@@ -1075,18 +1291,31 @@ class TheDataRefusalSaysWhichFailureItWas(unittest.TestCase):
             message)
         self.assertNotIn("could not read", message)
 
-    def test_the_four_refusals_are_four_different_sentences(self):
-        """The rule stated as a test: silence, emptiness and the wrong shape
-        must never render the same string."""
+    def test_the_six_refusals_are_six_different_sentences(self):
+        """The rule stated as a test: absence, silence, malformation,
+        emptiness, the wrong shape and somebody else's data must never render
+        the same string. The first three were one sentence between them."""
         messages = []
         for text in ("{not json", "{}", "[1, 2, 3]", '{"a": 1}'):
             message, path = self.refuse(text)
             # The path differs per temporary directory and is not the part
             # under test; the sentence around it is.
             messages.append(message.replace(path, "<path>"))
-        self.assertEqual(4, len(set(messages)), messages)
+        unreadable, path = self.refuse_bytes("{}".encode("utf-16"))
+        messages.append(unreadable.replace(path, "<path>"))
+        with tempfile.TemporaryDirectory() as tmp:
+            gone = os.path.join(tmp, "nope.json")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(2, prc.main(["--data", gone]))
+            messages.append(err.getvalue().strip().replace(gone, "<path>"))
+        self.assertEqual(6, len(set(messages)), messages)
         self.assertEqual(1, sum("could not read" in m for m in messages),
                          "only the unreadable file may be called unreadable")
+        self.assertEqual(1, sum("no such file" in m for m in messages),
+                         "only the absent file may be called absent")
+        self.assertEqual(1, sum("not valid JSON" in m for m in messages),
+                         "only the unparseable file may be called malformed")
 
     def test_every_refusal_is_still_exit_2(self):
         """`tests/test_robustness.py` asserts this path for adjacent shapes,
@@ -1226,12 +1455,40 @@ class BothModesAgreeOnWhatCountsAsHavingRun(unittest.TestCase):
         self.assertNotIn('"findings"', body)
         self.assertNotIn("supply it", body)
 
-    def test_empty_containers_of_every_shape_count_as_having_run(self):
-        """`{}` for health and coverage is the same statement `[]` makes for
-        gates: the producer ran and had nothing to say. Falsy is not absent."""
-        body = self.run_data({"health": {}, "coverage": {},
-                              "gates": [], "findings": []})
+    def test_an_empty_container_under_a_wrapper_key_counts_as_having_run(self):
+        """`[]` under `gates` is the producer saying it ran and had nothing to
+        report. Falsy is not absent, and this is the overwhelmingly common
+        clean run."""
+        body = self.run_data(dict(COMPLETE_DATA, gates=[], findings=[]))
         self.assertEqual(CLEAN_HEADLINE, headline(body))
+        self.assertNotIn("Not everything ran", body)
+
+    def test_an_empty_health_or_coverage_object_does_not_count_as_having_run(self):
+        """The boundary F5 moved, and the one place "falsy is not absent"
+        does not reach.
+
+        `gates` and `findings` are *under* a key: `{"gates": []}` is a
+        producer that ran. `health` and `coverage` **are** the object, so
+        `{}` is not an empty result under a key — there is no key, and
+        nothing the renderer reads. It prints no health line, no coverage
+        table and no verdict, and before this it counted as an input that
+        ran and found nothing. One `{}` of the four and the comment still
+        claimed an all-clear for a check that never reported.
+        """
+        for key in ("health", "coverage"):
+            with self.subTest(key=key):
+                body = self.run_data(dict(COMPLETE_DATA, **{key: {}}))
+                self.assertNotIn("No new findings", headline(body))
+                self.assertIn("1 input(s)", headline(body))
+                self.assertIn(f'"{key}" records no', body)
+
+    def test_a_health_object_of_the_wrong_type_keeps_its_malformed_notice(self):
+        """The boundary of the boundary: `{"health": "GREEN"}` supplied
+        something. It degrades through the malformed channel it already used,
+        and is not reported a second time as an input that never ran."""
+        body = self.run_data(dict(COMPLETE_DATA, health="GREEN"))
+        self.assertIn("`health` was not an object", body)
+        self.assertNotIn('"health" records no', body)
         self.assertNotIn("Not everything ran", body)
 
     def test_an_empty_gate_list_stays_silent_beside_a_real_finding(self):
@@ -1373,14 +1630,19 @@ class BothModesAgreeOnWhatCountsAsHavingRun(unittest.TestCase):
                           encoding="utf-8") as fh:
                     json.dump(blob, fh)
             out = os.path.join(tmp, "c.md")
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(0, prc.main(
-                    ["--testing-dir", testing, "--out", out]))
-            with open(out, encoding="utf-8") as fh:
-                dir_body = fh.read()
-        self.assertIn("Nothing was measured", headline(dir_body),
-                      "the --testing-dir branch did not use the shared "
-                      "classifier")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                # Four perfectly good files, and a classifier that says none
+                # of them ran: directory mode refuses, because its refusal is
+                # now keyed on that same count. A branch holding its own copy
+                # of the rule would render a clean comment and exit 0 here,
+                # which is exactly the divergence this test exists to catch.
+                self.assertEqual(2, prc.main(
+                    ["--testing-dir", testing, "--out", out]),
+                    "the --testing-dir branch did not use the shared "
+                    "classifier")
+            self.assertFalse(os.path.exists(out))
+        self.assertIn("no usable testsquad data", err.getvalue())
 
     def test_the_same_gap_counts_the_same_in_both_modes(self):
         """One input missing is one input missing, whichever way the renderer
@@ -1444,17 +1706,16 @@ class BothModesAgreeOnWhatCountsAsHavingRun(unittest.TestCase):
                     with contextlib.redirect_stderr(io.StringIO()):
                         self.assertEqual(2, prc.main(["--data", path]))
 
-    def test_an_empty_testing_directory_is_still_the_only_directory_refusal(self):
-        """The all-absent refusal stays keyed on file absence. Four files that
-        exist and carry nothing this comment reads still render a comment
-        saying so -- a refusal there would lose the diagnosis.
+    def test_the_directory_refusal_is_keyed_on_what_was_measured(self):
+        """The refusal used to be keyed on *file absence*: an empty
+        `.testing/` exited 2, and four files that existed and said nothing
+        exited 0 — with the same "Nothing was measured on this change." body.
 
-        Four `{}` files are not four empty inputs, and the headline below says
-        so correctly rather than conveniently: `health-baseline.json` and
-        `coverage-diff.json` *are* the object, so an empty one is an empty
-        result and counts as having run, while `gates.json` and
-        `findings.json` wrap their rows under a key that `{}` never carried.
-        Two ran, two were never supplied.
+        Four `{}` files are not four empty inputs. `gates.json` and
+        `findings.json` never carried their wrapper key, and
+        `health-baseline.json` and `coverage-diff.json` carry no field this
+        comment reads. Nothing ran, by the same count the headline uses, so
+        it is the same refusal as an empty directory.
         """
         with tempfile.TemporaryDirectory() as tmp:
             testing = os.path.join(tmp, ".testing")
@@ -1467,14 +1728,39 @@ class BothModesAgreeOnWhatCountsAsHavingRun(unittest.TestCase):
                 with open(os.path.join(testing, name), "w",
                           encoding="utf-8") as fh:
                     fh.write("{}")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(2, prc.main(
+                    ["--testing-dir", testing, "--out", out]))
+            self.assertFalse(os.path.exists(out))
+        message = err.getvalue()
+        self.assertIn('gates.json (readable, but its "gates" key is absent',
+                      message)
+        self.assertIn('health-baseline.json (readable, but it records no '
+                      '"verdict"', message)
+
+    def test_one_usable_input_out_of_four_still_renders_and_exits_0(self):
+        """The false-positive guard on the refusal above, and the thing that
+        keeps it from being a wider gate than it looks: a partial run is not
+        a refusal. One input that measured something is a comment worth
+        publishing, with the other three named as having not run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            testing = os.path.join(tmp, ".testing")
+            os.makedirs(testing)
+            for name in VALID_INPUTS:
+                with open(os.path.join(testing, name), "w",
+                          encoding="utf-8") as fh:
+                    fh.write("{}" if name != "findings.json"
+                             else json.dumps(VALID_INPUTS[name]))
+            out = os.path.join(tmp, "c.md")
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(0, prc.main(
                     ["--testing-dir", testing, "--out", out]))
             with open(out, encoding="utf-8") as fh:
                 body = fh.read()
+        self.assertIn(prc.MARKER, body)
+        self.assertIn("3 input(s)", headline(body))
         self.assertNotIn("No new findings", headline(body))
-        self.assertIn("2 input(s)", headline(body))
-        self.assertIn('gates.json (readable, but its "gates" key is absent', body)
 
 
 if __name__ == "__main__":

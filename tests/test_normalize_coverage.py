@@ -492,6 +492,87 @@ class TestImpossiblePercentages(unittest.TestCase):
         self.assertIsNone(result["files"][0]["line_pct"])
         self.assertTrue(any("a.py" in w for w in result["warnings"]))
 
+    def test_three_branches_covered_out_of_zero_is_not_silence(self):
+        """F9: `condition-coverage="300% (3/0)"` gave hit=3, found=0.
+
+        pct() refused it, so branch_pct came out null -- and null is also
+        what a file with no branches produces. The `found > 0` guard on
+        _flag_contradiction() exempted exactly this case from the warning, so
+        "3 of 0 branches covered", which cannot happen, reached the consumer
+        with an empty `warnings` list, indistinguishable from "this file has
+        no branches at all".
+        """
+        xml = ('<coverage><packages><package><classes>'
+               '<class filename="a.py"><lines>'
+               '<line number="1" hits="1" branch="true" '
+               'condition-coverage="300% (3/0)"/>'
+               '</lines></class></classes></package></packages></coverage>')
+        result, err = self._capture(xml, "cobertura")
+        self.assertIsNone(result["totals"]["branch_pct"])
+        self.assertIsNone(result["files"][0]["branch_pct"])
+        self.assertTrue(any("a.py" in w for w in result["warnings"]),
+                        "a null nobody is told about is a lost measurement")
+        self.assertIn("0 that exist", result["warnings"][0])
+        self.assertIn("a.py", err)
+
+    def test_no_branches_and_impossible_branches_are_different_outputs(self):
+        """The contrast the fix exists for, and the half that must stay quiet.
+
+        Both files report branch_pct null. One of them has nothing to cover,
+        which is legitimate and extremely common; the other is impossible.
+        If the two rendered alike the warning would be worthless -- and if the
+        legitimate one warned, the check would be noise and get switched off.
+        """
+        def one(condition):
+            return ('<coverage><packages><package><classes>'
+                    '<class filename="a.py"><lines>'
+                    '<line number="1" hits="1" branch="true" '
+                    f'condition-coverage="{condition}"/>'
+                    '</lines></class></classes></package></packages></coverage>')
+
+        none_at_all, quiet_err = self._capture(
+            '<coverage><packages><package><classes>'
+            '<class filename="a.py"><lines>'
+            '<line number="1" hits="1"/>'
+            '</lines></class></classes></package></packages></coverage>',
+            "cobertura")
+        zero_of_zero, zero_err = self._capture(one("0% (0/0)"), "cobertura")
+        impossible, loud_err = self._capture(one("300% (3/0)"), "cobertura")
+
+        # All three refuse to invent a percentage.
+        for result in (none_at_all, zero_of_zero, impossible):
+            self.assertIsNone(result["files"][0]["branch_pct"])
+        # Only one of them is a contradiction, and only it says anything.
+        self.assertEqual(none_at_all["warnings"], [])
+        self.assertEqual(quiet_err, "")
+        self.assertEqual(zero_of_zero["warnings"], [])
+        self.assertEqual(zero_err, "")
+        self.assertTrue(impossible["warnings"])
+        self.assertTrue(loud_err.strip())
+
+    def test_the_line_counters_get_the_same_rule(self):
+        # coverage.py's num_statements and covered_lines are independent
+        # fields, so 7 covered of 0 statements is a shape a real report can
+        # take. Zero statements alone stays silent: an empty module.
+        text = '{"files": {"a.py": {"summary": ' \
+               '{"num_statements": 0, "covered_lines": 7}}}}'
+        result, err = self._capture(text, "coveragepy")
+        self.assertIsNone(result["files"][0]["line_pct"])
+        self.assertTrue(any("a.py" in w for w in result["warnings"]))
+        self.assertIn("lines recorded as covered out of 0", result["warnings"][0])
+
+        empty_module, quiet = self._capture(
+            '{"files": {"a.py": {"summary": '
+            '{"num_statements": 0, "covered_lines": 0}}}}', "coveragepy")
+        self.assertEqual(empty_module["warnings"], [])
+        self.assertEqual(quiet, "")
+
+    def test_the_warning_names_branches_not_branchs(self):
+        # The message is the entire new signal for a contradiction nobody can
+        # see in the numbers; it has to read like English.
+        self.assertEqual(nc._plural("branch"), "branches")
+        self.assertEqual(nc._plural("line"), "lines")
+
     def test_a_consistent_report_carries_no_warnings(self):
         # The guard must stay silent on the normal case, or it becomes the
         # noise that gets the whole validator ignored.

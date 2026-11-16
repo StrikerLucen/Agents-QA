@@ -124,8 +124,11 @@ time.
 (`evals/`) runs every behavioural case **5 times and publishes a rate, not a
 pass**. And the honest gap as of v0.1.0: `evals/SCORECARD.md` is still a
 template. The claims are written down and falsifiable; they have not been
-measured and published yet. Treat the README's claims as design intent until
-that file has numbers in it.
+measured and published yet. Treat every behavioural claim about this plugin as
+design intent until that file has numbers in it.
+
+*(This paragraph previously said "the README's claims". There is no README in
+this repository and there never has been — corrected 2026-11-16.)*
 
 ## How do I know it isn't making things up?
 

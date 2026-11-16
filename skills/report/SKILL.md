@@ -59,6 +59,12 @@ them under `--testing-dir`. A file it cannot find is named in the comment as mis
 with the command that produces it — so an incomplete run says so instead of looking
 clean. If you find yourself about to explain a blank section, write the missing file.
 
+The exit code is part of that contract. The script exits **2 and writes nothing** when no
+input measured anything — every one absent, unreadable, invalid JSON, not an object, or
+readable without a single key the comment reads — and **0** whenever at least one input
+reported, a partial run included. A non-zero exit therefore never means clean; it means
+nothing was checked. Never `|| true` this step.
+
 And nothing else. Specifically **never**:
 
 - a suspicion, a code-read-only item, or anything not reproduced — those live in the

@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Structurally validate this plugin before anyone installs it.
 
-`claude plugin validate` is the authoritative check and this does not replace it.
-This runs where the Claude CLI is not available -- notably in CI -- and it also
-checks things the CLI does not, such as whether an agent's body is substantial
-enough to be worth loading, and whether a skill's name matches its directory.
+`claude plugin validate --strict` has now been run against this repo for the
+first time, and it passes -- but it is NOT a superset of this script and must
+not be read as one. What it validated was the marketplace manifest. It said
+nothing about the other 25 components this script checks: no agent's
+frontmatter, no skill's name-to-directory match, no hooks file shape, no
+context budget, and nothing at all about whether a component's bytes could be
+read. Where the two overlap, the CLI is authoritative and this is the stand-in
+that runs in CI where the CLI is absent. Where they do not overlap -- which is
+nearly everywhere below -- this script is the only check there is.
 
 Failing early here is cheap. A plugin that fails to load gives the user an
 "Errors" tab and no explanation, which is the worst first impression available.
@@ -300,10 +305,13 @@ def check_markdown_component(path: str, expected_name: str, kind: str, r: Report
         # ASCII, fails to start with "---\n", and is reported as missing
         # frontmatter. That is a claim about THIS program and nothing more. The
         # loader that will actually run the plugin has never been measured on a
-        # non-UTF-8 component, because `claude plugin validate` has never run on
-        # this machine (HANDOFF.md section 4, item 2).
+        # non-UTF-8 component. `claude plugin validate --strict` HAS now been
+        # run on this repo and passes, and that changes nothing here: it
+        # validates the marketplace manifest, so it has never opened an agent
+        # or a skill, let alone judged one's encoding.
         #
-        # WHAT WOULD SETTLE IT, for whoever installs the CLI -- two commands:
+        # WHAT WOULD SETTLE IT -- the CLI run is necessary but not sufficient,
+        # because a passing `validate` is not evidence the component LOADS:
         #     printf '---\nname: probe\ndescription: >\n  encoding probe\n---\n\nbody\n' \
         #       | iconv -f UTF-8 -t UTF-16 > agents/probe.md
         #     claude plugin validate --strict .    # then: is `probe` dispatchable?
@@ -393,6 +401,38 @@ def check_hooks(root: str, r: Report) -> None:
         r.error("hooks/hooks.json",
                 "needs a top-level 'hooks' key wrapping the event map, "
                 "or it will not load")
+        return
+    # HOW DEEP THIS GOES, AND WHY IT STOPS THERE. Checking only that the key
+    # exists passed `{"hooks": 7}` -- a file that cannot load, reported with
+    # the same words as a working one. One level further is settled by the
+    # JSON type alone: an event map is a mapping of event name to hooks, and
+    # an int, string, list or null is not a mapping in any version of that
+    # format, so this is a fact about JSON rather than a guess about the
+    # loader.
+    #
+    # The next level down is NOT settled, and that is where this stops.
+    # Validating event NAMES would need a list of them, and the nine
+    # hooks.json files shipped by plugins on this machine between them use
+    # SessionStart, UserPromptSubmit, UserPromptExpansion, PreToolUse,
+    # PostToolUse, PostToolUseFailure, PermissionRequest, Stop and
+    # StopFailure -- more than the names this script could confidently
+    # hardcode, and a hardcoded list would reject a legitimate plugin the day
+    # a tenth name ships. Validating each event's VALUE would mean asserting
+    # that the loader rejects a shape nobody here has run it on: `claude
+    # plugin validate --strict` passes on this repo but validates the
+    # marketplace manifest only, so it is no oracle for hooks. That is full
+    # schema validation, it duplicates the loader, and it is how a check
+    # earns false positives. An empty map, `{"hooks": {}}`, is left silent
+    # for the same reason: it loads, it simply does nothing, and the
+    # validator has no way to know that was not deliberate.
+    events = data["hooks"]
+    if not isinstance(events, dict):
+        r.error("hooks/hooks.json",
+                "'hooks' must be an object mapping event names to their hooks; "
+                f"this one is {type(events).__name__}: {events!r}, which cannot "
+                "load. Only that shape is checked here -- the event names and "
+                "their contents are the loader's business, and this script is "
+                "not a schema for it")
 
 
 def check_layout(root: str, r: Report) -> None:
@@ -417,6 +457,32 @@ def check_layout(root: str, r: Report) -> None:
         if not os.path.isdir(os.path.join(root, component)):
             r.warn(component, "directory absent")
 
+    # EMPTY IS LEGITIMATE; UNLISTABLE NEVER IS, and until this probe existed
+    # the two were the same output. glob.glob() swallows the error from a
+    # directory it cannot list and returns [], so a mode-000 agents/ made
+    # every agent disappear: measured on this repo as "Validation passed: 19
+    # component(s) checked, 0 warning(s), 0 could not be validated", which is
+    # byte-for-byte what an agents/ emptied of its seven files prints. A
+    # plugin that ships no agents is a real plugin and must stay silent. A
+    # plugin whose agents/ cannot be opened is not a plugin with no agents --
+    # it is seven components with no verdict, and the loader will be no more
+    # able to read them than this was.
+    #
+    # One listdir, one directory: skills/ is deliberately not probed here
+    # because check_skill_directories() has to list it anyway and reports its
+    # own failure, and saying it twice is noise. Zero false-positive risk --
+    # the only tree this fires on is one where the bytes of a shipped
+    # component are unreachable.
+    agents_dir = os.path.join(root, "agents")
+    if os.path.isdir(agents_dir):
+        try:
+            os.listdir(agents_dir)
+        except OSError as exc:
+            r.cannot_validate("agents", f"directory could not be listed ({exc}); "
+                                        "no agent in it was enumerated, so none of "
+                                        "them has a verdict and none is counted "
+                                        "below -- this is not the same as a plugin "
+                                        "that ships no agents")
 
 
 # --------------------------------------------------------------------------
@@ -626,22 +692,63 @@ def guarded(where: str, r: Report, fn, *args) -> object:
 
 
 def check_skill_directories(root: str, r: Report) -> None:
-    """A skills/<name>/ with no SKILL.md matches no glob and so is invisible.
+    """A skills/<name> that is not a loadable skill matches no glob.
 
-    The run then passes while a skill the author believes they shipped will
-    never load. Not finding a component is a finding, not a non-event.
+    `glob('skills/*/SKILL.md')` is how every other check finds a skill, and a
+    skills/<name> it does not match is invisible: the run passes while a skill
+    the author believes they shipped will never load. Not finding a component
+    is a finding, not a non-event.
+
+    Two shapes miss that glob, and both are reported the same way because the
+    consequence is the same. A DIRECTORY with no SKILL.md was already caught.
+    A skills/<name> that is a FILE, or a symlink resolving to nothing, was
+    not: `not os.path.isdir(sub)` skipped it before the SKILL.md test could
+    run, so replacing a skill directory with a file deleted that skill from
+    the run in silence -- 26 components checked became 25, with nothing else
+    said. It is the same rule with a hole in it rather than a new rule.
+
+    The false-positive question is whether anything legitimate sits directly
+    under skills/ that is not a skill directory. Measured, rather than
+    assumed: across the 27 plugin skills/ directories installed on this
+    machine -- the official Anthropic marketplace plus the synced plugins --
+    all 119 entries are directories and all 119 contain a SKILL.md. This repo
+    is 16 for 16. Dotfiles are still skipped, because .DS_Store and .gitkeep
+    are real and are not components.
     """
     skills_dir = os.path.join(root, "skills")
     if not os.path.isdir(skills_dir):
         return
-    for entry in sorted(os.listdir(skills_dir)):
-        sub = os.path.join(skills_dir, entry)
-        if not os.path.isdir(sub) or entry.startswith("."):
+    try:
+        entries = sorted(os.listdir(skills_dir))
+    except OSError as exc:
+        # Explicit rather than left to guarded(): the backstop would say "could
+        # not be checked", which reads as a bug in this script. What happened
+        # is that the directory holding every skill could not be opened.
+        r.cannot_validate("skills", f"directory could not be listed ({exc}); no "
+                                    "skill in it was enumerated, so none of them "
+                                    "has a verdict and none is counted below -- "
+                                    "this is not the same as a plugin that ships "
+                                    "no skills")
+        return
+    for entry in entries:
+        if entry.startswith("."):
             continue
-        if not os.path.isfile(os.path.join(sub, "SKILL.md")):
-            r.error(f"skills/{entry}",
-                    "has no SKILL.md, so it will not load as a skill and no "
-                    "other check in this run looked at it")
+        sub = os.path.join(skills_dir, entry)
+        if os.path.isdir(sub):
+            if not os.path.isfile(os.path.join(sub, "SKILL.md")):
+                r.error(f"skills/{entry}",
+                        "has no SKILL.md, so it will not load as a skill and no "
+                        "other check in this run looked at it")
+            continue
+        # Not a directory. Name which shape it is, because the two have
+        # different fixes: a file wants turning into a directory, a dangling
+        # link wants its target restored.
+        shape = ("is a symlink that resolves to nothing"
+                 if not os.path.exists(sub) else "is a file, not a directory")
+        r.error(f"skills/{entry}",
+                f"{shape}; a skill is a directory containing SKILL.md, so it "
+                "will not load as a skill and no other check in this run "
+                "looked at it")
 
 
 def validate(root: str) -> Report:

@@ -456,11 +456,32 @@ def normalize(text: str, fmt: str, *, source: str = "", strip_prefix: str = "",
 
 def _flag_contradiction(acc: Accumulator, path: str, kind: str,
                         hit: int, found: int) -> None:
-    if found > 0 and hit > found:
-        acc.warn(f"{path}: {hit} {kind}s recorded as covered out of {found} "
-                 f"that exist — the report contradicts itself, so {kind} "
-                 "coverage for this file is reported as null, not as a "
-                 "percentage")
+    """Warn when more was hit than exists. `found == 0` is deliberately NOT
+    exempt.
+
+    There used to be a `found > 0` guard here, and it carved out the one case
+    where silence is most dangerous. Cobertura's `condition-coverage="(3/0)"`
+    gives hit=3, found=0: pct() already refuses it, so branch_pct is null --
+    and null is also what a file with no branches produces. With the guard,
+    warnings stayed empty too, so "3 of 0 branches covered", which cannot
+    happen, rendered indistinguishably from "this file has no branches",
+    which happens constantly.
+
+    The line between the two is hit, not found:
+      * hit == 0 and found == 0 -- nothing to cover. Legitimate, common, and
+        stays silent: `hit > found` is False, so this function says nothing.
+      * hit  > 0 and found == 0 -- impossible. Warned, like every other
+        self-contradicting count.
+    """
+    if hit > found:
+        acc.warn(f"{path}: {hit} {_plural(kind)} recorded as covered out of "
+                 f"{found} that exist — the report contradicts itself, so "
+                 f"{kind} coverage for this file is reported as null, not as "
+                 "a percentage")
+
+
+def _plural(kind: str) -> str:
+    return f"{kind}es" if kind.endswith("ch") else f"{kind}s"
 
 
 def main(argv: list[str] | None = None) -> int:
