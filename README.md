@@ -40,7 +40,7 @@ down for an agent to do, and which parts of that are enforced by code you can ru
 ## The three gates
 
 ```sh
-cd examples/fixtures && ./regen_git_history.sh   # required on a fresh clone
+cd examples/fixtures && ./regen_git_history.sh
 cd tests && ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest
 python3 scripts/validate_plugin.py . --strict
 python3 scripts/flake_smells.py tests scripts --fail-on block

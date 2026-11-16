@@ -13,7 +13,7 @@ that belong to the owner rather than to you.
 Then re-measure before trusting anything written down:
 
 ```
-cd examples/fixtures && ./regen_git_history.sh    # required on a fresh clone
+cd examples/fixtures && ./regen_git_history.sh
 cd tests && ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest
 python3 scripts/validate_plugin.py . --strict
 ```
@@ -39,10 +39,14 @@ against it — and it is not committed, because an embedded repo would not survi
 ## Commands
 
 ```
-cd tests && ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest   # the suite
-python3 scripts/validate_plugin.py . --strict                            # manifests + context budgets
-python3 scripts/flake_smells.py tests scripts --fail-on block            # our own standards, on us
+cd tests && ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest
+python3 scripts/validate_plugin.py . --strict
+python3 scripts/flake_smells.py tests scripts --fail-on block
 ```
+
+In order: the suite; manifests plus context budgets; our own flake standards applied to
+us. No `#` comments in these blocks — zsh leaves `interactive_comments` off, so a pasted
+trailing comment becomes an argument and argparse rejects the line.
 
 Use the form above — it is what CI runs. (`unittest discover` works too: measured
 2026-11-16, both forms collect the same tests and both pass. This file claimed

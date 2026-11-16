@@ -45,22 +45,37 @@ API cost:
 
 ```sh
 cd examples/fixtures
-python3 ../../scripts/env_safety_check.py node-ts      # must print UNSAFE
-python3 ../../scripts/env_safety_check.py python-pkg   # must print SAFE
-python3 ../../scripts/risk_map.py node-ts --since ""   # src/cart.ts must rank first
+python3 ../../scripts/env_safety_check.py node-ts
+python3 ../../scripts/env_safety_check.py python-pkg
+python3 ../../scripts/risk_map.py node-ts --since ""
 python3 ../../scripts/flake_smells.py node-ts python-pkg java-min
 ```
 
-`flake_smells.py` must fire on every weak test and report **nothing** on
-`tests/good.spec.ts`, `tests/test_good.py` and `GoodTest.java`. A finding on a
-good test is a false positive, which matters more here than a miss.
+No `#` comments in that block, deliberately: zsh does not enable
+`interactive_comments`, so a pasted trailing comment arrives as an argument and
+argparse rejects the whole command. The expected results go here instead, where
+they cannot be pasted by accident. Measured 2026-11-16:
+
+| Command | Expected |
+|---|---|
+| `env_safety_check.py node-ts` | `UNSAFE`, 3 critical — and **exit 1**, which is the gate working, not a crash |
+| `env_safety_check.py python-pkg` | `SAFE`, 0 findings, exit 0 |
+| `risk_map.py node-ts` | `src/cart.ts` ranked first, likelihood 5 |
+| `flake_smells.py` | findings on the weak tests, **nothing** on the good ones |
+
+That last row is the one to check first. `flake_smells.py` must report
+**nothing** on `tests/good.spec.ts`, `tests/test_good.py` and `GoodTest.java`. A
+finding on a good test is a false positive, which matters more here than a miss.
 
 To check the scripts themselves, from the repository root:
 
 ```sh
-cd examples/fixtures && ./regen_git_history.sh   # required on a fresh clone
+cd examples/fixtures && ./regen_git_history.sh
 cd ../../tests && ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest
 ```
+
+The first line is required on a fresh clone; see
+[CONTRIBUTING.md](../CONTRIBUTING.md#first-after-cloning) for why.
 
 Expect **green, with one expected failure**, in well under a minute. The *count* is
 deliberately not printed here: it went 922 → 957 → 966 over a single afternoon on
