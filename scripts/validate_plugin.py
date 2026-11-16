@@ -502,15 +502,47 @@ BUDGETS = {
     "skills":           3_000,   # loaded when the skill is invoked
     "templates/agents": 1_600,   # the generated agent, per target repo
     "report-rules":     1_200,   # RULES.md: loaded by most skills
+
+    # Per-file ceilings, keyed by path relative to the plugin root. Looked up
+    # before the group ceiling above, so one file can differ from its group
+    # without moving everybody else's limit.
+    #
+    # ts-qa-gatekeeper.md.tmpl: 1,800 rather than the 1,600 the other three
+    # templates keep. This is not slack, it is a measured floor. A dedup pass
+    # over that file recovered 28 -> 65 tokens of headroom without dropping a
+    # single rule, and that is as far as it goes. The usual lever -- point at
+    # the canonical copy instead of repeating it -- is unavailable here twice
+    # over. A .tmpl ships into a *user's* repository, where
+    # ${CLAUDE_PLUGIN_ROOT} does not expand; and skills/start/SKILL.md step 9
+    # generates only the agents the detected stack needs, so the obvious
+    # target (the ~90-token flake table it shares with ts-debugger.md.tmpl)
+    # may not exist in that repo at all. A dangling pointer there is strictly
+    # worse than 90 tokens of table. A template is self-contained by design,
+    # so its duplication has, almost by definition, no reachable canonical
+    # home.
+    #
+    # What this one file has to carry inside its ceiling: frontmatter, a
+    # regeneration warning, four stack-specific commands, six non-negotiables,
+    # a six-step verification procedure including the flake matrix, the
+    # verdict format with a worked example, and the report contract -- and it
+    # is the canonical home among the generated agents for the 5-run bar that
+    # the other two templates defer to. Those three sit at 456, 593 and 137
+    # tokens of headroom because they legitimately delegate more. 1,600 is the
+    # right ceiling for the average generated agent and the wrong one for this
+    # one. Raise the default instead and the other three stop being held to
+    # anything.
+    "templates/agents/ts-qa-gatekeeper.md.tmpl": 1_800,
 }
 
 # Files deliberately outside the budget, with the reason. Each must be
 # something a human reads, or something loaded at most once per onboarding.
+#
+# Keys are paths relative to the plugin root, and check_exemptions_resolve()
+# below holds them to that: an entry naming a file nobody wrote exempts
+# nothing while reading like a decision somebody made.
 EXEMPT = {
     "docs/RESEARCH.md":              "human reference; never loaded at runtime",
     "templates/report/STYLE.md":     "rationale; only the reporter and humans read it",
-    "templates/agents/README.md":    "human reference",
-    "examples/fixtures/README.md":   "human reference",
 }
 
 
@@ -578,11 +610,17 @@ def check_context_budget(root: str, r: Report) -> None:
         (os.path.join(root, "templates", "report", "RULES.md"),
          BUDGETS["report-rules"], "report rules", True),
     ]
-    for pattern, ceiling, label, sole_check in checks:
+    for pattern, group_ceiling, label, sole_check in checks:
         for path in sorted(glob.glob(pattern)):
             rel = os.path.relpath(path, root)
             if rel in EXEMPT:
                 continue
+            # A per-file entry in BUDGETS overrides its group. Bound inside
+            # the inner loop and never assigned to `group_ceiling`, so one
+            # file's override cannot leak onto the files sorted after it --
+            # which is exactly how a single exception silently becomes the
+            # new default for a whole directory.
+            ceiling = BUDGETS.get(rel, group_ceiling)
             try:
                 size = readable_size(path)
             except Unreadable as exc:
@@ -631,6 +669,47 @@ def check_context_budget(root: str, r: Report) -> None:
             r.warn(rel,
                    "reads a stack playbook at task time; it should read "
                    ".testing/profile.json, which /start already distilled")
+
+
+def check_exemptions_resolve(root: str, r: Report) -> None:
+    """An exemption for a file nobody wrote exempts nothing.
+
+    EXEMPT reads as a decision: somebody weighed this file and chose to keep
+    it off the budget, and wrote down why. An entry whose path does not exist
+    reads exactly the same and does nothing at all -- a silent no-op wearing
+    the costume of a deliberate choice. Two of the four entries here were
+    `templates/agents/README.md` and `examples/fixtures/README.md`, neither of
+    which has ever existed in this repository, and nothing said so because
+    nothing looked.
+
+    Deliberately narrow, on both axes, because a budget check above roughly
+    10% false positives gets switched off and takes the real ceilings with it:
+
+    * Only non-existence is a finding. An entry that exists but that no
+      current glob consults is dead in a *recoverable* way -- add the glob and
+      the decision takes effect -- and warning about it would be a finding
+      against a correct decision. A path that is not there cannot become
+      reachable by any glob.
+    * An entry is skipped when the directory that would contain it is itself
+      absent from this root. This validator runs against trees that are not
+      this repository -- its own tests build a dozen of them -- and "this tree
+      has no docs/ at all" is a different tree, not a stale exemption. The
+      cost of that scoping is stated rather than hidden: in such a root this
+      check has no verdict about that entry, which is not the same as having
+      cleared it.
+    """
+    for rel, reason in sorted(EXEMPT.items()):
+        target = os.path.join(root, *rel.split("/"))
+        parent = os.path.dirname(target)
+        if not os.path.isdir(parent):
+            continue
+        if not os.path.exists(target):
+            r.warn("EXEMPT",
+                   f"{rel} is exempted from the context budget "
+                   f"(\"{reason}\"), but {os.path.dirname(rel)}/ exists and "
+                   f"that file does not; the entry exempts nothing while "
+                   f"reading as a deliberate decision -- delete it, or create "
+                   f"the file it was reserving")
 
 
 # Directories that hold shipped plugin components. Walked only to answer
@@ -758,6 +837,7 @@ def validate(root: str) -> Report:
     guarded("hooks/hooks.json", r, check_hooks, root, r)
     guarded("layout", r, check_layout, root, r)
     guarded("context budget", r, check_context_budget, root, r)
+    guarded("exemptions", r, check_exemptions_resolve, root, r)
     guarded("skills layout", r, check_skill_directories, root, r)
     # After the budget check, so it can see what that check weighed.
     guarded("budget coverage", r, record_budget_coverage, root, r)

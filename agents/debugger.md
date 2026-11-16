@@ -178,8 +178,7 @@ For each confirmed finding:
 - **Environment**: build SHA, OS, runtime version, and the exact command.
 - **Reproducibility**: N of M runs (`7 of 10`). A single observation is `1 of 1` and
   should be labelled honestly as such.
-- **Severity**: S1 data loss or money wrong · S2 feature broken · S3 limited case ·
-  S4 cosmetic.
+- **Severity**: the S1–S4 scale in the `RULES.md` cited above.
 - **Proposed priority, never a set one.** When to fix is a business call that needs
   context you do not have.
 - **Evidence level**, from the list above.

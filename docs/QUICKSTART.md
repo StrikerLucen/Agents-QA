@@ -16,8 +16,10 @@ tells you more than anything written here.
 
 **Prerequisites:** Python 3.9+ and `git`. That is the whole list.
 
-The analysis scripts (`scripts/*.py`, ~5,600 lines) use the Python standard
-library only — no `pip install`, no virtualenv, no lockfile. `git` is needed
+The analysis scripts (`scripts/*.py`, ten modules; `cat scripts/*.py | wc -l`
+for the size, which this page got wrong by nearly half until 2026-11-16 and
+which moved twice more the same day) use the Python standard library only — no
+`pip install`, no virtualenv, no lockfile. `git` is needed
 because the risk map is computed from `git log`; without a history you get an
 empty risk map, reported as "no data", not "no risk". Everything else it runs is
 your project's own tooling, invoked exactly as your own config invokes it.
@@ -65,10 +67,19 @@ deliberately not printed here: it went 922 → 957 → 966 over a single afterno
 2026-11-16 while this page was being written, so any number on this line would be wrong
 before you read it. The command is the answer; the number is not.
 
-**Do not use `python3 -m unittest discover -s tests`.** It is not equivalent: it reports
-10 failures on a clean tree, because the test modules import each other by bare module
-name and `discover` gives them a different import root. The `ls | xargs` form above is
-the supported one.
+**Use the `ls | xargs` form above**, not `python3 -m unittest discover`. It is what CI
+runs, what `CONTRIBUTING.md` asks contributors for, and the one invocation every page
+here names — so a failure you hit is a failure someone else can reproduce.
+
+*Until 2026-11-16 this paragraph said something stronger and wrong: that `discover` "is
+not equivalent: it reports 10 failures on a clean tree, because the test modules import
+each other by bare module name". Measured that day, at `HEAD` and in the working tree,
+none of it holds. No test module imports another — `grep -nE '^(import|from) test_'
+tests/*.py` returns nothing, because each one inserts `../scripts` itself, relative to
+`__file__` — and both forms collect the same number of tests and both pass. What does
+produce a wall of failures is a tree whose fixture git history has not been regenerated:
+15 of them, from either form equally. The step above this one is the one that is not
+optional, and that is what the warning was really about.*
 
 ### The agent check
 

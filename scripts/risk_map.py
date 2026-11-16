@@ -209,6 +209,35 @@ def _unrename(path: str) -> str:
     return new.strip()
 
 
+def symlink_lines(full: str) -> int | None:
+    """Line count for a symbolic link ITSELF, or None to let it be skipped.
+
+    git stores a symlink as a blob whose content is the target path, so
+    `git log --numstat` -- the churn numerator this script divides -- reports
+    a repointed link as one line changed. The denominator has to measure the
+    same object. open() followed the link instead and counted the TARGET,
+    which may not even be inside this repository, so `lines` named one file
+    and described another and `relative_churn` divided one file's churn by a
+    different file's size. Counting the link's own stored target path keeps
+    both halves of that ratio on the same blob, which is the only reading of
+    it that means anything.
+
+    None for the two cases already reported in skipped_files -- a broken link
+    and a link to a directory. Neither hands a reader a number at all, so
+    neither is the defect this function exists to close, and both keep the
+    named skip entry they were given.
+    """
+    if not os.path.exists(full) or os.path.isdir(full):
+        return None
+    try:
+        raw = os.fsencode(os.readlink(full))
+    except OSError:
+        return None
+    # Same trailing-newline rule as count_lines(). A target path normally has
+    # no newline at all, which is why git calls a repointed link one line.
+    return raw.count(b"\n") + (1 if raw and not raw.endswith(b"\n") else 0)
+
+
 def count_lines(full: str, *, max_bytes: int = MAX_FILE_BYTES) -> int | None:
     """Newline count for one file, or None when it must not be counted.
 
@@ -216,7 +245,13 @@ def count_lines(full: str, *, max_bytes: int = MAX_FILE_BYTES) -> int | None:
     holding the file in memory to produce it buys nothing and costs the file's
     size in RAM. Returns None for a directory, an unreadable file, a binary
     one, or one over `max_bytes` -- the caller reports which.
+
+    A symbolic link is measured as the link, never as whatever it points at:
+    see symlink_lines(). The `max_bytes` ceiling does not apply to one, because
+    the thing being read is a target path of a few dozen bytes.
     """
+    if os.path.islink(full):
+        return symlink_lines(full)
     try:
         if os.path.getsize(full) > max_bytes:
             return None
@@ -240,16 +275,23 @@ def count_lines(full: str, *, max_bytes: int = MAX_FILE_BYTES) -> int | None:
 
 
 def current_files(repo: str, *, max_bytes: int = MAX_FILE_BYTES
-                  ) -> tuple[dict[str, int], list[dict]]:
-    """(path -> line count, skipped) for files that exist right now.
+                  ) -> tuple[dict[str, int], list[dict], dict[str, str]]:
+    """(path -> line count, skipped, path -> symlink target) for files that
+    exist right now.
 
     History for deleted files is dropped: a file that no longer exists cannot
     carry risk. A file that exists but was skipped is NOT the same thing, so
     it is returned separately rather than silently missing from the map -- a
     file that vanishes from a risk report reads exactly like a safe one.
+
+    The third mapping holds only the ranked symlinks. Their `lines` is an
+    honest count of the link, but a reader scanning a ranking has no way to
+    tell a one-line link from a one-line file, so the target travels with the
+    entry and is said out loud in `why`.
     """
     sizes: dict[str, int] = {}
     skipped: list[dict] = []
+    links: dict[str, str] = {}
     for path in run_git(repo, ["ls-files"]).splitlines():
         path = path.strip()
         if not path:
@@ -265,8 +307,16 @@ def current_files(repo: str, *, max_bytes: int = MAX_FILE_BYTES
             # risk. Name every one of them, and say which kind it was.
             skipped.append({"file": path, "reason": skip_reason(full, max_bytes)})
             continue
+        if os.path.islink(full):
+            try:
+                links[path] = os.readlink(full)
+            except OSError:
+                # count_lines() just read it, so this is a race rather than a
+                # state. Rank it anyway and say the target is unknown: an
+                # unnamed link is still better than an unmarked one.
+                links[path] = "?"
         sizes[path] = lines
-    return sizes, skipped
+    return sizes, skipped, links
 
 
 def human_bytes(n: int) -> str:
@@ -372,7 +422,7 @@ def build(repo: str, *, since: str | None = None, max_commits: int = 20000,
         for commit in commits
         for path, _ in commit["files"]
     } - set(modified_churn)
-    sizes, skipped_files = current_files(repo, max_bytes=max_file_bytes)
+    sizes, skipped_files, symlinks = current_files(repo, max_bytes=max_file_bytes)
 
     churn: dict[str, int] = defaultdict(int)
     commit_count: dict[str, int] = defaultdict(int)
@@ -418,6 +468,11 @@ def build(repo: str, *, since: str | None = None, max_commits: int = 20000,
         files.append({
             "path": path,
             "lines": sizes.get(path, 0),
+            # None for an ordinary file; the stored target for a symlink. The
+            # entry's `lines` counts the link, not the target, so a reader who
+            # wonders why a tracked path is one line long gets the answer in
+            # the same record rather than having to go and stat it.
+            "symlink": symlinks.get(path),
             "churned_lines": churn.get(path, 0),
             "new_in_window": path in created_in_window,
             "relative_churn": round(relative_churn, 4),
@@ -584,6 +639,14 @@ def _explain(f: dict) -> str:
     because developers could not see why a file was flagged. Every score here
     ships with the sentence that justifies it."""
     bits = []
+
+    # First, and before any number: this row's counts describe a link, and
+    # nothing else in the row says so. A reader aiming testing effort at a
+    # path needs to know the path is a pointer before they read its size.
+    target = f.get("symlink")
+    if target:
+        bits.append(f"a symbolic link to {target}, counted as the link "
+                    "itself rather than as its target")
 
     # Churn: exactly one phrase, chosen by magnitude. Below 1% the percentage
     # rounds to "0% churned", which reads as a contradiction beside a real

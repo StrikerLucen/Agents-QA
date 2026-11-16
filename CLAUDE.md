@@ -44,7 +44,11 @@ python3 scripts/validate_plugin.py . --strict                            # manif
 python3 scripts/flake_smells.py tests scripts --fail-on block            # our own standards, on us
 ```
 
-`unittest discover` does not work in `tests/`; use the form above. Python 3.9 is the
+Use the form above — it is what CI runs. (`unittest discover` works too: measured
+2026-11-16, both forms collect the same tests and both pass. This file claimed
+otherwise since the initial commit and the claim was never checked. What really
+produces a wall of failures is skipping the fixture regeneration above, from *either*
+form.) Python 3.9 is the
 floor. Everything is stdlib — there is nothing to install, and that is deliberate.
 
 ## How work is done here
@@ -99,6 +103,12 @@ defect in this repo, and most were caught by the project's own tools.
 ## Known state
 
 `evals/SCORECARD.md` is still a template. **No behavioural claim has been measured.**
-The README says so, and it should keep saying so until the evals actually run.
-`claude plugin validate --strict` has never run — `scripts/validate_plugin.py` is a
-stand-in, not a substitute.
+`README.md` says so, under *Read this before you believe anything else here* — its
+opening section, before anything about what the plugin does — and it should keep saying
+so until the evals actually run. (That README was written 2026-11-16. Before then there
+was none, and the three files claiming one carried the disclaimer were telling users
+nothing.)
+`claude plugin validate --strict` passes (run 2026-11-16, CLI 2.1.276), but it is not a
+substitute for `scripts/validate_plugin.py`: it validates the marketplace manifest only
+and says nothing about the other 25 components. The CLI is at `~/.local/bin/claude` and
+is NOT on the default PATH — `which claude` will tell you it is missing.

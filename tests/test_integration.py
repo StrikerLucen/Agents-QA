@@ -47,6 +47,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -1694,7 +1695,19 @@ class FixtureAvailabilityPolicyTest(unittest.TestCase):
         back anywhere in this file would restore the exact silence that hid
         NODE-CONFIG-01, and no behavioural test would notice."""
         source = read_text(os.path.abspath(__file__))
-        tree = ast.parse(source)
+        try:
+            tree = ast.parse(source)
+        except RecursionError:
+            # Not protection: the input is this module's own committed source,
+            # and a raise here is already a loud red error. What the handler
+            # buys is the sentence. A bare RecursionError traceback under this
+            # test's name is about parser depth and says nothing about skips,
+            # so a reader can triage it as unrelated infrastructure noise and
+            # never notice that the skip guard below went unevaluated.
+            self.fail("this module's own source is too deeply nested for "
+                      "ast.parse; the source-level guard below did NOT run, "
+                      "so nothing checked that every skip still goes through "
+                      "fixture_unavailable()")
         allowed = None
         for node in ast.walk(tree):
             if (isinstance(node, ast.FunctionDef)
@@ -1729,6 +1742,22 @@ class FixtureAvailabilityPolicyTest(unittest.TestCase):
             "success; route it through the helper so it fails by default and "
             "says {0} when it does not: {1}"
             .format(ALLOW_MISSING_FIXTURES, offenders))
+
+    def test_an_unparseable_own_source_says_the_guard_did_not_run(self):
+        """Covers the RecursionError handler above, which no committed source
+        can reach -- on the 3.9.6 floor ast.parse goes straight from accepting
+        a very deep expression to SIGSEGV, so the handler cannot be reached by
+        depth there at all. A handler nobody can prove is a handler nobody
+        should trust, so it is forced to fire here instead."""
+        with mock.patch.object(ast, "parse",
+                               side_effect=RecursionError("forced")):
+            with self.assertRaises(self.failureException) as caught:
+                self.test_every_skip_in_this_module_goes_through_the_opt_in()
+        message = str(caught.exception)
+        self.assertIn("did NOT run", message)
+        self.assertNotIn("silence that looks like success", message,
+                         "the parse never happened, so the real assertion "
+                         "below it must not have reported a verdict")
 
     def test_no_ci_workflow_sets_the_override(self):
         """The hatch is for a human running the suite next to another agent.

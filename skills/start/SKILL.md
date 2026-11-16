@@ -24,9 +24,8 @@ afterwards. Nothing is a black box, and you should say so.
 (8), the contract (11). Nothing else interrupts, and re-asking something already
 answered is a defect — check `.testing/preferences.json` first.
 
-**Nothing runs until it is safe and agreed.** No test command, no coverage run, no
-dependency install, until step 3 has passed and step 5 is agreed. A suite you have
-never seen may point at production, and running it is executing its author's code.
+**Nothing runs until it is safe and agreed.** No command the repository supplies runs
+until step 3 has passed and step 5 is agreed.
 
 ---
 
@@ -49,7 +48,7 @@ In **one** AskUserQuestion call:
    needed it reports "cannot execute" with the exact command it would have needed.
 
 Write both to `.testing/preferences.json` immediately, with the date and a 30-day expiry
-on the install permission. Never ask either again.
+on the install permission.
 
 ## Step 3 — Environment safety check
 
@@ -83,15 +82,19 @@ field `null` with a reason, and which consent state it read.
 
 ## Step 5 — Agree to execute this repo's code. This is a gate
 
-Nothing the repository supplied has run yet. **Print those commands verbatim and get
-agreement** before the first one does: whole-suite, changed-files, coverage, and any
-dependency install. Give the file you found each in, and name what the runner invokes
-implicitly: npm runs `pretest` before `test`, and `install` runs `postinstall`.
+**Print those commands verbatim and get agreement** before the first one runs:
+whole-suite, changed-files, coverage, and any dependency install. Give the file you
+found each in, and name what the runner invokes implicitly: npm runs `pretest` before
+`test`, and `install` runs `postinstall`.
 
 Say what is being agreed to: **these run code written by whoever wrote this repository,
 as you, on this machine.** It is not a configuration value being approved. Step 3 covers
 *where* tests point, not *what* they do, so repeat its findings here beside the command.
 Showing the string is what closes the class; a detector list never will.
+
+**Shown, written and matched are one list**: record the strings byte-identical to what
+you displayed, nothing normalised, abbreviated or added. Narrower, the gate silently
+refuses everything; wider, it silently runs what the user never saw.
 
 Record it under `consent.execute_repo_commands` in `.testing/preferences.json`, in the
 shape `agents/project-analyst.md` defines under "The consent record" — the only
@@ -207,8 +210,6 @@ first because they are the cheapest wins on the board.
 
 Each item carries: what to do, which agent does it, the expected change, and a
 **command-checkable done-when line**.
-
-Item #0 is a RED health verdict, if there is one.
 
 ## Step 13 — Report
 

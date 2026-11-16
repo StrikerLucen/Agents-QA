@@ -881,5 +881,133 @@ class ComponentDirectoryTests(PluginTreeMixin, unittest.TestCase):
         self.assertEqual(report.unvalidated, [])
 
 
+# --------------------------------------------------------------------------
+# a per-file ceiling is an exception for one file, not a new default
+# --------------------------------------------------------------------------
+
+class PerFileBudgetTests(PluginTreeMixin, unittest.TestCase):
+    """BUDGETS carries one entry keyed by a full relative path --
+    `templates/agents/ts-qa-gatekeeper.md.tmpl` at 1,800 where its group sits
+    at 1,600. The risk in that shape is not the number, it is leakage: if the
+    override is assigned to the loop variable it silently becomes the ceiling
+    for every file sorted after it, and three templates stop being held to
+    anything while the run still prints 0 warnings."""
+
+    OVERRIDDEN = "templates/agents/ts-qa-gatekeeper.md.tmpl"
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(self.path("templates/agents"))
+
+    def test_the_override_is_the_ceiling_for_its_own_file(self):
+        # Over the 1,600 group ceiling, under its own 1,800: silent.
+        self.assertEqual(vp.BUDGETS[self.OVERRIDDEN], 1_800)
+        self.write(self.OVERRIDDEN, "q" * (1_700 * 4))
+        report = vp.validate(self.tmp)
+        self.assertEqual([w for w in report.warnings if "gatekeeper" in w], [],
+                         f"the per-file ceiling did not apply: {report.warnings!r}")
+
+    def test_the_override_still_has_a_ceiling(self):
+        # A named exception is not an exemption. Past 1,800 it warns, and the
+        # message has to quote 1,800 or the reader trims to the wrong target.
+        self.write(self.OVERRIDDEN, "q" * (1_900 * 4))
+        report = vp.validate(self.tmp)
+        hits = [w for w in report.warnings if "gatekeeper" in w]
+        self.assertTrue(hits, report.warnings)
+        self.assertIn("over the 1,800 budget", hits[0])
+
+    def test_the_override_does_not_leak_onto_the_files_after_it(self):
+        """`zzz.tmpl` sorts after the overridden file, so it is the one that
+        inherits a leaked ceiling. 1,700 tokens is over 1,600 and under 1,800:
+        it must warn, and it must warn about 1,600."""
+        self.write(self.OVERRIDDEN, "q" * (1_700 * 4))
+        self.write("templates/agents/zzz.tmpl", "z" * (1_700 * 4))
+        report = vp.validate(self.tmp)
+        hits = [w for w in report.warnings if "zzz.tmpl" in w]
+        self.assertTrue(hits, f"zzz.tmpl inherited the override: {report.warnings!r}")
+        self.assertIn("over the 1,600 budget", hits[0])
+
+    def test_the_override_does_not_leak_onto_the_files_before_it(self):
+        # aaa.tmpl sorts first; a ceiling cannot travel backwards, but the
+        # group entry could have been mutated in place rather than shadowed.
+        self.write("templates/agents/aaa.tmpl", "a" * (1_700 * 4))
+        self.write(self.OVERRIDDEN, "q" * (1_700 * 4))
+        report = vp.validate(self.tmp)
+        hits = [w for w in report.warnings if "aaa.tmpl" in w]
+        self.assertTrue(hits, report.warnings)
+        self.assertIn("over the 1,600 budget", hits[0])
+
+    def test_a_template_with_no_override_is_unaffected(self):
+        # The false-positive guard: the other three templates keep 1,600 and
+        # a file comfortably under it stays silent.
+        self.write("templates/agents/zzz.tmpl", "z" * (1_500 * 4))
+        report = vp.validate(self.tmp)
+        self.assertEqual([w for w in report.warnings if "zzz.tmpl" in w], [],
+                         report.warnings)
+
+
+# --------------------------------------------------------------------------
+# an exemption naming a file nobody wrote exempts nothing
+# --------------------------------------------------------------------------
+
+class ExemptionResolutionTests(PluginTreeMixin, unittest.TestCase):
+    """EXEMPT once carried `templates/agents/README.md` and
+    `examples/fixtures/README.md`. Neither has ever existed here. Both read as
+    a decision somebody made and did nothing whatever, and no run said so
+    because no run looked -- the same silent-no-op shape this validator exists
+    to print instead of swallow."""
+
+    def exempt(self, mapping):
+        """Swap EXEMPT for the duration of one test, restoring it after."""
+        original = vp.EXEMPT
+        vp.EXEMPT = mapping
+        self.addCleanup(setattr, vp, "EXEMPT", original)
+
+    def test_an_exemption_whose_file_is_missing_is_reported(self):
+        os.makedirs(self.path("templates/report"))
+        self.exempt({"templates/report/GHOST.md": "human reference"})
+        report = vp.validate(self.tmp)
+        hits = [w for w in report.warnings if "GHOST.md" in w]
+        self.assertTrue(hits, f"a dead exemption passed silently: {report.warnings!r}")
+        self.assertIn("exempts nothing", hits[0])
+
+    def test_the_reason_is_quoted_so_the_entry_can_be_found(self):
+        os.makedirs(self.path("templates/report"))
+        self.exempt({"templates/report/GHOST.md": "reserved for the style guide"})
+        report = vp.validate(self.tmp)
+        hits = [w for w in report.warnings if "GHOST.md" in w]
+        self.assertIn("reserved for the style guide", hits[0])
+
+    def test_an_exemption_that_resolves_is_silent(self):
+        # The false-positive guard that matters: this fires on every run of
+        # every tree, so a wrong one costs --strict for everybody.
+        self.write("templates/report/STYLE.md", "y" * 40000)
+        self.exempt({"templates/report/STYLE.md": "rationale"})
+        report = vp.validate(self.tmp)
+        self.assertEqual([w for w in report.warnings if "STYLE.md" in w], [],
+                         report.warnings)
+
+    def test_a_root_without_the_directory_at_all_is_not_a_stale_exemption(self):
+        """The scoping rule, asserted rather than left implicit: this
+        validator is run against trees that are not this repository, and
+        `docs/` being absent from one of them is a different tree, not an
+        exemption that went stale."""
+        self.assertFalse(os.path.isdir(self.path("docs")))
+        self.exempt({"docs/RESEARCH.md": "human reference"})
+        report = vp.validate(self.tmp)
+        self.assertEqual([w for w in report.warnings if "RESEARCH.md" in w], [],
+                         report.warnings)
+
+    def test_every_shipped_exemption_resolves_in_this_repository(self):
+        """The regression guard on the real EXEMPT, not on a fixture. Two
+        entries here named files that had never been written; this is the
+        check that says so if it happens again."""
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        missing = [rel for rel in vp.EXEMPT
+                   if not os.path.exists(os.path.join(root, *rel.split("/")))]
+        self.assertEqual(missing, [],
+                         f"EXEMPT names files that do not exist: {missing!r}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

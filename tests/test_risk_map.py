@@ -544,6 +544,135 @@ class TestUnrankedFilesAreNamed(unittest.TestCase):
                 self.assertTrue(json.load(fh)["skipped_files"])
 
 
+class TestWorkingSymlinksAreMeasuredAsLinks(unittest.TestCase):
+    """A tracked symlink whose target exists was followed by open(), so its
+    `lines` counted the TARGET -- possibly a file outside the repository.
+
+    This is not a silent drop: the entry was ranked and visible. It is the
+    other failure the project's rules name, a number that describes something
+    other than the thing it is attached to. git stores a symlink as a blob
+    holding the target path, so `git log --numstat` already measured the
+    churn numerator on the link; only the denominator came from elsewhere,
+    and `relative_churn` divided one file's churn by another file's size.
+
+    The broken and directory cases were already named in `skipped_files` and
+    hand a reader no number at all, so they keep the skip entry they have.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Repo(self._tmp.name)
+        self._outside = tempfile.TemporaryDirectory()
+        self.addCleanup(self._outside.cleanup)
+
+    def _link(self, name, target):
+        os.symlink(target, os.path.join(self._tmp.name, name))
+
+    def _ranked(self, result):
+        return {f["path"]: f for f in result["files"]}
+
+    def _history_with(self, link_name, target):
+        """One commit creating the link, one modifying a sibling, so both the
+        link and the sibling appear in the ranking."""
+        self.repo.write("good.py", 10)
+        self._link(link_name, target)
+        self.repo.commit("initial commit")
+        self.repo.write("good.py", 20)
+        self.repo.commit("fix: touch the sibling")
+        return rm.build(self._tmp.name, since=None)
+
+    def test_a_link_inside_the_repo_is_not_given_its_targets_line_count(self):
+        self.repo.write("big.py", 400)
+        result = self._history_with("alias.py", "big.py")
+        entry = self._ranked(result)["alias.py"]
+        self.assertEqual(entry["lines"], 1,
+                         "a symlink's own content is the target path git "
+                         "stores, which is one line")
+        self.assertNotEqual(entry["lines"], 400,
+                            "400 is big.py's size, not alias.py's")
+
+    def test_a_link_outside_the_repo_never_reports_the_outside_files_size(self):
+        # The case that matters most: git has never seen this file, it is not
+        # in the ranking under any path, and nothing else in the map would
+        # let a reader notice the number came from off the map entirely.
+        outside = os.path.join(self._outside.name, "elsewhere.txt")
+        with open(outside, "w", encoding="utf-8") as fh:
+            fh.write("x\n" * 137)
+        result = self._history_with("outward.link", outside)
+        entry = self._ranked(result)["outward.link"]
+        self.assertEqual(entry["lines"], 1)
+        self.assertNotEqual(entry["lines"], 137,
+                            "137 lines live in a file outside this repository")
+
+    def test_the_entry_says_it_is_a_link_and_names_the_target(self):
+        self.repo.write("big.py", 400)
+        result = self._history_with("alias.py", "big.py")
+        entry = self._ranked(result)["alias.py"]
+        self.assertEqual(entry["symlink"], "big.py")
+        self.assertIn("symbolic link", entry["why"],
+                      "a one-line link and a one-line file are "
+                      "indistinguishable in a ranking unless the row says so")
+        self.assertIn("big.py", entry["why"])
+
+    def test_an_ordinary_file_carries_no_link_target(self):
+        # The marker must stay absent where there is nothing to mark, or it
+        # becomes noise on every row of every map.
+        result = self._history_with("alias.py", "good.py")
+        self.assertIsNone(self._ranked(result)["good.py"]["symlink"])
+
+    def test_churn_and_size_are_measured_on_the_same_blob(self):
+        # Repointing the link is 1 insertion + 1 deletion on a 1-line blob:
+        # numerator and denominator both describe the link. Before the fix
+        # the denominator was the target's size, so the ratio was in no unit
+        # at all.
+        self.repo.write("one.py", 10)
+        self.repo.write("two.py", 900)
+        self._link("alias.py", "one.py")
+        self.repo.commit("initial commit")
+        os.remove(os.path.join(self._tmp.name, "alias.py"))
+        self._link("alias.py", "two.py")
+        self.repo.commit("fix: repoint the alias")
+        entry = self._ranked(rm.build(self._tmp.name, since=None))["alias.py"]
+        self.assertEqual(entry["lines"], 1)
+        self.assertEqual(entry["symlink"], "two.py")
+        self.assertEqual(entry["relative_churn"],
+                         round(entry["churned_lines"] / 1, 4))
+
+    def test_a_link_to_a_directory_keeps_its_named_skip(self):
+        # Adjacent case, deliberately unchanged: it hands a reader no number,
+        # so it is not the defect above, and it is already reported.
+        os.mkdir(os.path.join(self._tmp.name, "pkg"))
+        self.repo.write("pkg/mod.py", 10)
+        result = self._history_with("dirlink", "pkg")
+        skipped = {s["file"]: s["reason"] for s in result["skipped_files"]}
+        self.assertIn("dirlink", skipped)
+        self.assertIn("symbolic link to a directory", skipped["dirlink"])
+        self.assertNotIn("dirlink", self._ranked(result))
+
+    def test_count_lines_does_not_follow_a_link(self):
+        self.repo.write("big.py", 400)
+        self._link("alias.py", "big.py")
+        self.assertEqual(
+            rm.count_lines(os.path.join(self._tmp.name, "big.py")), 400)
+        self.assertEqual(
+            rm.count_lines(os.path.join(self._tmp.name, "alias.py")), 1)
+
+    def test_the_ceiling_does_not_skip_a_link_to_an_oversized_file(self):
+        # getsize() followed the link too, so a link to a 3MB file was
+        # reported as "larger than the 2MB ceiling" -- a true sentence about
+        # the wrong file, and a tracked path dropped from the ranking for it.
+        big = os.path.join(self._outside.name, "huge.txt")
+        with open(big, "w", encoding="utf-8") as fh:
+            fh.write("y\n" * 50)
+        self._history_with("huge.link", big)  # commits it; rebuilt below
+        result = rm.build(self._tmp.name, since=None, max_file_bytes=20)
+        entry = self._ranked(result).get("huge.link")
+        self.assertIsNotNone(entry, "the link is 8 bytes; the ceiling is the "
+                                    "target's business, not the link's")
+        self.assertEqual(entry["lines"], 1)
+
+
 class TestPercentile(unittest.TestCase):
     def test_bounds(self):
         vals = [1.0, 2.0, 3.0, 4.0]

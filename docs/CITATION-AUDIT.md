@@ -20,7 +20,7 @@
 > | N-1: "3 live locations" to delete | 0 — already fixed as option (B) |
 > | A remediation applied to `README.md:47` | no README has ever existed in this repo |
 > | `skills/mutate/SKILL.md` and `arid_nodes.py` carry zero `RESEARCH §` pointers | they carry six |
-> | RESEARCH §12 has no citations | still true of §12; §21 was added and carries three |
+> | RESEARCH §12 has no citations | was true; §21 was added carrying three, and §12 has since been merged into §21 — see *Inside RESEARCH.md* item 1 |
 >
 > Every claim kept in this file was re-checked with `grep -F` on the same day. Where a
 > finding is now closed, it says what was actually done and what command shows it.
@@ -39,8 +39,49 @@ comments and `CHANGELOG.md`. Checked against `docs/RESEARCH.md`, the ledger.
 > those paths are not stale references — they are fabricated evidence, and each is struck
 > out where it appears below.
 >
+> **Amended later the same day: half of that evidence has stopped reproducing, and the
+> half that matters has not.** `find . -name 'README*' -not -path './.git/*'` now returns
+> `./README.md` — an **untracked** file that appeared in the working tree during this
+> session, while another agent was working. `git log --all --diff-filter=A -- README.md`
+> still returns nothing, so the load-bearing sentence above — **no README has ever existed
+> on any ref, in any commit** — is unchanged, and so is the verdict on the findings
+> recorded against that path: a remediation cannot have been applied in 2026-11-12 to a
+> file first written in 2026-11-16. The `find` command is the one to stop quoting; the
+> `git log --all` one is the evidence. `evals/README.md` and `hooks/examples/README.md`
+> are still absent by both tests.
+>
 > **The ledger was edited too**, contrary to this sentence. See the correction under
 > *Dossier* for the measurement.
+
+> **`CHANGELOG.md` was in scope and was never actually audited — found 2026-11-16.** It is
+> named in the scope line above, and it is the one file in that list that **no commit on
+> this branch had touched**: `git log --oneline -- CHANGELOG.md` → a single commit, the
+> initial one. Four claims in its `0.1.0` entry were contradicted by the tree *as the tree
+> stood at `0.1.0`*, so none of these is drift — each was wrong when written, and an audit
+> that listed the file in its scope passed over all four. Each is now corrected in place,
+> and each correction was re-derived from the tree rather than from `HANDOFF.md`:
+>
+> | The entry said | What the tree says | How it was measured |
+> |---|---|---|
+> | "**Eight** testing roles — analyst, unit-test engineer, automation engineer, debugger, QA gatekeeper, reporter, **advisor**, tech scout" | Seven agents. "Advisor" is **`skills/advise/`, a command, not an agent**, and the orchestrator — the actual eighth role — was left out of the list | `ls agents/` → 7 files; `git ls-tree --name-only 8a2f1a1 agents/` → the same 7, so the count was wrong at release too |
+> | "`/testsquad:start` **profiles the project, checks it is safe** to run anything" | Reversed. The safety check is step 3 and the profile is step 4, at `0.1.0` and at HEAD alike | `grep -n '^## ' skills/start/SKILL.md`; same on `git show 8a2f1a1:skills/start/SKILL.md` |
+> | "**every stage** of `start` is one of these and can be re-run on its own" | Three stages have no standalone command: the environment safety check, the profiling pass and the risk map | `grep -rl env_safety_check.py skills/` → `skills/start/SKILL.md` only; same for `risk_map.py` and `project-analyst` |
+> | "**No bug is reported that could not be reproduced**" | 👁 **observed** findings — read in a log or CI artifact, not re-run — do reach the main list and **are** counted | `templates/report/RULES.md`, anchor *"Only ✅ reproduced and 👁 observed appear in the main list"* |
+>
+> **Its research figures, by contrast, all check out.** Every number in the *Research
+> basis* paragraph was `grep -F`-verified against `docs/RESEARCH.md` the same day — 3.84%
+> → 0.46% (§2, and in the stated direction), 12–15% vs 2.0–2.4% (§4), the 10% effective-
+> false-positive ceiling (§7), coverage as a floor detector (§1), and async wait at 45% of
+> Java flakes against *"Async wait is almost absent — 3 instances"* in Python (§19). Rule 2
+> has since been applied: each now carries its section number inline.
+>
+> **One claim was deliberately *not* written into it.** The brief for this pass asserted
+> that `claude plugin validate --strict` "now runs and passes". It does not, and the
+> `CHANGELOG` says so instead: `which claude` → not found, and
+> `.github/workflows/ci.yml` states in its own header comment *"No `claude` CLI job. The
+> CLI is not available on the runners"*. What runs, locally and in CI, is
+> `scripts/validate_plugin.py . --strict` — the stand-in — which passes at **26
+> components, 0 warnings, 0 could not be validated** (measured 2026-11-16).
 
 Not counted as claims: the project's own eval targets in `evals/SCORECARD.md` (they are
 commitments, measured by the suite), illustrative numbers in
@@ -562,14 +603,33 @@ are left for the owner because they change figures.
    and a row should have one source."* This entry reported §20 as carrying the figures §20
    had already rejected, read off two line numbers (`:636-637`) that point at prose, not
    at the table. Nothing to fix.
-2. **§15's "12.5% of mutants ever shown to a developer" and TABLE IV's total survivability
-   of 12.5% are the same digits** — exactly the shape flagged under "Inside RESEARCH.md"
-   item 3 for the two 73%s. They may well both be true (a mutant must survive to be shown,
-   and the shown rate could coincide). **Worth one look at the PDF before publication**;
-   this pass did not resolve it and does not assert either is wrong.
-3. **§20's "~87% of mutant runs kill the mutant"** is supported and slightly conservative:
-   the paper says "Overall, **87.5%** of all generated mutants are killed by the initial
-   test suite."
+2. ~~**§15's "12.5% of mutants ever shown to a developer" and TABLE IV's total survivability
+   of 12.5% are the same digits.**~~ **RESOLVED IN THE LEDGER — re-read 2026-11-16, and the
+   answer is the stronger one: they are not a coincidence and not two measurements, they
+   are one number quoted twice.** Both §15 and §20 now say so in as many words. §15:
+   *"it is **the same quantity** as TABLE 4's total survivability of 12.5%, because the
+   paper defines survivability as surviving the suite *and* being surfaced in code review"*,
+   with the paper's counts — *"16,935,148 mutants were generated, out of which 2,110,489
+   were surfaced"* — and *"Checked against the primary source 2026-11-12."* §20: *"That
+   12.5% is TABLE 4's *total* survivability, and it is **the same quantity** as §15's
+   'mutants ever shown to a developer' row — not an independent corroboration of it"*, and
+   2,110,489 / 16,935,148 = 12.46%. `grep -nF "12.5%" docs/RESEARCH.md` → 4 hits, lines
+   338, 347, 660, 663. **No PDF look is owed.** The one instruction still standing is
+   §20's own: *"Cite it once, in either place, and say which"* — it is currently cited in
+   both, each labelled as the same quantity, which is honest but redundant.
+3. ~~**§20's "~87% of mutant runs kill the mutant"**~~ — **the finding stands, the quotation
+   does not. Corrected 2026-11-16.** `grep -rnF "mutant runs kill the mutant"
+   --exclude-dir=.git .` returns hits in **this file only** — the struck-out quote above and
+   the command recording it, and nothing else anywhere. §20 does not contain that sentence,
+   and neither does any other file in the repository — it was a paraphrase written here and
+   then quoted back as if it were §20's words, which is rule 0's failure in a new shape (an
+   invented anchor phrase rather than a drifted line number). **What §20 actually says**,
+   `grep -F`-verified: *"**87.5% of all generated mutants are killed by the initial test
+   suite**"* — the paper's figure, carried at full precision, not rounded to "~87%" and not
+   restated in terms of "mutant runs". So the underlying claim is not merely supported, it
+   is **verbatim**, and the "slightly conservative" reading was an artefact of comparing the
+   paper against a paraphrase of it. Nothing to fix in `docs/RESEARCH.md`; this entry is
+   what needed fixing.
 4. **§20's "context-based selection beats uniform random by >40% on survivability and ~50%
    on productivity"** is exact: "Context-based selection improves the probability that a
    generated mutant survives by more than 40% and the probability that a generated mutant
@@ -769,16 +829,28 @@ docs/RESEARCH.md` → 95 insertions, 24 deletions.
    opens *"These are the weakest-sourced numbers in this document, and they are labelled
    as such."* Measured: `sed -n '/^## 21\./,/^## 22\./p' docs/RESEARCH.md | grep -c http`
    → **3**; the same count over §12 → **0**.
-   **Still open, and now the sharper form of this finding:** §12 and §21 have *identical
-   headings* and §12 is still the unsourced one. Two sections, one title, one of them
-   citing nothing. Fold §12 into §21 or delete it — an owner call, so it is reported, not
-   taken.
+   **The sharper form of this finding — §12 and §21 sharing one heading, with §12 the
+   unsourced copy — is now CLOSED too, later the same day: §12 was folded into §21.** What
+   was done, and why that order: §21 is the sourced copy, so it stayed; §12 cited nothing
+   for any of the four figures §21 cites for all four, so §12 was the copy that went. **No
+   sourced material was deleted** — every figure, every one of the three links and the
+   *"weakest-sourced numbers in this document"* hedge are still in §21. §12's only two
+   claims that §21 did not already carry (subagents cannot ask for approval mid-task;
+   approval-gated writes therefore stay with the parent) were moved into §21 first, marked
+   there as a platform constraint rather than a research finding, and anchored to
+   `skills/test/SKILL.md`'s *"Keep writes with you where approval might be needed."*
+   (`grep -cF` → 1 hit). The §12 heading is now **"Multi-agent orchestration — merged into
+   §21"**, so the two headings are no longer identical, and the number is kept as a stub
+   rather than reused so §13–§21 keep the numbers every `(RESEARCH §n)` pointer downstream
+   already uses. Nothing outside `docs/RESEARCH.md` ever cited §12: measured before the
+   merge, `grep -rn "§12" . --exclude-dir=.git` returned hits in this file only.
 2. ~~**§12 says "the squad has 8 roles"; `agents/` contains 7 files.**~~ **CLOSED
    2026-11-16.** §21 now answers it in the words this item asked for — *"The squad has
    **eight roles**: seven agent files in `agents/`, plus the orchestrator, which is a skill
    (`skills/test/`) rather than a subagent because it must be able to ask the user
    questions that subagents cannot."* `ls agents/ | wc -l` → **7**, which matches.
-   §12's bare "the squad has 8 roles" is unexplained and goes away with §12.
+   §12's bare "the squad has 8 roles" was unexplained and **is gone** — it went with §12's
+   body in the merge above. `ls agents/ | wc -l` → **7**, re-measured 2026-11-16.
 3. **73% appears twice, for two different systems** — §4 "571 tests, **73% engineer
    acceptance**" (Meta ACH, FSE 2025) and §5 "Of what survived, **73%** was accepted by
    engineers" (TestGen-LLM, FSE 2024). Both may be genuine, but an identical figure
@@ -793,17 +865,39 @@ docs/RESEARCH.md` → 95 insertions, 24 deletions.
    12.57% is ~7.3x; Siddiq's 69.1% vs 1.3% in the same section is ~53x. Downstream
    (`agents/tech-scout.md:35`, `skills/scout/SKILL.md:61-63`) both pairs are listed and
    then summarised as "~7x", which under-reports the second.
-6. **§15 reads as self-contradictory on the cap.** "Hard cap **≤7 mutants per file**" sits
-   in the same table as "Median actually surfaced **2** per changelist (99th pct: **43**)".
-   Different denominators — per file vs per changelist — but the table does not say so.
-7. **§19 rounding:** "**45%** (74/161)" — 74/161 is 46.0%. Keep 45% if that is the
-   paper's own rounding, but the parenthetical invites the reader to check the division.
+6. ~~**§15 reads as self-contradictory on the cap.**~~ **ANSWERED — but in §20, not where
+   the table is.** "Hard cap **≤7 mutants per file**" still sits in §15's table beside
+   "Median actually surfaced **2** per changelist (99th pct: **43**)" with no note
+   (`grep -n "99th pct\|Hard cap" docs/RESEARCH.md` → lines 341–342, 2026-11-16). The
+   explanation exists, one section away: §20 closes with *"The ≤7 cap is per file and the
+   99th-percentile figure of 43 is per changelist."* plus *"denominators differ; they are
+   not comparable numbers"* (`grep -nF "denominators" docs/RESEARCH.md` → 1 hit). A reader
+   of §15 alone still meets the contradiction unexplained. Remaining fix is one
+   cross-reference in §15's table — not a figure change.
+7. ~~**§19 rounding:** "**45%** (74/161)" — 74/161 is 46.0%.~~ **CLOSED — already fixed in
+   the tree.** §19 reads *"**45%** (74/161 — the paper rounds down from 46.0%)"*
+   (`grep -cF "the paper rounds down from 46.0%" docs/RESEARCH.md` → 1, 2026-11-16), which
+   is exactly the disposition this item asked for: the paper's own rounding kept, the
+   division named. Nothing owed.
 
 **URLs:** every link resolves to the paper, post or repository its claim names; none is
 obviously attached to the wrong claim. Two notes: §4's MIST-RL cites alphaxiv rather than
-arXiv, and the 2026 arXiv identifiers (2601.13097, 2603.01409, 2607.22880, 2607.22883,
-2607.28871) could not be verified offline — they should be re-checked before any external
-publication.
+arXiv, and the 2026 arXiv identifiers could not be verified offline — they should be
+re-checked before any external publication.
+
+> **Corrected 2026-11-16 — that list was two identifiers short.** It named 2601.13097,
+> 2603.01409, 2607.22880, 2607.22883 and 2607.28871. **§21 added two more that it does not
+> name: 2608.05263 (OrchestraBench) and 2607.28802 (MAST)**, and both are load-bearing —
+> they are the sources §21 exists to supply, and they are now §12's sources too, since §12
+> was merged into §21. Enumerated with
+> `grep -o 'arxiv.org/[a-z]*/[0-9]\{4\}\.[0-9]*' docs/RESEARCH.md | sed 's#.*/##' | sort -u`,
+> the post-2600 identifiers in the ledger are: **2601.13097, 2607.22880, 2607.22883,
+> 2607.28802, 2607.28871, 2608.05263** — six, not five. (2603.01409 is the alphaxiv
+> MIST-RL link and does not appear as an arxiv.org URL.) §21's third source, the
+> readysolutions.ai write-up, is not peer-reviewed and §21 says so in the sentence that
+> cites it; it is unverified here for the same offline reason. **None of the six has been
+> opened**, so "every link resolves to the paper its claim names" above is **not** a
+> statement about these six.
 
 ## How to keep this clean
 

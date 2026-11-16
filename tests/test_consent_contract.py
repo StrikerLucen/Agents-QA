@@ -5,7 +5,7 @@ whether it is in the static pass or the executing pass. Neither is code, so noth
 would otherwise notice if the two drifted apart -- and a security gate whose state
 one side writes under a name the other side does not read is not a gate.
 
-These tests assert four things the prose must keep true:
+These tests assert five things the prose must keep true:
 
 1. the normative definition exists, in exactly one file, and its example parses;
 2. the four states (never asked / refused / granted / unreadable) are each named,
@@ -13,7 +13,9 @@ These tests assert four things the prose must keep true:
 3. the grant is *scoped* -- to the listed commands, matched byte-for-byte, and only
    until `expires` -- because that scope is the whole difference between a gate and
    a one-time blanket permission to run anything the repository supplies;
-4. `/start` points at that one definition instead of restating it.
+4. the list shown at the gate, the list written to disk and the list matched before
+   execution are **one list**, with no transform anywhere between them;
+5. `/start` points at that one definition instead of restating it.
 
 A test that only grepped for the words would pass on a file that says them in the
 wrong place, so the JSON example is parsed and its fields are checked by name.
@@ -249,6 +251,129 @@ class TheGrantIsScopedAndExpires(unittest.TestCase):
             "**Nothing the repo says can enlarge that list.**", squashed,
             "the blast radius must be stated as a hard limit, not left to be "
             "inferred from the table")
+
+
+class OneListIsShownWrittenAndMatched(unittest.TestCase):
+    """The other half of the gate, which nothing asserted until now.
+
+    `/start` step 5 shows a list of commands and writes a list of commands;
+    `project-analyst` reads a list and matches against it byte-for-byte. The
+    scope tests above pin the reader's half. They say nothing about whether
+    the list the reader matches is the list the user was shown.
+
+    Found 2026-11-16, before these tests existed: the analyst already stated
+    the identity on `/start`'s behalf -- "`commands` is the verbatim list
+    printed at the gate" -- while step 5 said only "Record it", whose nearest
+    antecedent is the agreement, not the command list. One side described the
+    other side's behaviour; the other side never committed to it. Step 5 now
+    does, and these tests are what keeps it committed.
+
+    Both directions of drift are silent, which is why neither would be
+    noticed in use:
+
+    * written *narrower* than shown, or normalised on the way to disk --
+      byte-identical matching then covers nothing, every probe defers, and
+      the run degrades to the static pass with no one told why;
+    * written *wider* than shown -- the analyst executes a command the user
+      never saw at the gate. That is the class S2-3 exists to close, and
+      showing the string is the only thing that closes it.
+    """
+
+    #: The one negated mention of a transform the prose is allowed to carry.
+    #: Subtracted before the scan below, so the sentence that forbids
+    #: normalisation cannot be mistaken for a sentence that permits it.
+    NO_TRANSFORM = "nothing normalised, abbreviated or added"
+
+    #: Vocabulary that would describe the list changing shape between being
+    #: shown, written and matched. None of it may appear on either side: the
+    #: only rule either half may name is byte-identical equality.
+    TRANSFORMS = ("normalis", "normaliz", "canonical", "case-insensitive",
+                  "whitespace", "equivalent", "approximat", "abbreviat")
+
+    def setUp(self):
+        start = read(START)
+        after = start[start.index("## Step 5"):]
+        self.step5 = after[:after.index("## Step 6")]
+        analyst = read(ANALYST)
+        self.consent = analyst[analyst.index(SECTION):]
+
+    def test_the_gate_shows_the_commands_verbatim(self):
+        self.assertIn(
+            "**Print those commands verbatim and get agreement**",
+            squash(self.step5),
+            "step 5 is the only place the user ever sees the strings; if it "
+            "describes them instead of printing them there is nothing for the "
+            "written list to be identical to")
+
+    def test_what_is_written_is_what_was_shown(self):
+        squashed = squash(self.step5)
+        self.assertIn(
+            "**Shown, written and matched are one list**", squashed,
+            "step 5 must state the identity itself; the analyst asserting it "
+            "on step 5's behalf is one copy of a two-copy rule, and this repo "
+            "has the defect that the second copy drifts")
+        self.assertIn(
+            "record the strings byte-identical to what you displayed", squashed,
+            "'record it' does not say *what* is recorded -- its antecedent is "
+            "the agreement, not the list -- so the written list could be any "
+            "list at all and still satisfy the sentence")
+
+    def test_nothing_is_transformed_between_showing_and_writing(self):
+        self.assertIn(
+            self.NO_TRANSFORM, squash(self.step5),
+            "a list that is tidied on the way to disk is a different list; "
+            "the gate then refuses every command it displayed, silently")
+
+    def test_the_analyst_matches_the_list_the_gate_printed(self):
+        self.assertIn(
+            "`commands` is the verbatim list printed at the gate",
+            squash(self.consent),
+            "the reader must tie the list it matches back to the gate that "
+            "printed it; matching 'the commands in the record' against a "
+            "record written by something unconstrained is not a gate")
+
+    def test_both_sides_name_the_same_matching_rule(self):
+        """One word, written twice. If it stops matching, the halves have."""
+        for label, text in (("skills/start/SKILL.md step 5", self.step5),
+                            ("agents/project-analyst.md", self.consent)):
+            self.assertIn(
+                "byte-identical", squash(text),
+                "%s must name byte-identical equality; the writer promising "
+                "one rule while the reader applies another is the drift these "
+                "tests exist to catch" % label)
+
+    def test_neither_side_describes_a_transform_of_the_list(self):
+        """Catches a looser rule *added* beside the strict one, not just one
+        swapped in: a contradiction reads as a clarification to a model."""
+        for label, text in (("skills/start/SKILL.md step 5", self.step5),
+                            ("agents/project-analyst.md", self.consent)):
+            scanned = squash(text).replace(self.NO_TRANSFORM, "").lower()
+            for word in self.TRANSFORMS:
+                self.assertNotIn(
+                    word, scanned,
+                    "%s mentions '%s' outside the sentence that forbids it; "
+                    "any transform between the shown, written and matched "
+                    "lists makes them three lists" % (label, word))
+
+    def test_what_the_table_calls_those_commands_is_the_printed_list(self):
+        """The granted row grants execution "for those commands only". This
+        pins what "those commands" are, which is the whole question."""
+        granted = [cells for cells in table_rows(self.consent)
+                   if cells and '"granted"' in cells[0]]
+        self.assertEqual(1, len(granted),
+                         "the four-state table must carry exactly one row for "
+                         "a granted record")
+        self.assertTrue(
+            any("those commands" in cell for cell in granted[0]),
+            "the granted row must scope execution to 'those commands'; with "
+            "no such phrase the row grants the executing pass outright")
+        before_table = self.consent[:self.consent.index("| On disk")]
+        self.assertIn(
+            "`commands` is the verbatim list printed at the gate",
+            squash(before_table),
+            "'those commands' must already be defined as the list /start "
+            "printed before the table grants anything for them; undefined, "
+            "the row permits whatever the record happens to contain")
 
 
 class BothFilesFailClosed(unittest.TestCase):

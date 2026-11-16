@@ -36,6 +36,8 @@ or are writing the reporter itself. This file is what you follow.
 - **Every number links to its proof** — the exact command, copy-pasteable.
 - **Never a number you did not measure.** "not measured" is a valid answer; 0% is not.
 - **Severity (S1–S4) is computed; priority is proposed and needs a human.**
+  S1 data loss, a secret exposed or money wrong, no workaround · S2 core flow broken,
+  workaround exists · S3 degraded but contained · S4 cosmetic.
 - **Colour is never the only signal** — every status carries a word or icon.
 - **No secrets, ever.** Key names and redacted previews only.
 - **Coverage is never a headline score.** Report which high-risk code is untested.

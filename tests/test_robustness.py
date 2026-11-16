@@ -535,11 +535,37 @@ class EncodingTests(TempMixin, unittest.TestCase):
         self.assertEqual(result["summary"]["files_scanned"], 1)
 
     def test_flake_smells_skips_a_file_with_a_nul_byte(self):
+        """A binary file must be NAMED as skipped, and for the right reason.
+
+        The reason is asserted on its stable half -- that the record exists
+        and identifies the file as binary -- not on the whole sentence. This
+        test used to pin the exact string "unreadable or binary", and a
+        strictly better message broke it: that wording answered a permission
+        error, a broken symlink and a NUL-byte file identically, and the
+        three need three different reactions from a reader. The sentence will
+        be improved again; what must not change is that the skip is recorded
+        and that it says "binary".
+        """
         self.write("test_a.py", b"def test_x():\n\x00    assert 1\n", binary=True)
         result = fsm.scan_paths([self.tmp])
         self.assertEqual(result["summary"]["files_scanned"], 0)
-        self.assertEqual(result["summary"]["skipped"][0]["reason"],
-                         "unreadable or binary")
+        skipped = result["summary"]["skipped"]
+        self.assertEqual(len(skipped), 1, skipped)
+        self.assertIn("test_a.py", skipped[0]["path"])
+        reason = skipped[0]["reason"]
+        self.assertIn("binary", reason)
+        # The same file must not ALSO be called unreadable: "I was denied
+        # permission" and "this is not source text" are different facts and
+        # a reader acts differently on each.
+        self.assertNotIn("unreadable", reason)
+        # And the same fact is worded the same way across the scripts that
+        # state it: risk_map.py, arid_nodes.py and flake_smells.py all emit
+        # this prefix for this condition, and only the tail -- what the
+        # individual tool could not do with the file -- differs. Divergence
+        # between copies of one rule is this repository's most frequent
+        # defect, so the shared half is pinned here rather than left to
+        # three independent wordings.
+        self.assertIn("NUL byte in the first 8000 bytes", reason)
 
     @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
     def test_arid_nodes_handles_latin1_and_nul(self):
@@ -548,6 +574,38 @@ class EncodingTests(TempMixin, unittest.TestCase):
         result = arid.plan([self.tmp])
         # The latin-1 file is planned; the NUL file is dropped as binary.
         self.assertEqual(result["summary"]["files"], 1)
+        # And the drop says WHICH of the three things happened, in the same
+        # words flake_smells.py and risk_map.py use for the same fact.
+        reason = result["skipped_files"][0]["reason"]
+        self.assertIn("NUL byte in the first 8000 bytes", reason)
+        self.assertNotIn("unreadable", reason)
+
+    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    def test_arid_nodes_does_not_publish_a_secret_in_a_snippet(self):
+        """docs/SECURITY-REVIEW.md S3-1, the arid_nodes half.
+
+        The mutation plan carries up to 100 characters of verbatim source
+        into `.testing/` (which skills/start/SKILL.md says to commit), the CI
+        job log and the uploaded artifact. A fixture holding a real-shaped
+        token must not ride along -- and the readable parts of the line must
+        survive, or the plan cannot be reviewed and gets ignored.
+        """
+        self.write("a.py",
+                   'def charge(amount):\n'
+                   '    key = "sk_live_4eC39HqLyjWDarjtT1zdp7dcAbCdEfGh"\n'
+                   '    host = "localhost"\n'
+                   '    if amount > 0:\n'
+                   '        return bill(key, host, amount)\n'
+                   '    return None\n')
+        result = arid.plan([self.tmp])
+        self.assertTrue(result["summary"]["redaction"]["applied"],
+                        result["summary"]["redaction"])
+        blob = json.dumps(result)
+        self.assertNotIn("sk_live_4eC39", blob,
+                         "a live-shaped key reached the mutation plan")
+        # The opposite false positive, and the one that kills the tool: a
+        # plan whose snippets all read "[redacted]" cannot be reviewed.
+        self.assertIn("localhost", blob)
 
 
 # --------------------------------------------------------------------------

@@ -165,8 +165,8 @@ every future task here, so a lesson without evidence does not get written.
 - The behaviour list, with which items you covered and which you did not, and why.
 - Each test file written, and the command to run it.
 - **Fail-proof results**: for each test, the mutation applied and confirmation it went red.
-- Product bugs found: repro, expected vs actual, `file:line`, severity (S1 data loss or
-  money wrong · S2 feature broken · S3 limited case · S4 cosmetic). Propose a priority;
-  never set one.
+- Product bugs found: repro, expected vs actual, `file:line`, severity (S1 data loss, a
+  secret exposed or money wrong, no workaround · S2 core flow broken, workaround exists ·
+  S3 degraded but contained · S4 cosmetic). Propose a priority; never set one.
 - Anything you could not test, and what is blocking it.
 - Your lesson entry.

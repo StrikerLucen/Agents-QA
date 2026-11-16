@@ -168,11 +168,11 @@ VERDICT: 2 of 3 criteria met — NOT DONE
 Then, and only if they exist:
 
 - **Rejected tests** — each with the rule it broke and why it cannot fail.
-- **Product bugs found** — repro steps, expected vs actual, `file:line`, severity
-  (S1 data loss or money wrong · S2 feature broken · S3 limited case · S4 cosmetic).
+- **Product bugs found** — repro steps, expected vs actual, `file:line`.
   **Propose a priority, never set one** — when to fix is a business call.
-  State the evidence level, per `${CLAUDE_PLUGIN_ROOT}/templates/report/RULES.md`, which
-  is the authority on the badges and on which of them a main list admits. A problem with
+  State the severity and the evidence level, per
+  `${CLAUDE_PLUGIN_ROOT}/templates/report/RULES.md`, which is the authority on the S1–S4
+  scale, on the badges and on which of them a main list admits. A problem with
   the *testing* — broken fixture, dead environment, flaky test — is an **issue**, not a
   bug, and is listed separately; the badge is a separate axis from that split.
 - **Blockers** — `BLOCKED` or `NEEDS_PERMISSION` with exactly what you need.

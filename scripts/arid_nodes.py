@@ -96,6 +96,72 @@ from atomic_io import write_text_atomic  # noqa: E402
 
 SCHEMA = "testsquad.aridnodes/1"
 
+
+# --------------------------------------------------------------------------
+# snippet redaction -- docs/SECURITY-REVIEW.md S3-1
+# --------------------------------------------------------------------------
+# Every finding carries up to 100 characters of verbatim source, and that
+# goes three places a secret must not: `.testing/`, which
+# `skills/start/SKILL.md` tells people to commit; the CI job log, which is
+# public on a public repository; and the uploaded artifact. A fixture holding
+# a real-shaped token -- `TEST_API_KEY = "sk_live_..."`, precisely the thing
+# `env_safety_check.py` exists because people do -- is copied into all three
+# the moment any rule fires on that line.
+#
+# The patterns are NOT redefined here. `pr_comment.py` already has a
+# `redact()` that reuses `env_safety_check`'s own `VENDOR_TOKEN_RES`,
+# `AWS_KEY_RE`, `STRIPE_LIVE_RE` and `AZURE_CONN_RE`, so this is the third
+# consumer of one definition rather than a third copy of it. Two copies of a
+# rule drifting apart is this repository's most frequent defect, and a
+# redaction rule that is right in one copy and stale in another leaks exactly
+# the shapes the stale copy has not heard of.
+#
+# The false-positive direction matters here too, and in the opposite sense to
+# a detector: over-redaction destroys the thing the snippet is for. A finding
+# whose evidence reads `[redacted]` cannot be judged, so it gets ignored, and
+# the gate goes with it. Nothing is added on top of `pr_comment.redact()`,
+# which is already calibrated for readability -- its key-name pattern keeps
+# the key name and drops only the value, and its length/charset/entropy gate
+# leaves `localhost` and `change-me-later` legible.
+#
+# The import is lazy and may fail (this gate runs when other things are
+# broken). If it does, snippets are emitted VERBATIM and the report says so,
+# in `summary.redaction` and on stderr -- an unredacted report that claims to
+# be redacted is worse than one that admits it is not.
+_REDACTOR = None
+
+
+def _redactor():
+    """(fn | None, source | None, reason | None). Resolved once."""
+    global _REDACTOR
+    if _REDACTOR is None:
+        try:
+            from pr_comment import redact as _fn
+            _REDACTOR = (_fn, "pr_comment.redact", None)
+        except Exception as exc:   # pragma: no cover - depends on sys.path
+            _REDACTOR = (None, None,
+                         "scripts/pr_comment.py could not be imported "
+                         "(%s: %s), so the snippets below are VERBATIM "
+                         "SOURCE and have NOT been checked for credentials"
+                         % (type(exc).__name__, exc))
+    return _REDACTOR
+
+
+def redact_snippet(text: str) -> str:
+    """Secret-shaped runs removed. Call this BEFORE truncating to 100
+    characters: half a key is still a leak, and truncating first would
+    publish the half that fell inside the window."""
+    fn = _redactor()[0]
+    return fn(text) if fn is not None else text
+
+
+def redaction_status() -> dict:
+    """What the reader needs to know about the line above -- `applied: false`
+    is a different report from `applied: true`, and must not read the same."""
+    fn, source, reason = _redactor()
+    return ({"applied": True, "source": source} if fn is not None
+            else {"applied": False, "source": None, "reason": reason})
+
 # Same ceiling and same reasoning as flake_smells.MAX_FILE_BYTES and
 # env_safety_check.MAX_BYTES: read_lines() holds the bytes, the decoded text
 # and the line list at once, and a 49MB generated file was measured at 45s and
@@ -1406,7 +1472,13 @@ class FileScan:
         return self._by_line.get(line)
 
     def snippet(self, line: int) -> str:
-        s = self.raw[line - 1].strip() if 0 < line <= len(self.raw) else ""
+        # Redact first, truncate second: a token straddling the 100-character
+        # boundary would otherwise have its first 97 characters published.
+        # This is the single value used everywhere downstream -- the planned
+        # mutation, the suppression record AND the operator hash -- so there
+        # is never a redacted copy next to an unredacted one.
+        s = (redact_snippet(self.raw[line - 1]).strip()
+             if 0 < line <= len(self.raw) else "")
         return s[:97] + "..." if len(s) > 100 else s
 
     def prev_code_line(self, line: int) -> int | None:
@@ -1765,7 +1837,7 @@ def analyse_file(path: str, raw: list[str], lang: str, *, seed: int = 0,
         if applies:
             entry["suppressed"].append({
                 "line": 1,
-                "snippet": (raw[0].strip()[:97] if raw else ""),
+                "snippet": (redact_snippet(raw[0]).strip()[:97] if raw else ""),
                 "rule": rule,
                 "scope": "file",
                 "why": RULES[rule]["why"],
@@ -1854,32 +1926,54 @@ def iter_paths(paths: list[str]):
             yield p
 
 
-def read_lines_bounded(path: str, *, max_bytes: int = MAX_FILE_BYTES,
-                       max_line_chars: int = MAX_LINE_CHARS
-                       ) -> tuple[list[str] | None, list[dict]]:
-    """(lines, truncated) -- lines is None for an unreadable, binary or
-    oversized file; `truncated` lists every line whose tail was NOT read.
+def read_lines_detailed(path: str, *, max_bytes: int = MAX_FILE_BYTES,
+                        max_line_chars: int = MAX_LINE_CHARS
+                        ) -> tuple[list[str] | None, list[dict], str | None]:
+    """(lines, truncated, why_not) -- lines is None when the file was not
+    read; `why_not` then says which of the three reasons it was.
 
-    The second element exists so the caller cannot report silence about text
-    it shortened. A mutation planner that crashes on one odd file blocks the
-    whole run, so this never raises.
+    `truncated` exists so the caller cannot report silence about text it
+    shortened. `why_not` is the same argument one level up: the caller
+    already recorded every unread file in `skipped_files`, but under a single
+    string -- "unreadable or binary" -- that collapsed three causes needing
+    three different reactions. A permission error or a broken symlink is
+    wrong with the CHECKOUT; a NUL-byte file is a file that is not source;
+    an oversize file is a ceiling this tool chose and can raise. The wording
+    follows `risk_map.py`'s `skip_reason()` rather than inventing a fourth
+    phrasing of the same idea. `flake_smells.py` carries the identical
+    change, deliberately word-for-word: two copies of one rule drifting apart
+    is this repository's most frequent defect.
+
+    Measured, so it is not guessed at: there is NO fourth cause.
+    `latin-1` maps all 256 byte values, so `blob.decode("latin-1")` cannot
+    raise on a bytes input -- verified over every single byte and over a
+    200,000-byte random blob on CPython 3.14.6. The `except Exception` that
+    used to guard it was unreachable, and a reachable-looking guard around an
+    unreachable branch tells a reader a case is handled when nothing handles
+    it. It is gone; if a future encoding change makes decoding fallible
+    again it must come back WITH a reason string, not a bare `return None`.
+
+    A mutation planner that crashes on one odd file blocks the whole run, so
+    this never raises.
     """
     try:
         if os.path.getsize(path) > max_bytes:
-            return None, []
+            return None, [], (f"larger than {max_bytes} bytes "
+                              f"({max_bytes // (1024 * 1024)}MB ceiling); "
+                              "raise --max-file-bytes to plan it")
         with open(path, "rb") as fh:
             blob = fh.read()
-    except OSError:
-        return None, []
+    except OSError as exc:
+        return None, [], (f"unreadable ({exc.strerror or exc}); the file was "
+                          "NOT planned and nothing here is a verdict on it")
     if b"\x00" in blob[:8000]:
-        return None, []
+        return None, [], ("binary (a NUL byte in the first 8000 bytes); it "
+                          "carries a source extension but is not source "
+                          "text, so it was NOT planned")
     try:
         text = blob.decode("utf-8")
     except UnicodeDecodeError:
-        try:
-            text = blob.decode("latin-1")
-        except Exception:
-            return None, []
+        text = blob.decode("latin-1")
 
     lines: list[str] = []
     truncated: list[dict] = []
@@ -1897,7 +1991,18 @@ def read_lines_bounded(path: str, *, max_bytes: int = MAX_FILE_BYTES,
             })
             line = line[:max_line_chars]
         lines.append(line)
-    return lines, truncated
+    return lines, truncated, None
+
+
+def read_lines_bounded(path: str, *, max_bytes: int = MAX_FILE_BYTES,
+                       max_line_chars: int = MAX_LINE_CHARS
+                       ) -> tuple[list[str] | None, list[dict]]:
+    """Back-compatible wrapper: (lines, truncated). Prefer
+    read_lines_detailed(), which also hands back WHY the file was not read --
+    a caller that cannot tell "I lacked permission" from "this is not source"
+    has to report both as the same thing."""
+    return read_lines_detailed(path, max_bytes=max_bytes,
+                               max_line_chars=max_line_chars)[:2]
 
 
 def read_lines(path: str, *, max_bytes: int = MAX_FILE_BYTES) -> list[str] | None:
@@ -1933,22 +2038,19 @@ def plan(paths: list[str], *, seed: int = 0, max_per_file: int = 7,
                 # Not in the diff. Silence, not a finding: a mutation gate
                 # scoped to a change has nothing to say about untouched files.
                 continue
-        raw, cut = read_lines_bounded(path, max_bytes=max_bytes,
-                                      max_line_chars=max_line_chars)
+        raw, cut, why_not = read_lines_detailed(path, max_bytes=max_bytes,
+                                                max_line_chars=max_line_chars)
         truncated_lines.extend(cut)
         if raw is None:
             # A file with no mutants and a file nobody opened produce the same
-            # empty result, so the second one has to say so.
-            try:
-                oversized = os.path.getsize(path) > max_bytes
-            except OSError:
-                oversized = False
+            # empty result, so the second one has to say so -- and say WHICH
+            # of the three things happened. The reason used to be re-derived
+            # here by a second getsize(), a second copy of a rule that
+            # answered "unreadable or binary" to everything the ceiling had
+            # not caught.
             skipped_files.append({
                 "file": path,
-                "reason": (f"larger than {max_bytes} bytes "
-                           f"({max_bytes // (1024 * 1024)}MB ceiling); "
-                           "raise --max-file-bytes to plan it")
-                if oversized else "unreadable or binary",
+                "reason": why_not or "not read, and the reader did not say why",
             })
             continue
         entry = analyse_file(path, raw, lang, seed=seed, max_per_file=max_per_file,
@@ -2005,6 +2107,10 @@ def plan(paths: list[str], *, seed: int = 0, max_per_file: int = 7,
         "unparsed_files": unparsed_files,
         "files": files,
         "summary": {
+            # S3-1: snippets are verbatim source, so the report has to say
+            # whether anything filtered them. `applied: false` must never be
+            # mistaken for "nothing matched".
+            "redaction": redaction_status(),
             "files": len(files),
             "files_skipped": len(skipped_files),
             "files_ast_unparsed": len(unparsed_files),
@@ -2122,6 +2228,10 @@ def main(argv: list[str] | None = None) -> int:
             write_text_atomic(args.out, payload + "\n")
         else:
             print(payload)
+        red = result["summary"].get("redaction") or {}
+        if not red.get("applied"):
+            print("warning: snippets NOT redacted: %s" % red.get("reason"),
+                  file=sys.stderr)
         for entry in result["skipped_files"]:
             print(f"warning: not planned: {entry['file']}: {entry['reason']}",
                   file=sys.stderr)

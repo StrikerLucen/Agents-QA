@@ -108,10 +108,17 @@ did not know about are too.
 ## 4. Next, in priority order
 
 1. **Run the evals.** `cd evals && claude plugin eval`, then fill in `SCORECARD.md`.
-   This is still the only thing that converts the README's claims from intent into
-   evidence. **Blocked:** the `claude` CLI is not installed on this machine.
-2. **Run `claude plugin validate --strict`.** Never done. `scripts/validate_plugin.py`
-   is a stand-in, not a substitute. Same blocker.
+   This is still the only thing that converts the eleven behavioural claims from design
+   intent into evidence. `README.md` makes no behavioural claim and says why, under
+   *Read this before you believe anything else here*; when the scorecard is filled in,
+   that section is what changes. **Blocked only by the run itself** — the `claude` CLI
+   IS installed, at `~/.local/bin/claude` (2.1.276). It is not on the default PATH, so
+   `which claude` reports it missing; export the path first. That single fact blocked
+   this item for a whole session and was recorded as "not installed" three times.
+2. *(closed)* **`claude plugin validate --strict` passes**, run 2026-11-16. It is not a
+   superset of `scripts/validate_plugin.py --strict`: the CLI validates the marketplace
+   manifest only and says nothing about the other 25 components, so the stand-in is
+   still the thing checking them. Neither runs in CI (not on the runners).
 3. **Decisions that are yours, not an agent's** — each was deliberately left:
    - *(closed)* `RecursionError` escaping `ast.parse` is fixed at all three production
      sites — `arid_nodes.py`, `flake_smells.py`, `project_state.py` — each reporting an

@@ -231,24 +231,21 @@ measured GPT-3.5 at **69.1% line coverage on HumanEval-Java and 1.3% on SF110**
 **Design consequence:** our own evals run on seeded fixtures with known answers,
 and any public benchmarking uses ULT and SWT-Bench Verified only.
 
-## 12. Multi-agent orchestration: the cost knee
+## 12. Multi-agent orchestration — merged into §21
 
-- Cost **bottoms out at ~4–6 subagents and rises after**. A 4-agent system can
-  burn 10x a single agent; past ~6 hand-offs, roughly 4x the cost for half the
-  success rate.
-- Under *equal token budgets*, single-agent beat sequential multi-agent on
-  multi-hop reasoning (0.418–0.427 vs 0.379–0.389).
-- Known failure modes (MAST taxonomy): ambiguous delegation, tool-invocation
-  error, **context pollution**, conflicting sub-agent outputs, premature action.
-- A researcher given 4 dimensions and ~20 fetches exhausted its budget and
-  returned **zero salvageable output** — give each specialist one dimension and a
-  hard tool-call budget.
-- **Subagents cannot ask for approval mid-task.** Investigation belongs in
-  subagents; approval-gated writes belong in the parent.
+**Folded into [§21](#21-multi-agent-orchestration-the-cost-knee) on 2026-11-16.** This
+section and §21 carried the *same heading* and the same four figures; §12 cited nothing
+for any of them and §21 cites all of them, so §12 was the copy that went. Nothing sourced
+was removed: §21 keeps every figure, plus the three sources §12 lacked and the hedge that
+labels them directional. §12's two claims that were not already in §21 — that subagents
+cannot ask for approval mid-task, and that writes therefore stay with the parent — moved
+there verbatim.
 
-**Design consequence:** the squad has 8 roles but the orchestrator **selects 2–4
-per run** based on the diff. Workers are read-only where possible; writes stay
-with the parent.
+The number is left as this stub rather than reused, so that §13–§21 keep the numbers every
+`(RESEARCH §n)` pointer downstream already uses. Nothing outside this file cited §12:
+measured before the merge, `grep -rn "§12" . --exclude-dir=.git` returned hits in
+`docs/CITATION-AUDIT.md` only — no agent, skill, stack, template or script pointed here.
+Re-run now, it also returns this stub.
 
 ## 13. What already exists (so we don't rebuild it)
 
@@ -743,6 +740,11 @@ weakest-sourced numbers in this document, and they are labelled as such.
 - A researcher given four dimensions and ~20 fetches exhausted its budget and returned
   **zero salvageable output**, which is why each specialist gets one dimension and a hard
   tool-call budget.
+- **Subagents cannot ask for approval mid-task.** This is a platform constraint, not a
+  research finding, and it has no citation because none is needed: investigation belongs
+  in subagents, approval-gated writes belong in the parent, and workers stay read-only
+  wherever that is possible. `skills/test/SKILL.md` states the same rule under *"Keep
+  writes with you where approval might be needed."*
 
 **Treat the cost figures as directional.** They justify "select a few agents, not all of
 them"; they do not justify a precise optimum. The squad has **eight roles**: seven agent

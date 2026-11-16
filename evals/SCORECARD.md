@@ -60,8 +60,18 @@ Depth invariance (claim 6): `<the scorer's note>`
 >
 > Measured `<YYYY-MM-DD>` on `<model>`, `<n>` runs. Method and cases in `evals/`.
 
-If either number is below its claim, the README claim is corrected in the same
-commit as this file. The numbers move together or not at all.
+If either number is below its claim, every page that publishes that number is
+corrected in the same commit as this file. The numbers move together or not at
+all.
+
+As of 2026-11-16 that is an empty list, and deliberately so: the `README.md`
+added that day publishes **no** behavioural rate. It says instead that every
+behavioural claim here is design intent, not evidence, until this file has
+numbers in it. So there is no README rate to correct yet — not an oversight,
+and not something to fix by adding one. The rule above is written for the commit
+that fills this template in: if that commit also puts a rate on another page, the
+rate and this file move together, and if it cannot, the rate does not go on that
+page at all.
 
 ## Flake matrix (claim 7), per cell
 
@@ -106,4 +116,8 @@ Oldest last. Keep every row, including bad ones.
   and noisier than a seeded fixture.
 - Claims 6 and 11 are checked indirectly (identical graders across paired cases;
   on-disk file state after a re-run) rather than by diffing two verdicts
-  directly. See `evals/README.md`.
+  directly. The pairing is recorded in `evals/harness/claims.json`, which maps
+  each claim to its cases; the graders themselves are in each case's `graders/`.
+  *(This pointed at `evals/README.md` until 2026-11-16. No such file exists or
+  ever has — `ls evals/` lists the 27 case directories, `harness/` and this
+  file — so the one caveat whose method needed looking up sent you nowhere.)*

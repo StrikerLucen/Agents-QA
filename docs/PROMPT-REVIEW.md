@@ -22,7 +22,7 @@ nothing in the tree was edited by it.
 > | Broken references: `coverage-current.json` | **CLOSED** — the file no longer exists anywhere |
 > | Broken references: `arid_nodes.py` "invoked nowhere" | **WITHDRAWN** — `/testsquad:mutate` invokes it |
 > | Broken references: 3 agents "referenced by no skill" | **WITHDRAWN** — all three are referenced |
-> | L24 and contradiction #18, quoting `README.md:25` | **WITHDRAWN — fabricated.** No README has ever existed |
+> | L24 and contradiction #18, quoting `README.md:25` | **WITHDRAWN — fabricated.** No README existed when the quotation was attributed to one. A `README.md` was added 2026-11-16, after the withdrawal; it does not contain the quoted line. See L24 |
 > | `hooks/examples/README.md` | **does not exist** — that directory holds three `.json` files |
 >
 > Line numbers into `templates/report/RULES.md` were also all wrong by exactly 7 (this
@@ -536,6 +536,16 @@ gap against a numbered criterion is never minor."*
   ("repair it rather than deleting it" vs "Reject it"), but they are reconcilable — the
   gatekeeper rejects the *round*, the engineer repairs the *test* — so without the invented
   third party there is no finding here.
+
+  **Note, 2026-11-16 (same day, later).** A `README.md` was added to this repository after
+  the withdrawal above was written, so the two commands quoted in it no longer return
+  nothing — `find . -name 'README*' -not -path './.git/*'` now returns `./README.md`. The
+  withdrawal is unchanged and still correct on its merits: re-checked against the new file,
+  `grep -ni delet README.md` returns nothing, and `README.md:25` is a sentence about
+  unreplaced scorecard placeholders. The quotation was invented then and is still not
+  there now. The paragraph is kept as written, with its commands, because it is the
+  evidence that a verbatim quotation was once attributed to a file nobody had written —
+  and a record that is edited into agreement with the present is no longer a record.
 - **L25.** Unfalsifiable instructions, each costing context and checking nothing. With
   checkable replacements:
 
@@ -570,7 +580,7 @@ gap against a numbered criterion is never minor."*
 | 15 | `start/SKILL.md:203` `diagnostic-<date>.html` | `report/SKILL.md:89` `dashboard-<date>.html` | **B** |
 | 16 | ~~`diagnose/SKILL.md` `coverage-raw.json`~~ | ~~`templates/ci/…yml` `coverage-current.json`~~ | ✅ **CLOSED, as A** — both now say `coverage-raw.json`; `coverage-current.json` exists nowhere |
 | 17 | `unit-test-engineer.md:82-84` testid exception | `ts-unit-test-engineer…:64` no exception | **A**, and port it to both templates |
-| 18 | ~~`README.md:25` non-discriminating test is deleted~~ | ~~`unit-test-engineer.md:128` repair, don't delete~~ | ❌ **WITHDRAWN — fabricated.** No `README.md` has ever existed in this repo, so there is no Claim A; see L24 |
+| 18 | ~~`README.md:25` non-discriminating test is deleted~~ | ~~`unit-test-engineer.md:128` repair, don't delete~~ | ❌ **WITHDRAWN — fabricated.** No `README.md` existed in this repo when this was written, so there was no Claim A. One was added 2026-11-16 and does not make the claim either; re-checked, still withdrawn. See L24 |
 
 ---
 

@@ -28,8 +28,10 @@ python3 scripts/validate_plugin.py . --strict
 python3 scripts/flake_smells.py tests scripts --fail-on block
 ```
 
-`python3 -m unittest discover` does **not** work from inside `tests/` in this layout.
 Use the form above; it is what CI runs and what every contributor runs locally.
+`python3 -m unittest discover` also works — measured 2026-11-16, same tests, same
+result. An earlier version of this file said it did not; that was never measured. If
+you get a wall of failures from *either* form, you skipped the fixture regeneration.
 
 The second gate enforces context budgets as well as manifest validity: 3,500 tokens per
 agent, 3,000 per skill, 1,600 per agent template. Prose costs tokens on every single
@@ -98,8 +100,10 @@ adjacent one. `docs/CITATION-AUDIT.md` tracks this.
 The deterministic core in `scripts/` is tested. The seven agents and sixteen commands
 in `agents/` and `skills/` are prompts, and the eleven claims in `evals/` are
 falsifiable but unscored. Until `evals/SCORECARD.md` has numbers, every behavioural
-claim about agent conduct is **design intent, not evidence** — and the README should
-keep saying so.
+claim about agent conduct is **design intent, not evidence** — and `README.md` says so
+in those words, in its opening section. Keep it saying so until the evals run, and if
+you add a claim to the README, add the measurement with it or do not add the claim.
 
+`README.md` is what a user reads first; it states only what the three gates enforce.
 `CLAUDE.md` holds the working notes for developing the plugin. `HANDOFF.md` holds the
 current measured state.

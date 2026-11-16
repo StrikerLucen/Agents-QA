@@ -82,6 +82,72 @@ SEVERITIES = ("block", "warn", "info")
 
 
 # --------------------------------------------------------------------------
+# snippet redaction -- docs/SECURITY-REVIEW.md S3-1
+# --------------------------------------------------------------------------
+# Every finding carries up to 100 characters of verbatim source, and that
+# goes three places a secret must not: `.testing/`, which
+# `skills/start/SKILL.md` tells people to commit; the CI job log, which is
+# public on a public repository; and the uploaded artifact. A fixture holding
+# a real-shaped token -- `TEST_API_KEY = "sk_live_..."`, precisely the thing
+# `env_safety_check.py` exists because people do -- is copied into all three
+# the moment any rule fires on that line.
+#
+# The patterns are NOT redefined here. `pr_comment.py` already has a
+# `redact()` that reuses `env_safety_check`'s own `VENDOR_TOKEN_RES`,
+# `AWS_KEY_RE`, `STRIPE_LIVE_RE` and `AZURE_CONN_RE`, so this is the third
+# consumer of one definition rather than a third copy of it. Two copies of a
+# rule drifting apart is this repository's most frequent defect, and a
+# redaction rule that is right in one copy and stale in another leaks exactly
+# the shapes the stale copy has not heard of.
+#
+# The false-positive direction matters here too, and in the opposite sense to
+# a detector: over-redaction destroys the thing the snippet is for. A finding
+# whose evidence reads `[redacted]` cannot be judged, so it gets ignored, and
+# the gate goes with it. Nothing is added on top of `pr_comment.redact()`,
+# which is already calibrated for readability -- its key-name pattern keeps
+# the key name and drops only the value, and its length/charset/entropy gate
+# leaves `localhost` and `change-me-later` legible.
+#
+# The import is lazy and may fail (this gate runs when other things are
+# broken). If it does, snippets are emitted VERBATIM and the report says so,
+# in `summary.redaction` and on stderr -- an unredacted report that claims to
+# be redacted is worse than one that admits it is not.
+_REDACTOR = None
+
+
+def _redactor():
+    """(fn | None, source | None, reason | None). Resolved once."""
+    global _REDACTOR
+    if _REDACTOR is None:
+        try:
+            from pr_comment import redact as _fn
+            _REDACTOR = (_fn, "pr_comment.redact", None)
+        except Exception as exc:   # pragma: no cover - depends on sys.path
+            _REDACTOR = (None, None,
+                         "scripts/pr_comment.py could not be imported "
+                         "(%s: %s), so the snippets below are VERBATIM "
+                         "SOURCE and have NOT been checked for credentials"
+                         % (type(exc).__name__, exc))
+    return _REDACTOR
+
+
+def redact_snippet(text: str) -> str:
+    """Secret-shaped runs removed. Call this BEFORE truncating to 100
+    characters: half a key is still a leak, and truncating first would
+    publish the half that fell inside the window."""
+    fn = _redactor()[0]
+    return fn(text) if fn is not None else text
+
+
+def redaction_status() -> dict:
+    """What the reader needs to know about the line above -- `applied: false`
+    is a different report from `applied: true`, and must not read the same."""
+    fn, source, reason = _redactor()
+    return ({"applied": True, "source": source} if fn is not None
+            else {"applied": False, "source": None, "reason": reason})
+
+
+# --------------------------------------------------------------------------
 # languages and file selection
 # --------------------------------------------------------------------------
 
@@ -274,6 +340,20 @@ RULES: dict[str, dict] = {
             "on the day the remote service is slow.",
         fix="Stub the call (responses/nock/WireMock) or point it at a local "
             "fixture server on 127.0.0.1.",
+    ),
+    "live-repo": dict(
+        category="flake", severity="warn", family="os",
+        why="The test takes its answer from the checkout it happens to be "
+            "running in -- which files are on disk right now, which branch is "
+            "out, what is uncommitted. It passes on CI's clean checkout and "
+            "fails on a developer's dirty one, which is the worst polarity a "
+            "test can have: the failure is unreproducible on CI, so it trains "
+            "everyone to ignore the suite rather than to read it.",
+        fix="Name the tree the test means instead of inheriting one. Pass "
+            "cwd= (or git -C <dir>) to the subprocess; point the walk at a "
+            "tempfile.TemporaryDirectory or a committed fixture directory; "
+            "and patch the module's ROOT around the WHOLE call, not part of "
+            "it, then assert the fixture is what got measured.",
     ),
     "fs-order": dict(
         category="flake", severity="info", family="os",
@@ -706,6 +786,129 @@ FS_ORDER_RE = re.compile(
 )
 SORTED_RE = re.compile(r"\bsorted\s*\(|\.\s*sort\s*\(|\bsort\s*\.\s*\w+\s*\("
                        r"|\bOrderBy\s*\(|\.\s*toSorted\s*\(")
+
+# --------------------------------------------------------------------------
+# live-repo: ambient filesystem / VCS coupling
+# --------------------------------------------------------------------------
+#
+# The gap this closes was found in this project's OWN suite: two tests called
+# project_state.collect() with the module's ROOT left pointing at the real
+# checkout, so they walked every file in the working tree, shelled out to git
+# four times and ran scripts/validate_plugin.py as a subprocess. They passed
+# on CI and failed on a dirty tree. `real-network` was the only rule in this
+# file about ambient environment, and it only knows about the network.
+#
+# WHY THIS RULE IS NARROW, AND WHAT IT DELIBERATELY WILL NOT SAY
+# --------------------------------------------------------------
+# The obvious rule -- "a test that touches the filesystem, runs git, or
+# shells out to a project script is ambient" -- is useless, and this repo is
+# the proof: tests/test_integration.py runs the scripts under test as
+# subprocesses by design, most tests here build and read temp directories,
+# and tests/test_fixture_manifest.py reads examples/fixtures/ on purpose. A
+# rule firing on those is above the ~10% false-positive line on its first
+# run, and a rule above that line gets the whole gate switched off.
+#
+# The distinction that carries the signal is AMBIENT state versus FIXTURE
+# state -- not filesystem versus no filesystem:
+#
+#   controlled  a tempdir, a fixture directory, a path the test built, a
+#               subprocess told which directory to stand in
+#   ambient     the repository root itself, the current working directory,
+#               git asked about "here", a module-level ROOT the test left
+#               pointing at the real checkout
+#
+# So all three detectors below are shaped the same way: they look for the
+# ambient form AND for the absence of the thing that would have named the
+# tree. Each one has an explicit suppressor for its legitimate twin, and each
+# one is written to stay silent when it cannot tell -- the misses are listed
+# at each detector.
+
+# Subcommands whose answer is a property of whatever repository the process
+# is standing in. `clone` and `init` are absent on purpose: both are told
+# their source and their destination, so the working directory does not
+# change what they do, and firing on them was a false positive on this repo's
+# own `git clone --depth 1` shallow-clone fixture.
+#
+# This is the one rule that has to read `raw` rather than `code`: the
+# program name lives in a string literal and the scrubber exists precisely to
+# hide those. The guard against the usual consequence -- firing on a
+# commented-out or merely-mentioned command -- is that the statement's CODE
+# must independently show a subprocess invocation. A comment lives in
+# `comments`, never in `code`, so `# like git status` cannot reach this.
+GIT_AMBIENT_RE = re.compile(
+    r"""(?:["']git["']\s*,\s*["']|["']git\s+)"""
+    r"(status|rev-parse|log|diff|branch|remote|describe|show|ls-files"
+    r"|rev-list|symbolic-ref|blame|stash|shortlog|whatchanged|ls-remote)"
+    r"\b"
+)
+SUBPROCESS_RE = re.compile(
+    r"\bsubprocess\s*\.\s*(?:run|call|check_call|check_output|Popen)\s*\("
+    r"|\bos\s*\.\s*(?:system|popen)\s*\("
+    r"|\bexecSync\s*\(|\bspawnSync\s*\(|\bexecFileSync\s*\("
+    r"|\bexec\s*\.\s*Command\s*\(|\bIO\s*\.\s*popen\s*\("
+    r"|\bRuntime\s*\.\s*getRuntime\s*\(\s*\)\s*\.\s*exec\s*\("
+)
+# Any of these names the tree, so the call is deterministic.
+#
+# Measured, because it is not what it looks like: the `-C` alternatives are
+# belt-and-braces, not the working part. `["git", "-C", repo, "status"]` --
+# which is how every git call in this repository's own suite is written --
+# never reaches here at all, because GIT_AMBIENT_RE requires the subcommand
+# to follow `git` immediately and `-C` is in the way. The alternatives that
+# a real call can actually reach are `cwd=` and `--git-dir`/`--work-tree` in
+# the argv after the subcommand. The `-C` ones are kept against a future
+# relaxation of that adjacency, and a mutant that neuters this whole pattern
+# is killed by the `cwd=` case, not by a `-C` one.
+GIT_SCOPED_RE = re.compile(
+    r"\bcwd\s*=" r"|[\"']-C[\"']" r"|[\"']--git-dir" r"|[\"']--work-tree"
+    r"|(?<![\w.])git\s+-C\b" r"|--git-dir\s*=" r"|--work-tree\s*="
+)
+
+# Enumerating a directory: the RESULT is the set of files that happen to be
+# there, which is the ambient half. Reading one NAMED committed file is not
+# this rule's business -- scripts/arid_nodes.py is the same bytes on CI and
+# on a dirty tree.
+ENUMERATE_RE = re.compile(
+    r"\bos\s*\.\s*(?:walk|listdir|scandir)\s*\("
+    r"|\bglob\s*\.\s*i?glob\s*\("
+    r"|\bPath\s*\([^)]*\)\s*\.\s*(?:glob|rglob|iterdir)\s*\("
+    r"|\bos\s*\.\s*ReadDir\s*\(|\bfs\s*\.\s*readdir(?:Sync)?\s*\("
+)
+# The repository root, written directly. Uppercase only, and `os.getcwd()`:
+# a LOWERCASE `root` is the commonest local variable name for a tempdir in
+# this repo's own suite (`os.listdir(root)` in tests/test_atomic_io.py), and
+# matching it case-insensitively would have made this rule's first finding a
+# false positive.
+#
+# Known miss, accepted: one level of indirection defeats it.
+# `base = os.path.join(ROOT, "agents")` then `os.walk(base)` is invisible
+# here -- and that shape, in tests/test_consent_contract.py, is a deliberate
+# sweep of a committed directory rather than of the checkout, so the miss and
+# the correct silence point the same way.
+REPO_ROOT_EXPR_RE = re.compile(
+    r"\b(?:[A-Z][A-Z0-9_]*_)?(?:ROOT|CHECKOUT)\b"
+    r"|\bos\s*\.\s*getcwd\s*\(\s*\)"
+    r"|\bPath\s*\(\s*__file__\s*\)(?:\s*\.\s*parent){2,}"
+    r"|\bos\s*\.\s*path\s*\.\s*dirname\s*\(\s*os\s*\.\s*path\s*\.\s*dirname\s*\("
+)
+# A tree the test built or a fixture it committed. Present anywhere in the
+# statement, the statement is controlled.
+CONTROLLED_PATH_RE = re.compile(
+    r"\btmp\w*|\btemp\w*|\bmkdtemp\b|\bTemporaryDirectory\b"
+    r"|\bfixtures?\b|\bsandbox\b|\bworkdir\b|\bself\s*\.\s*dir\b",
+    re.IGNORECASE,
+)
+
+# A module-level root the test file itself knows about. The file patching it
+# ANYWHERE is the evidence: the author has already established that this
+# module reads a root from module scope. A call into that module that is not
+# covered by such a patch runs against the real one.
+ROOT_ATTR_RE = r"(?:[A-Z][A-Z0-9_]*_)?(?:ROOT|BASE_DIR|BASEDIR|CHECKOUT|CWD)"
+ROOT_PATCH_RE = re.compile(
+    r"patch\s*\.\s*object\s*\(\s*(?P<mod1>\w+)\s*,\s*[\"'](?P<a1>%s)[\"']" % ROOT_ATTR_RE
+    + r"|(?:mock\s*\.\s*)?patch\s*\(\s*[\"'](?P<mod2>[\w.]+)\.(?P<a2>%s)[\"']" % ROOT_ATTR_RE
+    + r"|setattr\s*\(\s*(?P<mod3>\w+)\s*,\s*[\"'](?P<a3>%s)[\"']" % ROOT_ATTR_RE
+)
 
 ITERATION_ORDER_RE = re.compile(
     r"\.\s*keys\s*\(\s*\)|\.\s*values\s*\(\s*\)|\.\s*items\s*\(\s*\)"
@@ -1330,7 +1533,9 @@ class FileScan:
             self.suppressed += 1
             return
 
-        snippet = raw.strip()
+        # Redact first, truncate second: a token straddling the 100-character
+        # boundary would otherwise have its first 97 characters published.
+        snippet = redact_snippet(raw).strip()
         if len(snippet) > 100:
             snippet = snippet[:97] + "..."
         finding = {
@@ -1455,6 +1660,9 @@ def _flake_rules(scan: FileScan) -> None:
                 scan.add("real-network", i, severity="warn")
                 break
 
+    # -- ambient repository / VCS coupling ---------------------------------
+    _live_repo(scan)
+
     # -- filesystem order ---------------------------------------------------
     for i, line in enumerate(code, 1):
         if FS_ORDER_RE.search(line) and not SORTED_RE.search(line):
@@ -1496,6 +1704,186 @@ def _flake_rules(scan: FileScan) -> None:
 
     # -- shared mutable state ----------------------------------------------
     _shared_state(scan)
+
+
+def _bracket_delta(line: str) -> int:
+    return (line.count("(") + line.count("[") + line.count("{")
+            - line.count(")") - line.count("]") - line.count("}"))
+
+
+def _statement_spans(code: list[str]) -> list[tuple[int, int]]:
+    """[(first, last)] 0-based line ranges of bracket-balanced statements.
+
+    A subprocess call is routinely written over three lines and the `cwd=`
+    that makes it deterministic is as likely to be on the last as on the
+    first. Reading one line at a time would report every multi-line call as
+    unscoped -- a false positive on the commonest way to write one -- so the
+    whole statement is the unit here.
+    """
+    spans: list[tuple[int, int]] = []
+    start, depth = 0, 0
+    for i, line in enumerate(code):
+        if depth <= 0:
+            start, depth = i, 0
+        depth += _bracket_delta(line)
+        if depth <= 0:
+            spans.append((start, i))
+            depth = 0
+    if depth > 0:                       # unbalanced tail; keep it addressable
+        spans.append((start, len(code) - 1))
+    return spans
+
+
+def _statement_index(code: list[str]) -> list[tuple[int, int]]:
+    """Per line, the (first, last) of the statement it belongs to."""
+    index = [(i, i) for i in range(len(code))]
+    for first, last in _statement_spans(code):
+        for i in range(first, min(last, len(code) - 1) + 1):
+            index[i] = (first, last)
+    return index
+
+
+PY_ANY_DEF_RE = re.compile(r"^(\s*)(?:async\s+)?def\s+\w+\s*\(")
+
+
+def _def_spans(code: list[str]) -> list[tuple[int, int]]:
+    """[(first, last)] 0-based line ranges of every `def` body, test or not.
+
+    `find_blocks` only knows about test functions, and the fix for this smell
+    is usually to move the call into a helper that patches the root -- a
+    helper is not a test function, so a test-block-only view would report the
+    fixed shape as broken.
+    """
+    spans: list[tuple[int, int]] = []
+    for i, line in enumerate(code):
+        m = PY_ANY_DEF_RE.match(line)
+        if not m:
+            continue
+        indent = len(m.group(1))
+        end = len(code) - 1
+        for j in range(i + 1, len(code)):
+            nxt = code[j]
+            if not nxt.strip():
+                continue
+            if len(nxt) - len(nxt.lstrip()) <= indent:
+                end = j - 1
+                break
+        spans.append((i, max(end, i)))
+    return spans
+
+
+_KWARG_RE = re.compile(r"^(?:\*\*)?\s*\w+\s*=(?!=)")
+
+
+def _has_positional_arg(args: list[str]) -> bool:
+    """True when the call was handed a subject rather than told only how to
+    behave. `collect(skip_tests=True)` was handed nothing; `render(state)`
+    was handed the thing it renders."""
+    for a in args:
+        s = a.strip()
+        if not s or s.startswith("**") or _KWARG_RE.match(s):
+            continue
+        return True
+    return False
+
+
+def _live_repo(scan: FileScan) -> None:
+    """Three ambient-state shapes, each with its controlled twin suppressed.
+
+    Deliberately NOT here, after measuring the cost on this repository:
+
+      * running the project's own scripts as a subprocess. This repo's
+        tests/test_integration.py does that by design, dozens of times, and
+        statically there is no way to tell "ran the script against a tempdir"
+        from "ran it against the checkout" once the target arrives through a
+        variable. The expected false-positive rate is high and the marginal
+        detection is nil -- in the real defect this rule was built for, the
+        subprocess was inside the production code, not the test.
+      * reading a named committed file (scripts/foo.py, a fixture). Those
+        bytes are identical on CI and on a dirty tree, so they are not
+        ambient at all.
+    """
+    code, raw = scan.code, scan.raw
+    stmt = _statement_index(code)
+
+    def statement_text(i: int, lines: list[str]) -> str:
+        first, last = stmt[i - 1]
+        return " ".join(lines[k].strip() for k in range(first, last + 1))
+
+    # (1) git asked about "here". The subcommand list is positive, so a
+    # cwd-independent command (clone, init, --version) cannot reach it.
+    # Once per STATEMENT, not once per file: a suite with two of these has
+    # two of these.
+    reported: set[int] = set()
+    for i in range(1, len(code) + 1):
+        first = stmt[i - 1][0]
+        if first in reported or not SUBPROCESS_RE.search(statement_text(i, code)):
+            continue
+        text = statement_text(i, raw)
+        if GIT_AMBIENT_RE.search(text) and not GIT_SCOPED_RE.search(text):
+            reported.add(first)
+            scan.add("live-repo", first + 1)
+
+    # (2) enumerating the checkout itself. The set of files in the repository
+    # root is whatever is on disk right now, editor leftovers and all.
+    #
+    # The controlled side is read from `raw`, strings included, because that
+    # is where it lives: `os.walk(os.path.join(ROOT, "examples", "fixtures"))`
+    # names a committed fixture tree, and the word that says so is a string
+    # literal the scrubber has already collapsed. Reading only `code` made
+    # this rule's first measured finding a false positive on exactly that
+    # shape -- which is how tests/test_fixture_manifest.py is written.
+    for i, line in enumerate(code, 1):
+        if not ENUMERATE_RE.search(line):
+            continue
+        if not REPO_ROOT_EXPR_RE.search(statement_text(i, code)):
+            continue
+        if CONTROLLED_PATH_RE.search(statement_text(i, raw)):
+            continue
+        scan.add("live-repo", i)
+
+    # (3) a module-level root the file itself knows is patchable, left
+    # pointing at the real checkout for one call.
+    #
+    # The evidence is intra-file and self-calibrating: this file patches
+    # `pstate.ROOT` somewhere, so its author has already established that
+    # `pstate` reads a root from module scope. A call into `pstate` that no
+    # enclosing `def` patches is running against the real one. Two
+    # suppressors, both load-bearing, both measured against the fixed version
+    # of the test that prompted this rule:
+    #
+    #   * a call with a POSITIONAL argument is given its subject by the test
+    #     -- `pstate.render(state)` renders what it was handed. Only a call
+    #     told nothing can be taking its input from the environment.
+    #   * a patch anywhere in ANY enclosing `def` covers the call, not just a
+    #     lexically enclosing `with`. The fix for this smell puts the patch
+    #     and the call in the same helper, often via ExitStack, where there
+    #     is no `with` block to be inside.
+    patched_modules: set[str] = set()
+    patch_lines: list[int] = []
+    for i, line in enumerate(raw, 1):
+        for m in ROOT_PATCH_RE.finditer(line):
+            mod = m.group("mod1") or m.group("mod2") or m.group("mod3")
+            if mod:
+                patched_modules.add(mod.split(".")[-1])
+                patch_lines.append(i)
+    if not patched_modules:
+        return
+    defs = _def_spans(code)
+    covered = set()
+    for first, last in defs:
+        if any(first + 1 <= p <= last + 1 for p in patch_lines):
+            covered.update(range(first + 1, last + 2))
+    call_re = re.compile(r"(?<![\w.])(%s)\s*\.\s*(\w+)\s*\("
+                         % "|".join(sorted(re.escape(m) for m in patched_modules)))
+    for i, line in enumerate(code, 1):
+        if i in covered:
+            continue
+        for m in call_re.finditer(line):
+            if _has_positional_arg(_call_args(line, m.end() - 1)):
+                continue        # given its subject by the test, not by the tree
+            scan.add("live-repo", i)
+            break
 
 
 def _shared_state(scan: FileScan) -> None:
@@ -1707,35 +2095,58 @@ MAX_LINE_CHARS = 2000
 MAX_FILE_BYTES = 2 * 1024 * 1024
 
 
-def read_lines_bounded(path: str, *, max_bytes: int = MAX_FILE_BYTES,
-                       max_line_chars: int = MAX_LINE_CHARS
-                       ) -> tuple[list[str] | None, list[dict]]:
-    """(lines, truncated) -- lines is None when the file is unreadable, binary
-    or over `max_bytes`; `truncated` lists every line whose tail was NOT
-    scanned.
+def read_lines_detailed(path: str, *, max_bytes: int = MAX_FILE_BYTES,
+                        max_line_chars: int = MAX_LINE_CHARS
+                        ) -> tuple[list[str] | None, list[dict], str | None]:
+    """(lines, truncated, why_not) -- lines is None when the file was not
+    read; `why_not` then says which of the three reasons it was.
 
-    The second element is the whole point. A gate that shortens its own input
-    and says nothing reports "nothing found" about text it never read, so the
-    caller is given what it would have to lie about otherwise. A
-    generated-test gate that crashes on one odd file blocks the whole
+    `truncated` is the whole point of the second element: a gate that
+    shortens its own input and says nothing reports "nothing found" about
+    text it never read, so the caller is given what it would have to lie
+    about otherwise.
+
+    `why_not` is the same argument one level up. The caller already recorded
+    every unread file in `skipped_files`, but under a single string --
+    "unreadable or binary" -- that collapsed three causes needing three
+    different reactions: a permission error or a broken symlink is wrong with
+    the CHECKOUT, a NUL-byte file is a file that is not source, and an
+    oversize file is a ceiling this tool chose and can raise. The wording
+    follows `risk_map.py`'s `skip_reason()` rather than inventing a fourth
+    phrasing of the same idea.
+
+    Measured, so it is not guessed at: there is NO fourth cause here.
+    `latin-1` maps all 256 byte values, so `blob.decode("latin-1")` cannot
+    raise on a bytes input -- verified over every single byte and over a
+    200,000-byte random blob on CPython 3.14.6. The `except Exception` that
+    used to guard it was unreachable, and a reachable-looking guard around an
+    unreachable branch is how a reader is told a case is handled when nothing
+    handles it. It is gone; if a future encoding change makes decoding
+    fallible again, it must come back WITH a reason string, not with a bare
+    `return None`.
+
+    A generated-test gate that crashes on one odd file blocks the whole
     pipeline, so this never raises.
     """
     try:
-        if os.path.getsize(path) > max_bytes:
-            return None, []
+        size = os.path.getsize(path)
+        if size > max_bytes:
+            return None, [], (f"larger than {max_bytes} bytes "
+                              f"({max_bytes // (1024 * 1024)}MB ceiling); "
+                              "raise --max-file-bytes to scan it")
         with open(path, "rb") as fh:
             blob = fh.read()
-    except OSError:
-        return None, []
+    except OSError as exc:
+        return None, [], (f"unreadable ({exc.strerror or exc}); the file was "
+                          "NOT scanned and nothing here is a verdict on it")
     if b"\x00" in blob[:8000]:
-        return None, []
+        return None, [], ("binary (a NUL byte in the first 8000 bytes); it "
+                          "carries a source extension but is not source "
+                          "text, so it was NOT scanned")
     try:
         text = blob.decode("utf-8")
     except UnicodeDecodeError:
-        try:
-            text = blob.decode("latin-1")
-        except Exception:
-            return None, []
+        text = blob.decode("latin-1")
 
     lines: list[str] = []
     truncated: list[dict] = []
@@ -1753,13 +2164,24 @@ def read_lines_bounded(path: str, *, max_bytes: int = MAX_FILE_BYTES,
             })
             line = line[:max_line_chars]
         lines.append(line)
-    return lines, truncated
+    return lines, truncated, None
+
+
+def read_lines_bounded(path: str, *, max_bytes: int = MAX_FILE_BYTES,
+                       max_line_chars: int = MAX_LINE_CHARS
+                       ) -> tuple[list[str] | None, list[dict]]:
+    """Back-compatible wrapper: (lines, truncated). Prefer
+    read_lines_detailed(), which also hands back WHY the file was not read --
+    a caller that cannot tell "I lacked permission" from "this is not source"
+    has to report both as the same thing."""
+    return read_lines_detailed(path, max_bytes=max_bytes,
+                               max_line_chars=max_line_chars)[:2]
 
 
 def read_lines(path: str, *, max_bytes: int = MAX_FILE_BYTES) -> list[str] | None:
-    """Back-compatible wrapper: lines only. Prefer read_lines_bounded(), which
-    also hands back what it had to shorten."""
-    return read_lines_bounded(path, max_bytes=max_bytes)[0]
+    """Back-compatible wrapper: lines only. Prefer read_lines_detailed(),
+    which also hands back what it had to shorten and why it read nothing."""
+    return read_lines_detailed(path, max_bytes=max_bytes)[0]
 
 
 def scan_paths(paths: list[str], use_ast: bool = True, *,
@@ -1782,22 +2204,20 @@ def scan_paths(paths: list[str], use_ast: bool = True, *,
             # code is not a smell.
             skipped.append({"path": path, "reason": "not a test file"})
             continue
-        raw, cut = read_lines_bounded(path, max_bytes=max_bytes,
-                                      max_line_chars=max_line_chars)
+        raw, cut, why_not = read_lines_detailed(path, max_bytes=max_bytes,
+                                                max_line_chars=max_line_chars)
         truncated_lines.extend(cut)
         if raw is None:
-            # Name the ceiling when that is what happened: "unreadable" and
-            # "too big to look at" need different reactions from the reader.
-            try:
-                oversized = os.path.getsize(path) > max_bytes
-            except OSError:
-                oversized = False
+            # The reason comes from the reader, which is the only place that
+            # knows which of the three things happened. It used to be
+            # re-derived here by a second getsize() -- a second copy of a
+            # rule, which is this repository's most frequent defect, and one
+            # that answered "unreadable or binary" to everything the ceiling
+            # had not caught. A permission error, a broken symlink and a
+            # NUL-byte file need three different reactions from a reader.
             skipped.append({
                 "path": path,
-                "reason": (f"larger than {max_bytes} bytes "
-                           f"({max_bytes // (1024 * 1024)}MB ceiling); "
-                           "raise --max-file-bytes to scan it")
-                if oversized else "unreadable or binary",
+                "reason": why_not or "not read, and the reader did not say why",
             })
             continue
         scan = analyse_file(path, raw, lang, use_ast=use_ast)
@@ -1857,6 +2277,10 @@ def scan_paths(paths: list[str], use_ast: bool = True, *,
         "unparsed_files": unparsed_files,
         "files": files,
         "summary": {
+            # S3-1: snippets are verbatim source, so the report has to say
+            # whether anything filtered them. `applied: false` must never be
+            # mistaken for "nothing matched".
+            "redaction": redaction_status(),
             "files_scanned": len(files),
             "files_skipped": len(skipped),
             "files_ast_unparsed": len(unparsed_files),
@@ -1967,6 +2391,10 @@ def main(argv: list[str] | None = None) -> int:
             write_text_atomic(args.out, payload + "\n")
         else:
             print(payload)
+        red = result["summary"].get("redaction") or {}
+        if not red.get("applied"):
+            print("warning: snippets NOT redacted: %s" % red.get("reason"),
+                  file=sys.stderr)
         for s in result["skipped_files"]:
             print(f"warning: not scanned: {s['file']}: {s['reason']}",
                   file=sys.stderr)

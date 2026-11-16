@@ -277,7 +277,7 @@ PROD_MARKER_RE = re.compile(r"(^|[.\-_])(prod|production|prd)([.\-_]|$)", re.IGN
 
 def host_of(url_rest: str) -> str:
     """Host from the part of a URL after `://`, with userinfo and port gone."""
-    authority = re.split(r"[/?#]", url_rest, 1)[0]
+    authority = re.split(r"[/?#]", url_rest, maxsplit=1)[0]
     if "@" in authority:
         authority = authority.rsplit("@", 1)[1]
     if authority.startswith("["):  # IPv6 literal

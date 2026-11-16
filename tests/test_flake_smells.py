@@ -1177,7 +1177,11 @@ class TestScanPaths(TempTree):
         result = fs.scan_paths([self.root])
         self.assertEqual(result["summary"]["files_scanned"], 0)
         reasons = [s["reason"] for s in result["summary"]["skipped"]]
-        self.assertIn("unreadable or binary", reasons)
+        # The reason is now specific: a permission error, a broken symlink
+        # and a NUL-byte file used to answer "unreadable or binary" alike,
+        # and they need three different reactions from a reader.
+        self.assertTrue(any("NUL byte" in r for r in reasons), reasons)
+        self.assertFalse(any("unreadable" in r for r in reasons), reasons)
 
     def test_unreadable_file_is_skipped_gracefully(self):
         path = self.write("tests/test_locked.py", "def test_x():\n    pass\n")
@@ -1559,6 +1563,400 @@ class TestTodoLivesInCommentsNotData(unittest.TestCase):
                '    with pytest.raises(ValueError, match="TODO: add assertion"):\n'
                '        parse("")\n')
         self.assertNotIn("todo-assertion", self._rules(src))
+
+
+# --------------------------------------------------------------------------
+# live-repo -- ambient filesystem / VCS coupling
+# --------------------------------------------------------------------------
+
+class TestLiveRepo(SmellCase):
+    """The rule's whole difficulty is the silent half, so there are more
+    negatives here than positives and they are the real suite. This repo's
+    own tests run subprocesses, build temp trees and read a committed
+    fixture directory constantly; a rule that fires on any of those is above
+    the ~10% line on its first run and gets the gate switched off."""
+
+    # -- (1) git asked about "here" -------------------------------------
+    def test_git_status_without_a_named_tree_fires(self):
+        self.assertFires("live-repo",
+                         'import subprocess\n'
+                         'def test_a():\n'
+                         '    out = subprocess.run(["git", "status", "--porcelain"])\n'
+                         '    assert out.returncode == 0\n')
+
+    def test_git_call_split_over_lines_finds_the_cwd_on_a_later_line(self):
+        """The suppressor has to survive the commonest way to write the
+        call. Reading one line at a time reports every multi-line
+        subprocess as unscoped, which is a false positive on good code."""
+        self.assertSilent("live-repo",
+                          'import subprocess\n'
+                          'def test_a():\n'
+                          '    out = subprocess.run(\n'
+                          '        ["git", "status", "--porcelain"],\n'
+                          '        cwd=self.tmp,\n'
+                          '    )\n'
+                          '    assert out.returncode == 0\n')
+
+    def test_git_dash_c_names_the_tree_and_stays_silent(self):
+        """Every git call in this repository's own suite is written this way.
+
+        Measured, so the comment does not mislead: this is silenced by the
+        subcommand having to follow `git` immediately -- `-C` is in the way,
+        so GIT_AMBIENT_RE never matches -- and not by GIT_SCOPED_RE. Both
+        answers are "silent"; only one of them is the reason.
+        """
+        src = ('import subprocess\n'
+               'def test_a():\n'
+               '    out = subprocess.run(["git", "-C", repo, "status"])\n'
+               '    assert out.returncode == 0\n')
+        self.assertSilent("live-repo", src)
+        self.assertFalse(fs.GIT_AMBIENT_RE.search(src),
+                         "the -C form is supposed to be excluded before the "
+                         "suppressor is ever consulted")
+
+    def test_git_dir_in_the_argv_names_the_tree_and_stays_silent(self):
+        """The reachable half of GIT_SCOPED_RE: a flag that names the tree
+        AFTER the subcommand, where the adjacency rule cannot see it."""
+        self.assertSilent("live-repo",
+                          'import subprocess\n'
+                          'def test_a():\n'
+                          '    out = subprocess.run(["git", "status", "--git-dir", d])\n'
+                          '    assert out.returncode == 0\n')
+
+    def test_git_clone_is_not_ambient(self):
+        """`clone` is told its source and its destination, so the working
+        directory does not change what it does. It is absent from the
+        subcommand list rather than suppressed afterwards."""
+        self.assertSilent("live-repo",
+                          'import subprocess\n'
+                          'def test_a():\n'
+                          '    out = subprocess.run(["git", "clone", "-q", url, dst])\n'
+                          '    assert out.returncode == 0\n')
+
+    def test_a_commented_out_git_call_stays_silent(self):
+        """This is the one rule that reads `raw` instead of `code`, because
+        the program name lives in a string literal. The guard is that the
+        statement's CODE must independently show a subprocess call."""
+        self.assertSilent("live-repo",
+                          'def test_a():\n'
+                          '    # subprocess.run(["git", "status"])\n'
+                          '    assert run() == 0\n')
+
+    def test_two_ambient_git_calls_are_two_findings(self):
+        src = ('import subprocess\n'
+               'def test_a():\n'
+               '    assert subprocess.run(["git", "status"]).returncode == 0\n'
+               'def test_b():\n'
+               '    assert subprocess.run(["git", "log", "-1"]).returncode == 0\n')
+        hits = [f for f in scan(src).findings if f["rule"] == "live-repo"]
+        self.assertEqual(len(hits), 2, hits)
+
+    # -- (2) enumerating the checkout ------------------------------------
+    def test_walking_the_repository_root_fires(self):
+        self.assertFires("live-repo",
+                         'import os\n'
+                         'ROOT = os.path.dirname(os.path.dirname(__file__))\n'
+                         'def test_a():\n'
+                         '    assert list(os.walk(ROOT))\n')
+
+    def test_globbing_the_repository_root_fires(self):
+        self.assertFires("live-repo",
+                         'import glob, os\n'
+                         'def test_a():\n'
+                         '    assert glob.glob(os.path.join(ROOT, "*", "*.py"))\n')
+
+    def test_scanning_the_working_directory_fires(self):
+        self.assertFires("live-repo",
+                         'import os\n'
+                         'def test_a():\n'
+                         '    assert list(os.scandir(os.getcwd()))\n')
+
+    def test_walking_a_tempdir_stays_silent(self):
+        self.assertSilent("live-repo",
+                          'import os\n'
+                          'def test_a():\n'
+                          '    assert list(os.walk(self.tmp))\n')
+
+    def test_walking_a_committed_fixture_directory_stays_silent(self):
+        """tests/test_fixture_manifest.py is written exactly like this, on
+        purpose. The word that says so -- "fixtures" -- is a string literal,
+        which the scrubber has already collapsed, so the controlled half has
+        to be read from `raw`. Reading only `code` made this rule's first
+        measured finding a false positive on this shape."""
+        self.assertSilent("live-repo",
+                          'import os\n'
+                          'def test_a():\n'
+                          '    base = os.path.join(ROOT, "examples", "fixtures")\n'
+                          '    assert list(os.walk(os.path.join(ROOT, "examples", "fixtures")))\n')
+
+    def test_a_lowercase_local_named_root_stays_silent(self):
+        """`root` is the commonest local name for a tempdir in this repo's
+        own suite (tests/test_atomic_io.py). Matching the repository root
+        case-insensitively would have made this rule's first finding a
+        false positive."""
+        self.assertSilent("live-repo",
+                          'import os, tempfile\n'
+                          'def test_a():\n'
+                          '    root = tempfile.mkdtemp()\n'
+                          '    assert sorted(os.listdir(root)) == []\n')
+
+    def test_reading_one_named_committed_file_stays_silent(self):
+        """Not every repository-relative path is ambient. scripts/foo.py is
+        the same bytes on CI and on a dirty tree; what is ambient is the SET
+        of files, not a file."""
+        self.assertSilent("live-repo",
+                          'import os\n'
+                          'def test_a():\n'
+                          '    text = open(os.path.join(ROOT, "scripts", "x.py")).read()\n'
+                          '    assert "max_per_file" in text\n')
+
+    # -- (3) a module-level root left pointing at the real checkout ------
+    #
+    # This is the shape that prompted the rule. Two tests in this repo's own
+    # tests/test_robustness.py called project_state.collect() with the
+    # module's ROOT still pointing at the real repository: they walked the
+    # whole checkout, shelled out to git four times and ran
+    # scripts/validate_plugin.py as a subprocess. They passed on CI and
+    # failed on a dirty tree.
+    PRE_FIX = (
+        'import unittest\n'
+        'from unittest import mock\n'
+        'import project_state as pstate\n'
+        'class T(unittest.TestCase):\n'
+        '    def test_reports_the_file_it_could_not_parse(self):\n'
+        '        state = pstate.collect(skip_tests=True)\n'
+        '        rendered = pstate.render(state)\n'
+        '        self.assertIn("NOT EXACT", rendered)\n'
+        '    def test_does_not_announce_a_half_written_file(self):\n'
+        '        with mock.patch.object(pstate, "ROOT", self.tmp):\n'
+        '            markers = pstate.section_markers()\n'
+        '        self.assertTrue(markers["totals_exact"])\n')
+
+    FIXED = (
+        'import contextlib\n'
+        'import unittest\n'
+        'from unittest import mock\n'
+        'import project_state as pstate\n'
+        'class T(unittest.TestCase):\n'
+        '    def collect_fixture(self):\n'
+        '        with contextlib.ExitStack() as stack:\n'
+        '            stack.enter_context(mock.patch.object(pstate, "ROOT", self.tmp))\n'
+        '            return pstate.collect(skip_tests=True)\n'
+        '    def test_reports_the_file_it_could_not_parse(self):\n'
+        '        state = self.collect_fixture()\n'
+        '        rendered = pstate.render(state)\n'
+        '        self.assertIn("NOT EXACT", rendered)\n'
+        '    def test_does_not_announce_a_half_written_file(self):\n'
+        '        with mock.patch.object(pstate, "ROOT", self.tmp):\n'
+        '            markers = pstate.section_markers()\n'
+        '        self.assertTrue(markers["totals_exact"])\n')
+
+    def test_the_real_pre_fix_shape_fires_once_on_the_uncovered_call(self):
+        hits = [f for f in scan(self.PRE_FIX).findings if f["rule"] == "live-repo"]
+        self.assertEqual([f["line"] for f in hits], [6], hits)
+
+    def test_the_shipped_fixed_shape_is_silent(self):
+        """The fix moves the call into a helper and patches ROOT with an
+        ExitStack, so there is no lexically enclosing `with` to be inside --
+        which is why coverage is computed over the whole enclosing `def`."""
+        self.assertSilent("live-repo", self.FIXED)
+
+    def test_a_call_handed_its_subject_stays_silent(self):
+        """pstate.render(state) renders what it was given. Only a call told
+        nothing can be taking its input from the environment -- and this is
+        the suppressor that keeps the FIXED sample above quiet."""
+        self.assertSilent("live-repo",
+                          'from unittest import mock\n'
+                          'import project_state as pstate\n'
+                          'def test_a():\n'
+                          '    with mock.patch.object(pstate, "ROOT", tmp):\n'
+                          '        pass\n'
+                          'def test_b():\n'
+                          '    assert pstate.render(state) == ""\n')
+
+    def test_without_a_root_patch_anywhere_the_file_is_not_judged(self):
+        """The evidence is intra-file: a file that never patches a module
+        root has not told us any module has one, so this detector has
+        nothing to go on and says nothing."""
+        self.assertSilent("live-repo",
+                          'import project_state as pstate\n'
+                          'def test_a():\n'
+                          '    assert pstate.collect(skip_tests=True)\n')
+
+    # -- severity and catalogue -----------------------------------------
+    def test_live_repo_warns_rather_than_blocks(self):
+        """Deliberate, and the reason is in the rule's comment: this project
+        runs `--fail-on block` in CI, the evidence here is the ABSENCE of a
+        cwd or a patch rather than a call anyone can see, and the last rule
+        shipped at `block` on reasoning instead of field data
+        (`no-assertion`) was measured at a 100% false-positive rate on this
+        repository. Promotion is a one-word change once there is field data;
+        recovering a gate that has been switched off is not."""
+        self.assertEqual(fs.RULES["live-repo"]["severity"], "warn")
+
+    def test_live_repo_names_the_remedy_not_the_regex(self):
+        spec = fs.RULES["live-repo"]
+        self.assertIn("cwd", spec["fix"])
+        self.assertIn("ROOT", spec["fix"])
+        self.assertNotIn("live-repo", spec["why"])
+
+    def test_the_suppression_comment_silences_it_like_every_other_rule(self):
+        self.assertSilent("live-repo",
+                          'import subprocess\n'
+                          'def test_a():\n'
+                          '    out = subprocess.run(["git", "status"])  '
+                          '# testsquad:ignore live-repo -- deliberate\n'
+                          '    assert out.returncode == 0\n')
+
+
+class TestLiveRepoOnThisRepository(unittest.TestCase):
+    """The measurement, pinned. A rule whose false-positive rate is only
+    ever claimed in a report rots the moment someone edits the suite."""
+
+    def test_the_rule_is_silent_on_this_project_s_own_suite(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        # normpath, deliberately: "tests/../scripts" contains the substring
+        # "/tests/", so TEST_FILE_PATTERN classifies every production script
+        # reached that way as a test file and every rule in this gate runs on
+        # it. That is a property of path spelling, not of this rule, and it
+        # is recorded rather than worked around silently.
+        scripts = os.path.normpath(os.path.join(here, os.pardir, "scripts"))
+        result = fs.scan_paths([here, scripts])
+        hits = [f for f in _all_findings(result) if f["rule"] == "live-repo"]
+        self.assertEqual(hits, [], "live-repo fired on this repository's own "
+                                   "suite; that is its false-positive rate "
+                                   "speaking, and the rule needs rethinking "
+                                   "rather than the suite needing edits")
+        # Guard the guard: a scan that read nothing would pass the line above
+        # without exercising one byte of the rule.
+        self.assertGreaterEqual(result["summary"]["files_scanned"], 10,
+                                result["summary"])
+
+
+# --------------------------------------------------------------------------
+# unread files -- which of the three reasons it was
+# --------------------------------------------------------------------------
+
+class TestWhyAFileWasNotRead(TempTree):
+    """`skipped_files` always existed. What did not was a reason a reader can
+    act on: "unreadable or binary" answered a permission error, a broken
+    symlink and a NUL-byte file identically."""
+
+    def test_a_binary_file_says_it_is_binary(self):
+        self.write("tests/test_x.py", b"def test_a():\n\x00\xff\n", binary=True)
+        result = fs.scan_paths([self.root])
+        reason = result["skipped_files"][0]["reason"]
+        self.assertIn("NUL byte", reason)
+        self.assertIn("NOT scanned", reason)
+        self.assertNotIn("unreadable", reason)
+
+    def test_an_unreadable_file_says_so_and_names_the_errno(self):
+        full = self.write("tests/test_x.py", "def test_a():\n    assert 1\n")
+        os.chmod(full, 0o000)
+        self.addCleanup(os.chmod, full, 0o644)
+        if os.access(full, os.R_OK):      # running as root: the probe cannot work
+            self.skipTest("this process can read a mode-000 file, so there is "
+                          "no permission error here to report on")
+        result = fs.scan_paths([self.root])
+        reason = result["skipped_files"][0]["reason"]
+        self.assertIn("unreadable", reason)
+        self.assertIn("Permission denied", reason)
+        self.assertNotIn("NUL byte", reason)
+
+    def test_an_oversize_file_still_names_the_ceiling(self):
+        self.write("tests/test_x.py", "def test_a():\n    assert 1\n")
+        result = fs.scan_paths([self.root], max_bytes=4)
+        reason = result["skipped_files"][0]["reason"]
+        self.assertIn("--max-file-bytes", reason)
+        self.assertNotIn("unreadable", reason)
+
+    def test_latin1_cannot_fail_so_there_is_no_fourth_reason(self):
+        """Measured, not assumed: latin-1 maps all 256 byte values, so the
+        decode fallback cannot raise on a bytes input. The `except
+        Exception: return None` that used to guard it was unreachable -- a
+        reachable-looking guard around an unreachable branch tells a reader
+        a case is handled when nothing handles it."""
+        blob = bytes(range(256)) * 8
+        self.assertEqual(len(blob.decode("latin-1")), len(blob))
+
+    def test_the_wrapper_still_returns_two_values(self):
+        full = self.write("tests/test_x.py", "def test_a():\n    assert 1\n")
+        self.assertEqual(len(fs.read_lines_bounded(full)), 2)
+        self.assertIsNotNone(fs.read_lines(full))
+
+
+# --------------------------------------------------------------------------
+# snippet redaction -- docs/SECURITY-REVIEW.md S3-1
+# --------------------------------------------------------------------------
+
+class TestSnippetRedaction(SmellCase):
+    """Findings carry verbatim source into `.testing/` (committed), the CI
+    log (public) and the uploaded artifact. The patterns are not redefined
+    here: pr_comment.redact() is reused, which itself reuses
+    env_safety_check's, so this is the third consumer of one definition
+    rather than a third copy of it."""
+
+    def _snippet(self, line_source):
+        src = "def test_a():\n" + line_source
+        hits = scan(src).findings
+        self.assertTrue(hits, "the probe line must make some rule fire")
+        return hits[0]["snippet"]
+
+    def test_a_live_stripe_key_is_not_published(self):
+        got = self._snippet('    assert f("sk_live_4eC39HqLyjWDarjtT1zdp7dcAbCd") '
+                            '== random.random()\n')
+        self.assertNotIn("sk_live_4eC39", got)
+        self.assertIn("redacted", got)
+
+    def test_an_aws_key_id_is_not_published(self):
+        got = self._snippet('    assert f("AKIAIOSFODNN7EXAMPLE") == random.random()\n')
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", got)
+
+    def test_a_credential_url_is_not_published(self):
+        got = self._snippet('    assert f("postgres://admin:hunter2secretpw@db:5432/a") '
+                            '== random.random()\n')
+        self.assertNotIn("hunter2secretpw", got)
+
+    def test_redaction_runs_before_truncation(self):
+        """Truncating first publishes whatever fell inside the first 97
+        characters, and half a key is still a leak."""
+        pad = "x" * 70
+        got = self._snippet('    assert f("%s", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") '
+                            '== random.random()\n' % pad)
+        self.assertNotIn("ghp_", got)
+
+    def test_developer_obvious_values_stay_readable(self):
+        """The opposite false positive, and the one that kills the tool: a
+        finding whose evidence reads `[redacted]` cannot be judged, so it
+        gets ignored and the gate goes with it."""
+        got = self._snippet('    assert f(password="change-me-later", host="localhost") '
+                            '== random.random()\n')
+        self.assertIn("change-me-later", got)
+        self.assertIn("localhost", got)
+
+    def test_the_report_states_whether_redaction_was_applied(self):
+        """An unredacted report that claims to be redacted is worse than one
+        that admits it is not, so `applied` is in the summary either way."""
+        status = fs.redaction_status()
+        self.assertIn("applied", status)
+        self.assertTrue(status["applied"], status)
+        self.assertEqual(status["source"], "pr_comment.redact")
+
+    def test_the_scan_summary_carries_the_redaction_record(self):
+        result = fs.scan_paths([os.path.dirname(os.path.abspath(__file__))])
+        self.assertTrue(result["summary"]["redaction"]["applied"])
+
+    def test_the_patterns_are_borrowed_not_redefined(self):
+        """Two copies of a redaction rule drifting apart leaks exactly the
+        shapes the stale copy has not heard of, so there must be no local
+        secret pattern in this script at all."""
+        import pr_comment
+        self.assertIs(fs._redactor()[0], pr_comment.redact)
+        # Not a source grep for key prefixes: this module's own comment names
+        # `sk_live_` to explain what it is protecting against, and a grep
+        # cannot tell an explanation from a second copy. Identity can.
+        self.assertNotIn("re.compile", fs.redact_snippet.__doc__ or "")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

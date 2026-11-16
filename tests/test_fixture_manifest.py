@@ -39,6 +39,7 @@ import ast
 import json
 import os
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -283,7 +284,20 @@ class SilenceIsNotSuccessTest(ManifestCase):
         prose is noise.
         """
         with open(os.path.abspath(__file__), encoding="utf-8") as fh:
-            tree = ast.parse(fh.read(), filename=__file__)
+            own_source = fh.read()
+        try:
+            tree = ast.parse(own_source, filename=__file__)
+        except RecursionError:
+            # Not protection: the input is this module's own committed source,
+            # and a raise here is already a loud red error. What the handler
+            # buys is the sentence. A bare RecursionError traceback under this
+            # test's name is about parser depth and says nothing about skips,
+            # so a reader can triage it as unrelated infrastructure noise and
+            # never notice that the guard below went unevaluated.
+            self.fail("this module's own source is too deeply nested for "
+                      "ast.parse; the source-level guard below did NOT run, "
+                      "so nothing checked that this module still fails "
+                      "loudly instead of skipping")
 
         def name_of(node):
             if isinstance(node, ast.Attribute):
@@ -319,6 +333,22 @@ class SilenceIsNotSuccessTest(ManifestCase):
             [], offenders,
             "this module must fail loudly, never skip. Found skip "
             "machinery:\n  " + "\n  ".join(offenders))
+
+    def test_an_unparseable_own_source_says_the_guard_did_not_run(self):
+        """Covers the RecursionError handler above, which no committed source
+        can reach -- on the 3.9.6 floor ast.parse goes straight from accepting
+        a very deep expression to SIGSEGV, so the handler cannot be reached by
+        depth there at all. A handler nobody can prove is a handler nobody
+        should trust, so it is forced to fire here instead."""
+        with mock.patch.object(ast, "parse",
+                               side_effect=RecursionError("forced")):
+            with self.assertRaises(self.failureException) as caught:
+                self.test_the_suite_itself_cannot_be_skipped_away()
+        message = str(caught.exception)
+        self.assertIn("did NOT run", message)
+        self.assertNotIn("Found skip machinery", message,
+                         "the parse never happened, so the real assertion "
+                         "below it must not have reported a verdict")
 
     def test_the_fixture_root_is_present(self):
         """If `examples/fixtures/` itself were gone, the loops above would have

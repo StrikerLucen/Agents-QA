@@ -13,13 +13,46 @@ Partly, and it is worth knowing which part.
 as the model following them, which is why none of the project's claims rest on
 them alone.
 
-**Executable Python:** `scripts/` is ~5,600 lines of standard-library Python —
+**Executable Python:** `scripts/` is **ten standard-library modules** —
 environment safety (`env_safety_check.py`), the churn-based risk map
 (`risk_map.py`), flake and weak-test smells (`flake_smells.py`), coverage
 normalization (`normalize_coverage.py`), the session preamble, the PR comment
-and the plugin validator. It has 484 unit tests of its own
-(`python3 -m unittest discover -s tests`), checked by mutation — a rule that
-still passes when its own condition is negated proves nothing.
+and the plugin validator. Each has a test suite of its own, checked by
+mutation — a rule that still passes when its own condition is negated proves
+nothing.
+
+**No test count is printed here**, deliberately. It is the number this project
+has got wrong most often: running the suite at the last commit and again in the
+working tree an hour later, on 2026-11-16, gave 966 and then 983. The command is
+the answer; the number is not.
+
+```sh
+cd tests && ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest
+```
+
+That `ls | xargs` form is the supported one — it is what CI runs and what
+[CONTRIBUTING.md](../CONTRIBUTING.md) asks of contributors.
+
+*This page printed `python3 -m unittest discover -s tests` until 2026-11-16, and
+three other pages warned that it reports 10 failures on a clean tree. Both were
+corrected that day, in opposite directions. Measured on 2026-11-16, at `HEAD`
+and in the working tree: `discover` and the `ls | xargs` form collect the same
+number of tests and both pass. What does produce a wall of failures — 15, from
+either form equally — is skipping `examples/fixtures/regen_git_history.sh` on a
+fresh clone. That, not `discover`, is what the warning was describing.
+`CLAUDE.md`, `CONTRIBUTING.md`, `README.md` and `docs/QUICKSTART.md` all still
+carried the `discover` wording; only QUICKSTART is this file's to fix.*
+
+How much Python, then: **10,185 raw lines, 7,218 excluding blanks and comment
+lines**, measured 2026-11-16 with the two commands below. Treat that as an order
+of magnitude and re-run them rather than quoting it — this page carried
+"~5,600 lines" until the same day, little more than half the raw figure, and
+the count moved again between two measurements taken that afternoon.
+
+```sh
+cat scripts/*.py | wc -l                              # raw
+cat scripts/*.py | grep -vE '^\s*$|^\s*#' | wc -l     # non-blank, non-comment
+```
 
 The division of labour is the design: anything a verdict depends on — can the
 suite run, can this test fail, is this environment safe — is executed, not
@@ -135,8 +168,14 @@ template. The claims are written down and falsifiable; they have not been
 measured and published yet. Treat every behavioural claim about this plugin as
 design intent until that file has numbers in it.
 
-*(This paragraph previously said "the README's claims". There is no README in
-this repository and there never has been — corrected 2026-11-16.)*
+*(This paragraph previously said "the README's claims". When that was corrected
+on 2026-11-16 there was no README in this repository and there never had been.
+**Later the same day a `README.md` was added**, and it carries this disclaimer
+itself, in its opening section — so the wording this correction removed would
+now be accurate. The correction stays rather than being deleted: it is the
+record of a file being quoted that did not exist, which is the defect this
+repository keeps catching in itself, and a record that only survives while it
+is convenient is not a record.)*
 
 ## How do I know it isn't making things up?
 
@@ -166,7 +205,11 @@ nobody can argue with.
 ## Can I turn bits off?
 
 Yes. **One hook ships enabled**: `SessionStart`, which reads a few files in
-`.testing/` and prints the ~150-token summary. The three that get in your way —
+`.testing/` and prints the session summary measured under *How much will it cost
+me in tokens?* above. (This line said "~150-token" until 2026-11-16 — the same
+superseded figure that section had already replaced with a measured one. A
+number repeated in two places goes stale in one of them.) The three that get in
+your way —
 run related tests on every edit, gate every turn end on the QA gatekeeper, block
 product-code edits during a task — live in `hooks/examples/` and are opt-in,
 each documented with what it costs and when it will annoy you. Remove any with

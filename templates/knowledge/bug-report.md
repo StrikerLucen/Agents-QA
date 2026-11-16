@@ -40,8 +40,8 @@ Starting state: clean checkout at `{{SHA}}`, `npm ci`, no `.env` overrides.
 
 ## Scales
 
-- **Severity** S1 data loss or money lost, no workaround · S2 core flow broken,
-  workaround exists · S3 degraded, contained · S4 cosmetic.
+- **Severity** S1 data loss, a secret exposed or money wrong, no workaround · S2 core
+  flow broken, workaround exists · S3 degraded but contained · S4 cosmetic.
 - **Evidence** ✅ reproduced · 👁 observed · 📖 code-read · 💭 suspicion.
   Only ✅ and 👁 reach the main report list; the rest go to the appendix and are
   never counted in the bug total.
