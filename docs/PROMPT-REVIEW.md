@@ -165,8 +165,8 @@ must say it unconditionally, including on BLOCKED, or the guard latches on forev
 
 **What is actually in the tree.** `skills/test/SKILL.md` §1, anchor *"**Mark the task in
 flight.** Write the task id to `.testing/tasks/current` — a single line, nothing else — and
-delete it when the task ends, however it ends."*, followed by the reason, anchor *"without
-it they are permanent no-ops and the product-code guard silently protects nothing."* And
+delete it when the task ends, however it ends."*, followed by the reason, anchor
+*"they are permanent no-ops and the product-code guard silently protects nothing."* And
 §5, anchor *"Delete `.testing/tasks/current` before you finish — on success, on BLOCKED,
 and on a crash"*. `skills/start/SKILL.md`'s "What gets written" table carries the row.
 
@@ -601,17 +601,34 @@ agent name used in a skill.
 
 ## Context-waste candidates
 
-`scripts/validate_plugin.py:240-244` sets the ceilings (agents 3,500 / skills 3,000 /
-templates 1,600 / RULES 1,200 tokens). The validator currently passes with **0
-warnings**, so nothing is over budget — but two agents are within ~10% of the ceiling
-(`automation-engineer.md` ~3,183, `debugger.md` ~3,031) and the headroom is spent on
-prose that is duplicated elsewhere.
+`scripts/validate_plugin.py` sets the ceilings in its `BUDGETS` dict — agents 3,500,
+skills 3,000, `templates/agents` 1,600, `report-rules` 1,200 tokens. The validator still
+passes with **0 warnings**, so nothing is over budget.
+
+**Re-measured 2026-11-16, and the headroom has got worse, not better.** Using the
+validator's own `estimate_tokens()`:
+
+| File | Then | Now | Ceiling |
+|---|---|---|---|
+| `agents/automation-engineer.md` | ~3,183 | **3,486** | 3,500 |
+| `agents/debugger.md` | ~3,031 | **3,136** | 3,500 |
+| `agents/reporter.md` | — | **3,022** | 3,500 |
+
+`automation-engineer.md` is now **14 tokens** — under half a percent — below a ceiling the
+validator fails the build on. The original finding said "within ~10%"; it is within 0.4%,
+and the next paragraph added to that file breaks `--strict`. The de-duplication below is
+no longer a tidiness exercise. Reproduce with:
+
+```sh
+python3 -c "import sys; sys.path.insert(0,'scripts'); import validate_plugin as v; \
+print(v.estimate_tokens('agents/automation-engineer.md'))"
+```
 
 | Candidate | Where | Est. saving |
 |---|---|---|
 | The flake/real-bug matrix, verbatim 5 times | `qa-gatekeeper.md:119-124`, `debugger.md:137-142`, `debug/SKILL.md:74-79`, `ts-debugger…:42-48`, `ts-qa-gatekeeper…:73-78` | ~**550 tok** — keep it in `RULES.md` and `debugger.md`; the others cite it |
 | `debug/SKILL.md:87-105` restates the four statistics `debugger.md:18-36` already carries (84%, 1-in-6, 18x/90%/25%, `1−(1−p)ⁿ`) | both files load together on `/testsquad:debug` | ~**345 tok** |
-| `automation-engineer.md:14-40` "Why you are built this way" — four paragraphs of arithmetic that change no action | | ~**300 tok** (compress to 3 bullets; full derivation already in `RESEARCH.md:417-443`) |
+| `agents/automation-engineer.md` "Why you are built this way" — four paragraphs of arithmetic that change no action | | ~**300 tok** (compress to 3 bullets; the derivation is already in `docs/RESEARCH.md` — §17, "Flakiness: reruns alone cannot work, and the math says so"). **This is the file that is 14 tokens from the ceiling; do this one first** |
 | "You cannot ask questions" section, 7 near-identical copies | `qa-gatekeeper:55-58`, `unit-test-engineer:132-135`, `automation-engineer:159-164`, `debugger:61-66`, `tech-scout:133-138`, `reporter:123-129`, `project-analyst:50-53` | ~**350 tok** (one sentence each: "You cannot prompt. Take the conservative reading and state the assumption.") |
 | Lesson-recording boilerplate + "a lesson without evidence is a rumour", 7 copies | all agents, "Last step" | ~**300 tok** (the five fields are specified authoritatively in `learn/SKILL.md:30-40`) |
 | Severity scale `S1 data loss · S2 … · S4 cosmetic` spelled out 4+ times | `qa-gatekeeper:156`, `unit-test-engineer:153-155`, `automation-engineer:189-190`, `debugger:179-180` | ~**100 tok** (defined in `RULES.md`, anchor *"**Severity (S1–S4) is computed"*) |

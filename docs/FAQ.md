@@ -58,11 +58,19 @@ is as useless as one that fires on nothing.
 
 The plugin's own footprint, measured from the files:
 
+Re-measured 2026-11-16 with the same `size // 4` estimator `scripts/validate_plugin.py`
+uses for its budgets:
+
 | | Tokens |
 |---|---|
-| Session preamble, every request in a repo with `.testing/` | **~150** (578 chars measured; a test caps it at 1,500 chars) |
-| A `/testsquad:test` run | **~6,000** — skill ~1,250, report rules ~790, plus 2–4 agents at ~2,100–3,200 each |
-| Any single agent / skill | ≤3,500 / ≤3,000, enforced by `scripts/validate_plugin.py` |
+| Session preamble, every request in a repo with `.testing/` | **~139** (555 chars, measured on a `.testing/` with a profile, a health baseline, three conventions and one known issue — it scales with those files). The **ceiling** is the stable number: `tests/test_integration.py` enforces 2,000 chars, fed deliberately oversized input |
+| A `/testsquad:test` run | **~7,900 at the two-agent floor, ~15,300 at the four-agent ceiling** — skill 1,890, report rules 957, plus 2–4 agents at 2,398–3,486 each |
+| Any single agent / skill | ≤3,500 / ≤3,000, enforced by `scripts/validate_plugin.py --strict` |
+
+*The previous version of this table said ~150 tokens / 578 chars / a 1,500-char cap, and
+"~6,000" for a `/testsquad:test` run. The cap is 2,000, not 1,500, and ~6,000 was below
+even the two-agent floor. Prose about token cost goes stale every time a prompt is
+edited; re-measure rather than cite.*
 
 No `.testing/` directory, no preamble: the hook exits silently on a repo that
 has never run `/testsquad:start`.

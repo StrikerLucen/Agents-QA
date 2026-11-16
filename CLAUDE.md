@@ -18,10 +18,12 @@ cd tests && ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest
 python3 scripts/validate_plugin.py . --strict
 ```
 
-Expect the suite **all passing**, plus one skip and one expected failure. Run it rather
-than trusting a count here — it moved from 717 to over 900 in a single session, so any
-number written down goes stale fast. The three failures the previous handoff named are
-fixed, as are two it did not know about.
+Expect the suite **all passing**, with no skips and one expected failure. Run it rather
+than trusting a count here — it moved from 717 to over 900 in a single session, and three
+different counts were measured in one afternoon, so any number written down goes stale
+before it is read. The three failures the previous handoff named are fixed, as are two it
+did not know about. The suite's only skip was removed when the test holding it turned out
+to be unable to fail on a fast machine.
 
 **Ask, do not assume**, on anything in `HANDOFF.md` §4. Those are the owner's calls.
 

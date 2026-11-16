@@ -75,12 +75,95 @@ MARKER_XFAIL = MARKERS[3]
 # session runs when nothing else can be trusted; a traceback here leaves the
 # reader with no numbers at all, and a quiet fallback leaves them with numbers
 # they would wrongly believe.
+# ---- the REACHABLE half of the same ceiling --------------------------------
+#
+# Everything above is about RecursionError, which is the half of this ceiling
+# a real file almost never reaches. CPython's tokenizer and PEG parser cap
+# nesting far earlier, and those caps are compile-time constants rather than a
+# function of the C stack. Measured here against _xfail_tests() with ast.parse,
+# macOS arm64, by bisection in child processes:
+#
+#                                        3.9.6 (this repo's    3.14.6
+#                                        FLOOR)
+#   (, [ or { nesting (tokenizer         accepts 200,          accepts 200,
+#   MAXLEVEL)                            raises at 201         raises at 201
+#       -> SyntaxError: "too many nested parentheses"
+#   indentation levels (tokenizer        accepts 99,           accepts 99,
+#   MAXINDENT)                           raises at 100         raises at 100
+#       -> IndentationError: "too many levels of indentation"
+#   nested unary (`not not not ...`,     no cap found;         accepts 5,967,
+#   pegen parser stack)                  parses 100,000        raises at 5,968
+#       -> MemoryError: "Parser stack overflowed - Python source too complex
+#          to parse"
+#   binop chain (`a + a + ...`)          no cap; SIGSEGV past  accepts 95,066,
+#       -> RecursionError                ~262,000              raises at 95,067
+#
+# 201 nested brackets is a thing generated code and vendored data literals do,
+# and 100 levels of indentation is the most reachable of the lot. 95,067
+# chained terms is not. Before this was fixed, the loud AST_TOO_DEEP signal
+# covered only the depth nobody reaches, while the depths a real file actually
+# hits were classified "syntax-error" and fell back to the line scanner in
+# silence -- `totals_exact: true`, `ast_unparsed_files: []`,
+# `files_ast_unparsed: 0`, a confident number nobody measured. The signal added
+# for this defect class was missing the only cases in range.
+#
+# Telling the two apart is only possible from the exception's MESSAGE. CPython
+# gives "this source is malformed" and "the parser hit its nesting cap" the
+# same exception type -- IndentationError is itself a SyntaxError subclass --
+# and attaches no code, no attribute and no flag that distinguishes them. So
+# message matching it is, and message matching is BRITTLE: these strings are
+# not API, a future CPython may reword them, and a translated or patched build
+# may not produce them at all. Verified verbatim on CPython 3.9.6 and 3.14.6
+# (macOS arm64) only.
+#
+# The brittleness is therefore made one-directional, which is the part that
+# matters:
+#
+#   recognised message  -> AST_TOO_DEEP, the loud signal
+#   ANY other message   -> "syntax-error", silent, exactly as before
+#
+# An unrecognised message can only ever cost a MISSED too-deep report. It can
+# never produce a spurious "this file could not be analysed" on an ordinary
+# half-written file -- which is the false positive that would fire on every
+# malformed file in a repo and get the whole signal switched off, taking the
+# rest of the report with it. If CPython rewords one of these, this degrades to
+# the old silent behaviour rather than to noise.
+_NESTING_CAP_MESSAGES = (
+    "too many nested parentheses",     # tokenizer MAXLEVEL; 3.9.6 and 3.14.6
+    "too many levels of indentation",  # tokenizer MAXINDENT; 3.9.6 and 3.14.6
+    "parser stack overflowed",         # pegen; 3.14.6, arrives as MemoryError
+)
+
+
+def _is_nesting_cap(exc: BaseException) -> bool:
+    """Does this exception mean "too deeply nested", rather than "malformed"?
+
+    Message text is the only signal CPython offers (see above). Both the
+    SyntaxError `.msg` and `str(exc)` are read: `.msg` is the documented
+    attribute and carries the bare text, `str()` appends "(<unknown>, line N)"
+    around it, and MemoryError has no `.msg` at all. On both interpreters
+    verified here the two overlap, so a mutant that reads only `str(exc)`
+    SURVIVES -- recorded rather than removed, because `.msg` is the stable
+    half (str()'s formatting has changed between CPython releases; the
+    attribute has not) and str() is the only half MemoryError has.
+    Unrecognised -> False -> the caller stays silent, which is the status quo.
+    """
+    text = "{} {}".format(getattr(exc, "msg", "") or "", exc).lower()
+    return any(fragment in text for fragment in _NESTING_CAP_MESSAGES)
+
+
 AST_TOO_DEEP = "ast-nesting-too-deep"
 AST_TOO_DEEP_REASON = (
-    "ast.parse raised RecursionError: expression nesting is too deep for "
-    "CPython's AST builder on this interpreter and stack. No flag raises this "
-    "ceiling -- it is the C stack, not sys.setrecursionlimit, and it moves "
-    "between platforms. The AST pass did NOT run on this file."
+    "ast.parse refused this file for nesting depth. It arrives as a "
+    "RecursionError (the AST builder running out of C stack), or as one of "
+    "CPython's parser nesting caps: SyntaxError \"too many nested "
+    "parentheses\" at 201 nested brackets, IndentationError \"too many levels "
+    "of indentation\" at 100 levels, or MemoryError \"Parser stack "
+    "overflowed\". Nothing about the file is wrong and no flag raises any of "
+    "these ceilings -- they are CPython's own limits, not sys.setrecursionlimit "
+    "and not this script's MAX_SCAN_BYTES, and the stack-dependent one moves "
+    "between platforms. "
+    "The AST pass did NOT run on this file."
 )
 AST_TOO_DEEP_LOST = (
     "the decorated test's NAME, and the certainty that each hit is a real "
@@ -275,14 +358,27 @@ def _xfail_tests(text: str) -> "tuple[list[dict] | None, str | None]":
     text match rather than the parser. Falling back silently there would be the
     same silence-looks-like-success defect this script exists to measure.
 
-    This function never raises. The docstring used to promise that while the
-    code only caught SyntaxError and ValueError, so a deeply nested expression
-    anywhere in the scanned tree killed section_markers() and with it the whole
-    state report.
+    This function never raises for a refusal -- only a MemoryError that is NOT
+    the parser's own stack overflow is re-raised, unchanged, because a real
+    out-of-memory must not be reported as a parse fallback. The docstring used
+    to promise "never raises" flatly while the code only caught SyntaxError and
+    ValueError, so a deeply nested expression anywhere in the scanned tree
+    killed section_markers() and with it the whole state report.
     """
     try:
         tree = ast.parse(text)
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError) as exc:
+        # The reachable ceiling arrives here, not below: CPython accepts 200
+        # nested brackets and 99 indentation levels, raising at 201 and at 100
+        # respectively, and it reports both of those as a
+        # SyntaxError (IndentationError is one). Same fact about the file as
+        # the RecursionError case -- too deeply nested for the AST builder --
+        # under a different exception type, so it gets the same loud signal.
+        # Anything whose message we do not recognise stays an ordinary,
+        # deliberately silent syntax error. See _is_nesting_cap above for why
+        # the fallback direction is the one that matters.
+        if _is_nesting_cap(exc):
+            return None, AST_TOO_DEEP
         return None, "syntax-error"
     except RecursionError:
         # Caught here and NOT re-raised, but the caller is handed the reason so
@@ -290,6 +386,17 @@ def _xfail_tests(text: str) -> "tuple[list[dict] | None, str | None]":
         # exact. Catch-and-continue on its own would be silence in a fix's
         # clothes.
         return None, AST_TOO_DEEP
+    except MemoryError as exc:
+        # CPython 3.14.6 reports its own parser-stack overflow as a
+        # MemoryError. A MemoryError we do NOT recognise is a real one, and is
+        # re-raised unchanged -- precisely what this function did before, since
+        # it never caught MemoryError at all. Swallowing a genuine out-of-memory
+        # would turn a machine-level failure into a quiet line-scan fallback
+        # with `totals_exact` still true, which is the defect class this guard
+        # exists to prevent, inverted.
+        if _is_nesting_cap(exc):
+            return None, AST_TOO_DEEP
+        raise
     found = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):

@@ -17,18 +17,35 @@ python3 scripts/validate_plugin.py . --strict
 **Re-measured 2026-11-16** (fixtures regenerated first with
 `cd examples/fixtures && ./regen_git_history.sh`, as `CLAUDE.md` requires):
 
-```
-Ran 922 tests in 33.801s
-OK (skipped=1, expected failures=1)
+**The test count is deliberately not recorded here.** Every run during this
+re-derivation gave a different one:
 
+| When | Result |
+|---|---|
+| original review | `539 tests, OK (2 expected failures)` |
+| 2026-11-12 | `873 tests, OK (skipped=1, expected failures=1)` |
+| 2026-11-16, early | `922 tests, OK (skipped=1, expected failures=1)` |
+| 2026-11-16, +40 min | `957 tests, OK (expected failures=1)` |
+| 2026-11-16, +15 min | `966 tests, OK (expected failures=1)` |
+
+Three counts in one afternoon, on one branch, while concurrent agents were landing tests.
+The *shape* of the result also moved twice: `2 expected failures` → `1 skip + 1 expected
+failure` → `1 expected failure, no skip`.
+
+**What is stable, and was re-confirmed on every run above:** the suite is green, and the
+validator prints
+
+```
 Validation passed: 26 component(s) checked, 0 warning(s), 0 could not be validated.
 ```
 
-*This block has now held three different counts — "539 tests, OK (2 expected failures)" at
-the original review, "873" dated 2026-11-12, and 922 today. The validator's 26 components
-is unchanged and was re-confirmed. **Do not trust any of these numbers; re-run the two
-commands.** The suite moved by 49 tests between the previous re-measurement and this one,
-which is why `CLAUDE.md` tells you to measure rather than read.*
+A previous version of this block asserted `873 tests` as a current fact, four days after
+it stopped being one. Recording the count was the error — not the count. **Run the two
+commands.**
+
+*(Note for whoever reads `CLAUDE.md`: it currently tells you to expect "all passing, plus
+one skip and one expected failure". The skip no longer exists. `CLAUDE.md` is outside this
+document's ownership, so this is flagged, not edited.)*
 
 **On locations in this document.** Where a finding cites a file, it quotes an anchor phrase
 rather than, or as well as, a line number. *This policy was stated but only partly
@@ -800,9 +817,8 @@ user the verbatim test command and get agreement before first execution (S2-3, f
 though it were outstanding. **S2-3 above already records that fix as shipped** — *"**Done**
 — this is now step 5"* — and the summary table records S2-3 as "**yes, by consent gate** —
 `/start` step 5". Three statements, one of them stale, in one document. Corrected
-2026-11-16; `skills/start/SKILL.md` step 5 carries the gate, anchor *"Say what is being
-agreed to: **these run code written by whoever wrote this repository, as you, on this
-machine.**"*
+2026-11-16; `skills/start/SKILL.md` step 5 carries the gate, anchor
+*"Say what is being agreed to: **these run code written by whoever wrote this repository,"*
 
 **The one thing I would change before this goes public, restated against the current
 tree:** the two remaining halves of S2-3 — a `remote_code_in_test_command` detector at

@@ -2574,5 +2574,342 @@ class ManifestTests(TempMixin, unittest.TestCase):
         self.assertEqual(text.count("\n  - "), sctx.MAX_CONVENTIONS)
 
 
+
+# --------------------------------------------------------------------------
+# the REACHABLE half of ast.parse's depth ceiling
+# --------------------------------------------------------------------------
+# Everything in `ProjectStateAstTests` and the `*AstDepth*` tests above is
+# about RecursionError -- the half of the ceiling a real file never reaches
+# (95,067 chained terms on 3.14.6, and on the 3.9.6 floor no catchable window
+# at all). CPython's tokenizer caps bracket nesting and indentation far
+# earlier, as compile-time constants, and reports both as a SyntaxError:
+# IndentationError is a SyntaxError subclass. So before the fix these landed
+# in the `except (SyntaxError, ValueError)` branch of all three scripts and
+# were classified "syntax-error" -- silent, by design, because a half-written
+# file is an ordinary state. The loud signal covered only the unreachable
+# case; the reachable ones fell back without a word.
+#
+# The depths are NOT hardcoded below. 200 and 99 are what CPython accepts
+# today, not a promise, so each cap is discovered at runtime by bisection and
+# the assertions are written against whatever was found. A CPython that
+# changes MAXLEVEL changes these tests' inputs, not their verdicts.
+#
+# The other half of the specification is the part that protects the signal
+# from itself: an ordinary half-written file must STAY silent. Message
+# matching is the only way CPython lets these be told apart, and message
+# matching is brittle, so the brittleness is one-directional -- an
+# unrecognised message costs a missed report, never a spurious "could not be
+# analysed" on every malformed file in a repo. That is pinned below across
+# four malformed shapes, and separately with a forced unrecognised message.
+
+def _bracket_source(depth):
+    """`depth` nested brackets -- the tokenizer's MAXLEVEL shape."""
+    return "x = " + "(" * depth + ")" * depth + "\n"
+
+
+def _indent_source(depth):
+    """`depth` levels of indentation -- the tokenizer's MAXINDENT shape."""
+    lines = ["    " * i + "if True:\n" for i in range(depth)]
+    lines.append("    " * depth + "pass\n")
+    return "".join(lines)
+
+
+def _parses(source):
+    try:
+        ast.parse(source)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return False
+    return True
+
+
+def discover_cap(make_source, ceiling=8192):
+    """The smallest depth `ast.parse` REFUSES, found by bisection.
+
+    Returns None when the interpreter accepts everything up to `ceiling` --
+    which is the honest answer for the pegen parser-stack shape on 3.9.6,
+    where no cap exists. Never hardcodes a depth: these are CPython's
+    constants today, and a test that asserts 201 would start lying the
+    release they move.
+    """
+    accepted, refused, probe = 0, None, 1
+    while probe <= ceiling:
+        if _parses(make_source(probe)):
+            accepted, probe = probe, probe * 2
+        else:
+            refused = probe
+            break
+    if refused is None:
+        return None
+    while refused - accepted > 1:
+        mid = (accepted + refused) // 2
+        if _parses(make_source(mid)):
+            accepted = mid
+        else:
+            refused = mid
+    return refused
+
+
+class AstNestingCapTests(unittest.TestCase):
+    """All three AST sites must report a nesting cap, and stay silent otherwise.
+
+    One class for three scripts on purpose. The same rule living in three
+    copies is this repository's single most common defect -- one of them had
+    seven copies -- and the cheapest guard against the copies drifting is a
+    test that refuses to let them answer differently.
+    """
+
+    # (label, callable) -- each takes source text and returns
+    # (result_or_None, why_not), with why_not None on success.
+    @classmethod
+    def sites(cls):
+        return (
+            ("flake_smells.python_blocks_ast_detailed",
+             fsm, fsm.python_blocks_ast_detailed),
+            ("arid_nodes.python_funcs_detailed",
+             arid, None if arid is None else arid.python_funcs_detailed),
+            ("project_state._xfail_tests",
+             pstate, pstate._xfail_tests),
+        )
+
+    def each_site(self):
+        """Yields (label, module, probe). Fails -- never skips -- when a
+        production module is missing: a missing script is a broken checkout,
+        not a platform this test does not apply to."""
+        for label, module, probe in self.sites():
+            self.assertIsNotNone(
+                module, f"{label}: its module did not import -- that is a "
+                        "broken checkout, not a reason to pass")
+            yield label, module, probe
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bracket_cap = discover_cap(_bracket_source)
+        cls.indent_cap = discover_cap(_indent_source, ceiling=1024)
+
+    # ---- the caps exist and are reachable ---------------------------------
+
+    def test_both_tokenizer_caps_are_discoverable_and_low(self):
+        """If this fails, every assertion below is testing nothing."""
+        self.assertIsNotNone(self.bracket_cap,
+                             "no bracket-nesting cap found below 8192 -- the "
+                             "cases below would be vacuous")
+        self.assertIsNotNone(self.indent_cap,
+                             "no indentation cap found below 1024 -- the "
+                             "cases below would be vacuous")
+        # The point of the fix: these are depths a generated or vendored file
+        # actually reaches, unlike the ~95,000-term RecursionError shape.
+        self.assertLess(self.bracket_cap, 1000)
+        self.assertLess(self.indent_cap, 1000)
+
+    # ---- the loud signal, at every site -----------------------------------
+
+    def test_bracket_cap_reports_too_deep_at_every_site(self):
+        at_cap = _bracket_source(self.bracket_cap)
+        just_under = _bracket_source(self.bracket_cap - 1)
+        for label, module, probe in self.each_site():
+            with self.subTest(site=label):
+                result, why = probe(just_under)
+                self.assertIsNone(
+                    why, f"{label}: {self.bracket_cap - 1} nested brackets is "
+                         "under CPython's cap and must parse normally")
+                self.assertIsNotNone(result)
+                result, why = probe(at_cap)
+                self.assertIsNone(result)
+                self.assertEqual(
+                    why, module.AST_TOO_DEEP,
+                    f"{label}: {self.bracket_cap} nested brackets went back to "
+                    "being a silent syntax-error fallback")
+
+    def test_indentation_cap_reports_too_deep_at_every_site(self):
+        # The most reachable of all of them, and an IndentationError, so it
+        # was already landing in the silent SyntaxError branch.
+        at_cap = _indent_source(self.indent_cap)
+        just_under = _indent_source(self.indent_cap - 1)
+        for label, module, probe in self.each_site():
+            with self.subTest(site=label):
+                result, why = probe(just_under)
+                self.assertIsNone(
+                    why, f"{label}: {self.indent_cap - 1} indentation levels "
+                         "is under CPython's cap and must parse normally")
+                result, why = probe(at_cap)
+                self.assertIsNone(result)
+                self.assertEqual(
+                    why, module.AST_TOO_DEEP,
+                    f"{label}: {self.indent_cap} indentation levels went back "
+                    "to being a silent syntax-error fallback")
+
+    def test_the_cap_signal_reaches_the_report_not_just_the_helper(self):
+        """A constant returned by a helper nobody surfaces is not a signal.
+
+        project_state keeps its own vocabulary for this -- the file is named
+        in `ast_unparsed_files`, `files_ast_unparsed` counts it and
+        `totals_exact` goes False -- and a cap must route into that machinery
+        rather than into a parallel one.
+        """
+        tmp = tempfile.mkdtemp(prefix="testsquad-nestcap-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        with open(os.path.join(tmp, "deep.py"), "w", encoding="utf-8") as fh:
+            fh.write(_indent_source(self.indent_cap))
+        with mock.patch.object(pstate, "ROOT", tmp):
+            markers = pstate.section_markers()
+        self.assertEqual([d["file"] for d in markers["ast_unparsed_files"]],
+                         ["deep.py"])
+        self.assertEqual(markers["files_ast_unparsed"], 1)
+        self.assertFalse(markers["totals_exact"],
+                         "a file counted by the line scanner must mark the "
+                         "totals inexact -- a confident number nobody "
+                         "measured is the defect this script exists to catch")
+        entry = markers["ast_unparsed_files"][0]
+        self.assertEqual(entry["fell_back_to"], "line-scan")
+        self.assertTrue(entry["reason"].strip())
+        self.assertTrue(entry["not_measured"].strip())
+
+    # ---- and the silence, which is the half that protects the signal ------
+
+    MALFORMED = (
+        # (label, source) -- four shapes a half-written file really takes.
+        ("unclosed bracket", "def f():\n    return (1, 2\n"),
+        ("unexpected indent", "x = 1\n    y = 2\n"),
+        ("unterminated string", "s = 'half a stri\nx = 1\n"),
+        ("truncated def", "def f(:\n"),
+    )
+
+    def test_ordinary_syntax_errors_stay_silent_at_every_site(self):
+        """The false positive that would switch the whole gate off.
+
+        A check above ~10% effective false positives gets ignored entirely.
+        "Could not be analysed" on every malformed file in a repo is 100%.
+        """
+        for shape, source in self.MALFORMED:
+            self.assertFalse(_parses(source),
+                             f"{shape}: fixture must actually be malformed")
+            for label, module, probe in self.each_site():
+                with self.subTest(site=label, shape=shape):
+                    result, why = probe(source)
+                    self.assertIsNone(result)
+                    self.assertEqual(
+                        why, "syntax-error",
+                        f"{label}: an ordinary {shape} must stay a silent "
+                        "syntax-error, not become a too-deep report")
+
+    def test_an_unrecognised_message_stays_silent_at_every_site(self):
+        """Message matching is brittle on purpose, in one direction only.
+
+        If a future CPython rewords "too many nested parentheses", this must
+        degrade to the old silent behaviour -- a missed report -- and never to
+        a spurious refusal on every malformed file.
+        """
+        for label, module, probe in self.each_site():
+            with self.subTest(site=label):
+                with mock.patch.object(
+                        ast, "parse",
+                        side_effect=SyntaxError("some future wording")):
+                    result, why = probe("x = 1\n")
+                self.assertIsNone(result)
+                self.assertEqual(why, "syntax-error",
+                                 f"{label}: an unrecognised message must cost "
+                                 "a missed report, never a spurious one")
+
+    def test_a_recognised_parser_stack_overflow_is_reported_at_every_site(self):
+        """CPython 3.14.6 raises this one as a MemoryError, not a SyntaxError.
+
+        Forced rather than generated: on the 3.9.6 floor the pegen parser has
+        no such cap at all, so the real shape cannot be produced there and an
+        interpreter-dependent test would pass by not running.
+        """
+        for label, module, probe in self.each_site():
+            with self.subTest(site=label):
+                with mock.patch.object(
+                        ast, "parse",
+                        side_effect=MemoryError(
+                            "Parser stack overflowed - Python source too "
+                            "complex to parse")):
+                    result, why = probe("x = 1\n")
+                self.assertIsNone(result)
+                self.assertEqual(why, module.AST_TOO_DEEP)
+
+    def test_a_genuine_memory_error_is_reraised_at_every_site(self):
+        """The same defect inverted: laundering an out-of-memory into a quiet
+        fallback would turn a machine-level failure into a clean-looking run.
+        """
+        for label, module, probe in self.each_site():
+            with self.subTest(site=label):
+                with mock.patch.object(
+                        ast, "parse",
+                        side_effect=MemoryError("Cannot allocate memory")):
+                    with self.assertRaises(MemoryError):
+                        probe("x = 1\n")
+
+    # ---- the drift guard --------------------------------------------------
+
+    def test_all_three_scripts_classify_every_refusal_identically(self):
+        """Three copies of one rule, pinned to answer the same thing.
+
+        Agreement alone would be satisfied by all three being equally wrong,
+        so every probe carries its EXPECTED classification too. The table is
+        the cheapest thing standing between this fix and the next divergence.
+        """
+        probes = [
+            ("valid source", "def test_x():\n    assert True\n", None),
+            ("bracket cap", _bracket_source(self.bracket_cap), "AST_TOO_DEEP"),
+            ("indentation cap", _indent_source(self.indent_cap), "AST_TOO_DEEP"),
+        ]
+        probes += [(shape, source, "syntax-error")
+                   for shape, source in self.MALFORMED]
+
+        forced = [
+            ("forced RecursionError",
+             RecursionError("maximum recursion depth exceeded during ast "
+                            "construction"), "AST_TOO_DEEP"),
+            ("forced parser-stack MemoryError",
+             MemoryError("Parser stack overflowed - Python source too complex "
+                         "to parse"), "AST_TOO_DEEP"),
+            ("forced unrecognised SyntaxError",
+             SyntaxError("some future wording"), "syntax-error"),
+            ("forced unrecognised ValueError",
+             ValueError("source code string cannot contain null bytes"),
+             "syntax-error"),
+            ("forced genuine MemoryError",
+             MemoryError("Cannot allocate memory"), "raised:MemoryError"),
+        ]
+
+        def classify(module, probe, source, exc=None):
+            try:
+                if exc is None:
+                    result, why = probe(source)
+                else:
+                    with mock.patch.object(ast, "parse", side_effect=exc):
+                        result, why = probe(source)
+            except BaseException as raised:  # noqa: BLE001 - that IS the answer
+                return "raised:" + type(raised).__name__
+            if why is None:
+                self.assertIsNotNone(result)
+                return None
+            self.assertIsNone(result)
+            return "AST_TOO_DEEP" if why == module.AST_TOO_DEEP else why
+
+        table = []
+        for name, source, expected in probes:
+            table.append((name, expected,
+                          [(label, classify(module, probe, source))
+                           for label, module, probe in self.each_site()]))
+        for name, exc, expected in forced:
+            table.append((name, expected,
+                          [(label, classify(module, probe, "x = 1\n", exc))
+                           for label, module, probe in self.each_site()]))
+
+        for name, expected, answers in table:
+            with self.subTest(probe=name):
+                got = {label: answer for label, answer in answers}
+                self.assertEqual(
+                    len(set(got.values())), 1,
+                    f"{name}: the three scripts disagree -- {got}")
+                self.assertEqual(
+                    sorted(got), sorted(l for l, _, _ in self.sites()),
+                    "a site dropped out of the drift guard")
+                self.assertEqual(
+                    set(got.values()), {expected},
+                    f"{name}: expected {expected!r} from all three, got {got}")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

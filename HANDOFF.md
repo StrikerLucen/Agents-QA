@@ -156,10 +156,15 @@ did not know about are too.
    - M15's last piece: the "What gets written" inventory in `skills/start/SKILL.md`
      is missing `mutation-plan.json`, `tooling-radar.md`, `coverage-raw.json` and
      `tasks/current`. M13, M14, M17 and M15's naming and CI halves are closed.
-   - **Three files are at their context ceiling**: `agents/automation-engineer.md` (14
-     tokens), `templates/agents/ts-qa-gatekeeper.md.tmpl` (28), `skills/start/SKILL.md`
-     (49). The next edit to any breaches the budget. Two restructuring levers exist and
-     were deliberately not pulled, both recorded in `docs/PROMPT-REVIEW.md`.
+   - **Four files are at their context ceiling** — re-measure before editing any of
+     them, the numbers move: `templates/ci/testsquad-pr.yml` (**5 bytes**),
+     `agents/automation-engineer.md`, `templates/agents/ts-qa-gatekeeper.md.tmpl`,
+     `skills/start/SKILL.md`. The next prose edit to any of them breaches the budget.
+     This is now a structural signal rather than four coincidences: the ceilings may be
+     wrong for these roles, or these files need a deliberate dedup pass. Two
+     restructuring levers were identified and not pulled, both in `docs/PROMPT-REVIEW.md`;
+     a third was used successfully on `skills/start/SKILL.md`, which paid for the entire
+     consent contract out of duplication it was already carrying.
 
 ## 5. How work is done here
 

@@ -556,8 +556,8 @@ are left for the owner because they change figures.
    2026-11-16 — the defect does not exist.** §20's operator table reads SBR **12.7%** and
    UOI **9.6%**, which *is* TABLE IV; `grep -F "| **SBR** statement block removal | 68.0% |
    12.7% | — |"` confirms it. §20 moreover discusses the 0.1pp question explicitly and
-   resolves it, anchor: *"**The paper states SBR and UOI survivability twice and the two do
-   not agree.**"* — TABLE 4 gives 12.7%/9.6%, the RQ2 prose and Figure 8 give 12.6%/9.5%,
+   resolves it, anchor:
+   *"**The paper states SBR and UOI survivability twice and the two do not agree.**"* — TABLE 4 gives 12.7%/9.6%, the RQ2 prose and Figure 8 give 12.6%/9.5%,
    and §20 states *"**We take TABLE 4**, because the rest of each row comes from TABLE 4
    and a row should have one source."* This entry reported §20 as carrying the figures §20
    had already rejected, read off two line numbers (`:636-637`) that point at prose, not

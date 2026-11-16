@@ -60,9 +60,10 @@ cd examples/fixtures && ./regen_git_history.sh   # required on a fresh clone
 cd ../../tests && ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest
 ```
 
-Measured 2026-11-16: **922 tests, `OK (skipped=1, expected failures=1)`, 33.8s.** Re-run
-it rather than trusting that number — the suite has gained hundreds of tests in single
-sessions, so any count written here goes stale quickly.
+Expect **green, with one expected failure**, in well under a minute. The *count* is
+deliberately not printed here: it went 922 → 957 → 966 over a single afternoon on
+2026-11-16 while this page was being written, so any number on this line would be wrong
+before you read it. The command is the answer; the number is not.
 
 **Do not use `python3 -m unittest discover -s tests`.** It is not equivalent: it reports
 10 failures on a clean tree, because the test modules import each other by bare module
@@ -160,9 +161,16 @@ conventions and six 200-character blockers to prove the caps hold under hostile 
 
 A `/testsquad:test` run loads the skill (**1,890 tokens**) plus the report rules
 (**957**) plus the 2–4 agents it selects, which range from **2,398** (`unit-test-engineer`)
-to **3,486** (`automation-engineer`). That is **~5,200 tokens at the two-agent floor and
+to **3,486** (`automation-engineer`). That is **~7,900 tokens at the two-agent floor and
 ~15,300 at the four-agent ceiling** — not a single figure, because the whole point of
 selecting 2–4 specialists rather than all 7 is that the cost varies.
+
+Reproduce any of these yourself:
+
+```sh
+python3 -c "import sys; sys.path.insert(0,'scripts'); import validate_plugin as v; \
+print(v.estimate_tokens('agents/automation-engineer.md'))"
+```
 
 ### When the answer is bad news
 

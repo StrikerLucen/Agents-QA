@@ -107,9 +107,9 @@ jobs:
             # It read nothing, or could not run. Either way say so, rather
             # than leave the last comment standing as if it still held.
             { echo '<!-- testsquad:pr-comment -->'
-              echo '**testsquad reported nothing.** It read no `.testing/`'
-              echo 'input, so nothing was checked - this is not a pass. The'
-              echo 'job log says why; `/testsquad:health` writes the first.'
+              echo '**testsquad reported nothing.** It read no usable'
+              echo '`.testing/` input, so nothing was checked - this is not a'
+              echo 'pass. The job log says why; start with `/testsquad:health`.'
             } > "$out"
           fi
           cat "$out"
