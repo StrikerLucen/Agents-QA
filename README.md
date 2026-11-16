@@ -20,9 +20,14 @@ request. They are listed below and you can run all three yourself in about a min
 
 **Not measured.** The seven agents in `agents/` and the sixteen commands in `skills/`
 are *prompts*: instructions to a model, as reliable as the model following them. The
-eleven behavioural claims in `evals/` are written down and falsifiable, and they have
-**never been scored**. `evals/SCORECARD.md` is still an unfilled template — every figure
-in it is an unreplaced `<...>` placeholder — and `evals/results/` does not exist.
+eleven behavioural claims in `evals/` are written down and falsifiable, and **ten of the
+eleven have never been scored**. `evals/SCORECARD.md` is still an unfilled template —
+every figure in it is an unreplaced `<...>` placeholder.
+
+One bounded run on 2026-11-16 measured 3 of the 27 cases, all under claim 1. On that
+claim the plugin scored **worse than running with no plugin at all** (mean Δ −0.20;
+not statistically significant at n=10 per arm, p = 0.35). The numbers and the caveats
+are in [`evals/RUN-2026-11-16-partial.md`](evals/RUN-2026-11-16-partial.md).
 
 > **Until `evals/SCORECARD.md` has numbers in it, every behavioural claim about this
 > plugin is design intent, not evidence.**
@@ -78,7 +83,7 @@ is not earned is worse than no badge.
 | `stacks/` | 10 per-language playbooks |
 | `templates/` | what gets generated into a user's repo |
 | `examples/fixtures/` | 3 repos with planted defects; `MANIFEST.json` is ground truth |
-| `evals/` | 27 cases, 81 graders, 11 behavioural claims + a deterministic pre-gate, 5 runs per case — **never run** |
+| `evals/` | 27 cases, 81 graders, 11 behavioural claims + a deterministic pre-gate, 5 runs per case — **3 cases run once, 2026-11-16; 10 of 11 claims still have no data** ([partial result](evals/RUN-2026-11-16-partial.md)) |
 | `docs/` | the citation ledger and three audits |
 | `hooks/` | one hook ships enabled (`SessionStart`); three more are opt-in in `hooks/examples/` |
 
