@@ -96,6 +96,72 @@ from atomic_io import write_text_atomic  # noqa: E402
 
 SCHEMA = "testsquad.aridnodes/1"
 
+
+# --------------------------------------------------------------------------
+# snippet redaction -- docs/SECURITY-REVIEW.md S3-1
+# --------------------------------------------------------------------------
+# Every finding carries up to 100 characters of verbatim source, and that
+# goes three places a secret must not: `.testing/`, which
+# `skills/start/SKILL.md` tells people to commit; the CI job log, which is
+# public on a public repository; and the uploaded artifact. A fixture holding
+# a real-shaped token -- `TEST_API_KEY = "sk_live_..."`, precisely the thing
+# `env_safety_check.py` exists because people do -- is copied into all three
+# the moment any rule fires on that line.
+#
+# The patterns are NOT redefined here. `pr_comment.py` already has a
+# `redact()` that reuses `env_safety_check`'s own `VENDOR_TOKEN_RES`,
+# `AWS_KEY_RE`, `STRIPE_LIVE_RE` and `AZURE_CONN_RE`, so this is the third
+# consumer of one definition rather than a third copy of it. Two copies of a
+# rule drifting apart is this repository's most frequent defect, and a
+# redaction rule that is right in one copy and stale in another leaks exactly
+# the shapes the stale copy has not heard of.
+#
+# The false-positive direction matters here too, and in the opposite sense to
+# a detector: over-redaction destroys the thing the snippet is for. A finding
+# whose evidence reads `[redacted]` cannot be judged, so it gets ignored, and
+# the gate goes with it. Nothing is added on top of `pr_comment.redact()`,
+# which is already calibrated for readability -- its key-name pattern keeps
+# the key name and drops only the value, and its length/charset/entropy gate
+# leaves `localhost` and `change-me-later` legible.
+#
+# The import is lazy and may fail (this gate runs when other things are
+# broken). If it does, snippets are emitted VERBATIM and the report says so,
+# in `summary.redaction` and on stderr -- an unredacted report that claims to
+# be redacted is worse than one that admits it is not.
+_REDACTOR = None
+
+
+def _redactor():
+    """(fn | None, source | None, reason | None). Resolved once."""
+    global _REDACTOR
+    if _REDACTOR is None:
+        try:
+            from pr_comment import redact as _fn
+            _REDACTOR = (_fn, "pr_comment.redact", None)
+        except Exception as exc:   # pragma: no cover - depends on sys.path
+            _REDACTOR = (None, None,
+                         "scripts/pr_comment.py could not be imported "
+                         "(%s: %s), so the snippets below are VERBATIM "
+                         "SOURCE and have NOT been checked for credentials"
+                         % (type(exc).__name__, exc))
+    return _REDACTOR
+
+
+def redact_snippet(text: str) -> str:
+    """Secret-shaped runs removed. Call this BEFORE truncating to 100
+    characters: half a key is still a leak, and truncating first would
+    publish the half that fell inside the window."""
+    fn = _redactor()[0]
+    return fn(text) if fn is not None else text
+
+
+def redaction_status() -> dict:
+    """What the reader needs to know about the line above -- `applied: false`
+    is a different report from `applied: true`, and must not read the same."""
+    fn, source, reason = _redactor()
+    return ({"applied": True, "source": source} if fn is not None
+            else {"applied": False, "source": None, "reason": reason})
+
 # Same ceiling and same reasoning as flake_smells.MAX_FILE_BYTES and
 # env_safety_check.MAX_BYTES: read_lines() holds the bytes, the decoded text
 # and the line list at once, and a 49MB generated file was measured at 45s and
@@ -104,14 +170,207 @@ SCHEMA = "testsquad.aridnodes/1"
 # ceiling the file is REPORTED in skipped_files, never quietly dropped.
 MAX_FILE_BYTES = 2 * 1024 * 1024
 
+# The file ceiling above bounds nothing *within* a file, and this script had no
+# per-line bound at all. Measured on this machine before the cap, with the
+# whole file comfortably under MAX_FILE_BYTES:
+#
+#   one line of "x = a + a + a + ..."   100,000 chars   0.080s
+#                                       400,000 chars   RecursionError
+#                                                       (ast.parse, uncaught,
+#                                                        kills the whole run)
+#   one line of spaces inside assert    400,000 chars   0.113s
+#
+# Same number as flake_smells.MAX_LINE_CHARS, and for the same reason: no
+# hand-written source line is 2,000 characters wide, so a line that is, is
+# minified, generated or vendored -- and a mutation planner has nothing useful
+# to say about any of those. Line numbers and the file's line count are
+# unchanged, so every planned mutant still points where it did, and every
+# shortened line is REPORTED in truncated_lines. A planner that quietly
+# shortens its input would report "no mutants here" about code it never read,
+# which is indistinguishable from a genuinely unmutable file.
+MAX_LINE_CHARS = 2000
+
+# The one ceiling in this file we do NOT set and cannot raise.
+#
+# `ast.parse` builds the Python AST objects from the C parse tree with a
+# recursive C function (`ast2obj_expr` in Python-ast.c), so a deeply NESTED
+# expression costs C stack, and past some depth `ast.parse` raises
+# `RecursionError`. That depth is not `sys.getrecursionlimit()`. Measured
+# here, binop chains (`a + a + a + ...`, nesting depth = term count):
+#
+#   CPython 3.14.6, macOS, main thread   accepts 95,065; RecursionError at
+#                                        95,066; still RecursionError at
+#                                        400,000 -- it never crashes
+#   CPython 3.14.6, 512KB thread stack   accepts 2,834; RecursionError at 2,835
+#   CPython 3.9.6 (this repo's FLOOR),   accepts 260,937; SIGSEGV (rc -11) by
+#   macOS, main thread                   262,500. Bisected in child processes.
+#                                        The macOS crash report for one of
+#                                        those runs names the cause: "Thread
+#                                        stack size exceeded due to excessive
+#                                        recursion", dead at recursion level
+#                                        261,942 -- inside the bracket above.
+#   CPython 3.9.6, 512KB thread stack,   SIGBUS, exit 138
+#   depth 20,000
+#
+# Three consequences, all measured rather than assumed:
+#
+#  1. `sys.setrecursionlimit()` is NOT the knob. On 3.14.6 at a 512KB stack and
+#     depth 3,000 the result is RecursionError at limits of 1,000, 10,000,
+#     100,000 and 1,000,000 alike.
+#  2. On 3.9.6 there is NO depth at which this raises. The bisect found no
+#     RecursionError anywhere between "accepted" and "crashed": it goes
+#     straight from OK at 260,937 to SIGSEGV. So the margin that raising the
+#     limit would be spending is not small -- on the interpreter this repo
+#     declares as its floor it does not exist. A RecursionError is catchable
+#     and can be reported; a SIGSEGV has no exception, no traceback, no output
+#     and no exit code a caller can act on. Raising the limit trades the
+#     former for the latter, which is strictly worse than the bug it would be
+#     trying to fix. We therefore do NOT raise it, and do not call
+#     threading.stack_size() either -- both are depth guesses, and a depth
+#     guess is exactly what is not portable here.
+#  3. The depth at which it bites depends on the C stack, which differs
+#     between macOS and Linux and between the main thread and a worker. A file
+#     that parses on a developer's machine can fail on a CI runner. That is
+#     exactly how this escaped: one machine could not have told us.
+#
+# Catching RecursionError at the call site needs no depth guess at all, which
+# is why it is the fix. Residual risk, stated plainly: on an interpreter whose
+# AST builder has no counter (3.9.6) a deep enough file still kills the
+# process, and nothing in this script can catch that. What this script
+# controls is that where the interpreter DOES raise, the run survives and says
+# so.
+#
+# So it has to be REPORTED, not merely survived. The AST pass is what gives
+# exact function spans and real parameter names; without it the regex scanner
+# still runs, but it misses lambdas, nested closures and any declaration shape
+# not in its table. A file where that happened is in `unparsed_files` and is
+# counted in summary.files_ast_unparsed -- a third state, distinct from both
+# "not read at all" (skipped_files) and "read and planned in full".
+# ---- the REACHABLE half of the same ceiling --------------------------------
+#
+# Everything above is about RecursionError, which is the half of this ceiling
+# a real file almost never reaches. CPython's tokenizer and PEG parser cap
+# nesting far earlier, and those caps are compile-time constants rather than a
+# function of the C stack. Measured here with ast.parse, macOS arm64, by
+# bisection in child processes:
+#
+#                                        3.9.6 (this repo's    3.14.6
+#                                        FLOOR)
+#   (, [ or { nesting (tokenizer         accepts 200,          accepts 200,
+#   MAXLEVEL)                            raises at 201         raises at 201
+#       -> SyntaxError: "too many nested parentheses"
+#   indentation levels (tokenizer        accepts 99,           accepts 99,
+#   MAXINDENT)                           raises at 100         raises at 100
+#       -> IndentationError: "too many levels of indentation"
+#   nested unary (`not not not ...`,     no cap found;         accepts 5,966,
+#   pegen parser stack)                  parses 100,000        raises at 5,967
+#       -> MemoryError: "Parser stack overflowed - Python source too complex
+#          to parse"
+#   binop chain (`a + a + ...`)          no cap; 100,000 ok    accepts 95,066,
+#       -> RecursionError                (SIGSEGV past         raises at 95,067
+#                                         ~262,000)
+#
+# 201 nested brackets is a thing generated code and vendored data literals do.
+# 95,067 chained terms is not. Before this was fixed, the loud AST_TOO_DEEP
+# signal covered only the depth nobody reaches, while the depth a real file
+# actually hits was classified "syntax-error" and fell back to the regex
+# scanner in silence -- `parsed_with: regex`, `files_ast_unparsed: 0`,
+# `unparsed_files: []`, empty stderr, exit 0. The signal added for this defect
+# class was missing the only case in range.
+#
+# Telling the two apart is only possible from the exception's MESSAGE. CPython
+# gives "this source is malformed" and "the parser hit its nesting cap" the
+# same exception type -- IndentationError is itself a SyntaxError subclass --
+# and attaches no code, no attribute and no flag that distinguishes them. So
+# message matching it is, and message matching is BRITTLE: these strings are
+# not API, a future CPython may reword them, and a translated or patched build
+# may not produce them at all. Verified verbatim on CPython 3.9.6 and 3.14.6
+# (macOS arm64) only.
+#
+# The brittleness is therefore made one-directional, which is the part that
+# matters:
+#
+#   recognised message  -> AST_TOO_DEEP, the loud signal
+#   ANY other message   -> "syntax-error", silent, exactly as before
+#
+# An unrecognised message can only ever cost a MISSED too-deep report. It can
+# never produce a spurious "this file could not be analysed" on an ordinary
+# half-written file -- which is the false positive that would fire on every
+# malformed file in a repo and get the whole signal switched off, taking the
+# rest of the gate with it. If CPython rewords one of these, this degrades to
+# the old silent behaviour rather than to noise.
+_NESTING_CAP_MESSAGES = (
+    "too many nested parentheses",     # tokenizer MAXLEVEL; 3.9.6 and 3.14.6
+    "too many levels of indentation",  # tokenizer MAXINDENT; 3.9.6 and 3.14.6
+    "parser stack overflowed",         # pegen; 3.14.6, arrives as MemoryError
+)
+
+
+def _is_nesting_cap(exc: BaseException) -> bool:
+    """Does this exception mean "too deeply nested", rather than "malformed"?
+
+    Message text is the only signal CPython offers (see above). Both the
+    SyntaxError `.msg` and `str(exc)` are read: `.msg` is the documented
+    attribute and carries the bare text, `str()` appends "(<unknown>, line N)"
+    around it, and MemoryError has no `.msg` at all. On both interpreters
+    verified here the two overlap, so a mutant that reads only `str(exc)`
+    SURVIVES -- recorded rather than removed, because `.msg` is the stable
+    half (str()'s formatting has changed between CPython releases; the
+    attribute has not) and str() is the only half MemoryError has.
+    Unrecognised -> False -> the caller stays silent, which is the status quo.
+    """
+    text = "{} {}".format(getattr(exc, "msg", "") or "", exc).lower()
+    return any(fragment in text for fragment in _NESTING_CAP_MESSAGES)
+
+
+AST_TOO_DEEP = "ast-nesting-too-deep"
+AST_TOO_DEEP_REASON = (
+    "ast.parse refused this file for nesting depth. It arrives as a "
+    "RecursionError (the AST builder running out of C stack), or as one of "
+    "CPython's parser nesting caps: SyntaxError \"too many nested "
+    "parentheses\" at 201 nested brackets, IndentationError \"too many levels "
+    "of indentation\" at 100 levels, or MemoryError \"Parser stack "
+    "overflowed\". Nothing about the file is wrong and no flag raises any of "
+    "these ceilings -- they are CPython's own limits, not --max-file-bytes, "
+    "--max-line-chars or sys.setrecursionlimit, and the stack-dependent one "
+    "moves between platforms. The AST pass did NOT run on this file."
+)
+AST_TOO_DEEP_LOST = (
+    "exact function spans and real parameter names; the regex scanner ran "
+    "instead, so rules needing function context (trivial-accessor, "
+    "pure-delegation, repr/equality boilerplate) may not have fired on "
+    "lambdas, nested closures or unrecognised declaration shapes"
+)
+
 
 # --------------------------------------------------------------------------
 # operators
 # --------------------------------------------------------------------------
 # Five operators, chosen because Google measured them, not because they are
-# elegant. `weight` is the selection weight when several apply to one line;
+# elegant. `weight` is the selection weight when several apply to one line.
+#
 # `productive` is the share of mutants of that kind developers judged worth
-# seeing, and is what the weights are derived from.
+# seeing. It is a MEASUREMENT, and it exists for exactly two of the five:
+# ROR (0.841) and UOI (0.745), from Petrovic et al., TSE 2021, which reports
+# productivity for those two operators and no others. docs/RESEARCH.md S20 is
+# honest about this -- the other three cells read "--".
+#
+# SBR, AOR and LCR therefore carry `productive=None`, meaning NOT MEASURED.
+# They previously carried 0.80, 0.79 and 0.78, which no study produced; they
+# sat between the two real endpoints in descending order of the weights beside
+# them, which is what interpolation looks like, and they read as measurements
+# because they sat next to measurements. None is the honest value here: this
+# project's rule is that "not measured" is a valid answer and a confident
+# wrong number is not.
+#
+# The weights are NOT derived from this column, and the old comment claiming
+# they were could not have been true -- SBR, AOR and LCR share weight=3.0
+# while the three deleted values were all different. The weights are a design
+# choice: ROR highest because it is the best-measured of the five, UOI lowest
+# because it is the worst, and the remaining three level in the middle
+# because there is no measurement to rank them by. Nothing reads this column
+# (the weighted draw in choose_operator() reads `weight` only), so the three
+# values never reached a user and changing them changes no behaviour.
 
 OPERATORS: dict[str, dict] = {
     "ROR": dict(
@@ -122,20 +381,20 @@ OPERATORS: dict[str, dict] = {
             "best of the five, so ties go here.",
     ),
     "SBR": dict(
-        weight=3.0, productive=0.80,
+        weight=3.0, productive=None,  # not measured; see note above
         what="delete the statement",
         why="Statement removal is ~68% of Google's generated mutants: it asks "
             "the bluntest useful question, 'does any test notice if this line "
             "never runs?'",
     ),
     "AOR": dict(
-        weight=3.0, productive=0.79,
+        weight=3.0, productive=None,  # not measured; see note above
         what="replace an arithmetic operator (+ with -, * with /)",
         why="Arithmetic mutants are cheap to understand and land directly on "
             "the calculations people care about most.",
     ),
     "LCR": dict(
-        weight=3.0, productive=0.78,
+        weight=3.0, productive=None,  # not measured; see note above
         what="replace a logical connector (and with or)",
         why="A flipped connector is how authorization and validation rules "
             "silently widen, and a test that cannot see it is a real gap.",
@@ -600,8 +859,8 @@ BRACE_FUNC_RE = re.compile(
 RUBY_DEF_RE = re.compile(r"^(\s*)def\s+(?:self\.)?([\w?!=]+)\s*(?:\((.*)\))?")
 
 
-def python_funcs(source: str) -> list[Func] | None:
-    """Exact spans from Python's own parser.
+def python_funcs_detailed(source: str) -> tuple[list[Func] | None, str | None]:
+    """(funcs, why_not) -- funcs is None when Python's own parser refused it.
 
     `ast` genuinely helps here and is not decoration: it gives real parameter
     names (so pure-delegation can compare arguments to parameters rather than
@@ -609,11 +868,52 @@ def python_funcs(source: str) -> list[Func] | None:
     one-line even when its decorators and type hints span four). Returns None
     when the file does not parse, so the caller can fall back to the regex
     scanner -- a half-written file still deserves an answer.
+
+    `why_not` exists because those refusals are not one thing. A SyntaxError is
+    an ordinary, expected state: the file is half-written, the regex scanner
+    is the right answer and saying so every time would be noise. A
+    RecursionError is not: nothing about the file is wrong, the limit is the
+    interpreter's C stack (see AST_TOO_DEEP above), it differs per platform,
+    and the caller MUST be able to tell the reader that the AST pass did not
+    run. Falling back silently in that case is the whole defect class this
+    file exists to avoid.
+
+    This function never raises for a refusal -- only a MemoryError that is NOT
+    the parser's own stack overflow is re-raised, unchanged, because a real
+    out-of-memory must not be reported as a parse fallback. The docstring used
+    to promise "never raises" while the code only caught SyntaxError and
+    ValueError, so a deeply nested expression
+    killed the entire run from inside plan().
     """
     try:
         tree = ast.parse(source)
-    except (SyntaxError, ValueError):
-        return None
+    except (SyntaxError, ValueError) as exc:
+        # The reachable ceiling arrives here, not below: CPython caps bracket
+        # nesting at 200 and indentation at 100, and reports both as a
+        # SyntaxError (IndentationError is one). Same fact about the file as
+        # the RecursionError case -- too deeply nested for the AST builder --
+        # under a different exception type, so it gets the same loud signal.
+        # Anything whose message we do not recognise stays an ordinary,
+        # deliberately silent syntax error. See _is_nesting_cap above for why
+        # the fallback direction is the one that matters.
+        if _is_nesting_cap(exc):
+            return None, AST_TOO_DEEP
+        return None, "syntax-error"
+    except RecursionError:
+        # Caught here and NOT re-raised, but the caller is handed the reason so
+        # it can put the file in unparsed_files. Catch-and-continue on its own
+        # would be silence wearing a fix's clothes.
+        return None, AST_TOO_DEEP
+    except MemoryError as exc:
+        # CPython 3.14.6 reports its own parser-stack overflow as a
+        # MemoryError. A MemoryError we do NOT recognise is a real one, and is
+        # re-raised unchanged -- precisely what this function did before, since
+        # it never caught MemoryError at all. Swallowing a genuine out-of-memory
+        # would turn a machine-level failure into a quiet regex fallback, which
+        # is the defect class this guard exists to prevent, inverted.
+        if _is_nesting_cap(exc):
+            return None, AST_TOO_DEEP
+        raise
     funcs: list[Func] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -641,7 +941,14 @@ def python_funcs(source: str) -> list[Func] | None:
         head = body[0].col_offset if body[0].lineno == node.lineno else 0
         funcs.append(Func(node.name, params, node.lineno, end, body_lines, head))
     funcs.sort(key=lambda f: f.start)
-    return funcs
+    return funcs, None
+
+
+def python_funcs(source: str) -> list[Func] | None:
+    """Back-compatible wrapper: spans only. Prefer python_funcs_detailed(),
+    which also hands back WHY the parser refused -- a caller that cannot tell
+    "half-written" from "too deeply nested" cannot report the second one."""
+    return python_funcs_detailed(source)[0]
 
 
 def regex_funcs(code: list[str], lang: str) -> list[Func]:
@@ -1141,10 +1448,16 @@ class FileScan:
         self.raw = raw
         self.code, self.strings = scrub(raw, lang)
         self.ast_used = False
+        # None unless the AST pass was attempted and the interpreter refused
+        # the file for depth. "Not attempted" (Java, --no-ast) and "attempted
+        # and failed" must not look alike downstream.
+        self.ast_unavailable: str | None = None
         funcs = None
         if lang == "python" and use_ast:
-            funcs = python_funcs("".join(raw))
+            funcs, why = python_funcs_detailed("".join(raw))
             self.ast_used = funcs is not None
+            if why == AST_TOO_DEEP:
+                self.ast_unavailable = why
         self.funcs = funcs if funcs is not None else regex_funcs(self.code, lang)
         self.unreachable = _unreachable_lines(self.code)
         self._by_line: dict[int, Func] = {}
@@ -1159,7 +1472,13 @@ class FileScan:
         return self._by_line.get(line)
 
     def snippet(self, line: int) -> str:
-        s = self.raw[line - 1].strip() if 0 < line <= len(self.raw) else ""
+        # Redact first, truncate second: a token straddling the 100-character
+        # boundary would otherwise have its first 97 characters published.
+        # This is the single value used everywhere downstream -- the planned
+        # mutation, the suppression record AND the operator hash -- so there
+        # is never a redacted copy next to an unredacted one.
+        s = (redact_snippet(self.raw[line - 1]).strip()
+             if 0 < line <= len(self.raw) else "")
         return s[:97] + "..." if len(s) > 100 else s
 
     def prev_code_line(self, line: int) -> int | None:
@@ -1326,11 +1645,28 @@ def _body_text(scan: FileScan, func: Func, line: int) -> str:
 
 
 def _single_statement_body(scan: FileScan, func: Func) -> int | None:
-    """The line number when the function's body is exactly one statement."""
-    body = [n for n in func.body
-            if n <= len(scan.code) and scan.code[n - 1].strip()
-            and scan.code[n - 1].strip() not in STRUCTURAL]
-    return body[0] if len(body) == 1 else None
+    """The line number when the function's body is exactly one statement.
+
+    Stops at the second statement rather than materialising the whole body.
+    It was a list comprehension over every line of the enclosing function,
+    called twice for every candidate line in that function, so one function
+    cost O(body^2): measured on a file well under MAX_FILE_BYTES, 8,005 lines
+    inside one function took 12.2s and 4,005 lines took 3.5s -- 2x the lines
+    for 3.5x the time. Extrapolated to a 2MB file of that shape, the file
+    ceiling permits roughly an hour and a half of work, so the ceiling was not
+    actually bounding anything. Same answer, O(body).
+    """
+    found: int | None = None
+    for n in func.body:
+        if n > len(scan.code):
+            continue
+        stripped = scan.code[n - 1].strip()
+        if not stripped or stripped in STRUCTURAL:
+            continue
+        if found is not None:
+            return None          # a second statement: not a one-liner
+        found = n
+    return found
 
 
 ACCESSOR_RETURN_RE = re.compile(
@@ -1501,7 +1837,7 @@ def analyse_file(path: str, raw: list[str], lang: str, *, seed: int = 0,
         if applies:
             entry["suppressed"].append({
                 "line": 1,
-                "snippet": (raw[0].strip()[:97] if raw else ""),
+                "snippet": (redact_snippet(raw[0]).strip()[:97] if raw else ""),
                 "rule": rule,
                 "scope": "file",
                 "why": RULES[rule]["why"],
@@ -1511,6 +1847,12 @@ def analyse_file(path: str, raw: list[str], lang: str, *, seed: int = 0,
 
     scan = FileScan(path, lang, raw, use_ast=use_ast)
     entry["parsed_with"] = "ast" if scan.ast_used else "regex"
+    if scan.ast_unavailable:
+        # `parsed_with: "regex"` is also what a Java file and a --no-ast run
+        # say, so it cannot carry this on its own. A separate key, named for
+        # what happened, so "regex because that is the right tool here" and
+        # "regex because the AST pass could not run" stay distinguishable.
+        entry["ast_unavailable"] = scan.ast_unavailable
 
     pool: list[dict] = []
     for i in range(1, len(scan.code) + 1):
@@ -1584,35 +1926,101 @@ def iter_paths(paths: list[str]):
             yield p
 
 
-def read_lines(path: str, *, max_bytes: int = MAX_FILE_BYTES) -> list[str] | None:
-    """None for an unreadable, binary or oversized file. A mutation planner
-    that crashes on one odd file blocks the whole run, so this never raises."""
+def read_lines_detailed(path: str, *, max_bytes: int = MAX_FILE_BYTES,
+                        max_line_chars: int = MAX_LINE_CHARS
+                        ) -> tuple[list[str] | None, list[dict], str | None]:
+    """(lines, truncated, why_not) -- lines is None when the file was not
+    read; `why_not` then says which of the three reasons it was.
+
+    `truncated` exists so the caller cannot report silence about text it
+    shortened. `why_not` is the same argument one level up: the caller
+    already recorded every unread file in `skipped_files`, but under a single
+    string -- "unreadable or binary" -- that collapsed three causes needing
+    three different reactions. A permission error or a broken symlink is
+    wrong with the CHECKOUT; a NUL-byte file is a file that is not source;
+    an oversize file is a ceiling this tool chose and can raise. The wording
+    follows `risk_map.py`'s `skip_reason()` rather than inventing a fourth
+    phrasing of the same idea. `flake_smells.py` carries the identical
+    change, deliberately word-for-word: two copies of one rule drifting apart
+    is this repository's most frequent defect.
+
+    Measured, so it is not guessed at: there is NO fourth cause.
+    `latin-1` maps all 256 byte values, so `blob.decode("latin-1")` cannot
+    raise on a bytes input -- verified over every single byte and over a
+    200,000-byte random blob on CPython 3.14.6. The `except Exception` that
+    used to guard it was unreachable, and a reachable-looking guard around an
+    unreachable branch tells a reader a case is handled when nothing handles
+    it. It is gone; if a future encoding change makes decoding fallible
+    again it must come back WITH a reason string, not a bare `return None`.
+
+    A mutation planner that crashes on one odd file blocks the whole run, so
+    this never raises.
+    """
     try:
         if os.path.getsize(path) > max_bytes:
-            return None
+            return None, [], (f"larger than {max_bytes} bytes "
+                              f"({max_bytes // (1024 * 1024)}MB ceiling); "
+                              "raise --max-file-bytes to plan it")
         with open(path, "rb") as fh:
             blob = fh.read()
-    except OSError:
-        return None
+    except OSError as exc:
+        return None, [], (f"unreadable ({exc.strerror or exc}); the file was "
+                          "NOT planned and nothing here is a verdict on it")
     if b"\x00" in blob[:8000]:
-        return None
+        return None, [], ("binary (a NUL byte in the first 8000 bytes); it "
+                          "carries a source extension but is not source "
+                          "text, so it was NOT planned")
     try:
         text = blob.decode("utf-8")
     except UnicodeDecodeError:
-        try:
-            text = blob.decode("latin-1")
-        except Exception:
-            return None
-    return text.splitlines(keepends=True)
+        text = blob.decode("latin-1")
+
+    lines: list[str] = []
+    truncated: list[dict] = []
+    for n, line in enumerate(text.splitlines(keepends=True), start=1):
+        if len(line) > max_line_chars:
+            truncated.append({
+                "file": path,
+                "line": n,
+                "chars": len(line),
+                "read_chars": max_line_chars,
+                "reason": (f"line is {len(line)} characters, over the "
+                           f"{max_line_chars}-character line ceiling; only "
+                           f"the first {max_line_chars} were considered for "
+                           "mutation and the rest was NOT read"),
+            })
+            line = line[:max_line_chars]
+        lines.append(line)
+    return lines, truncated, None
+
+
+def read_lines_bounded(path: str, *, max_bytes: int = MAX_FILE_BYTES,
+                       max_line_chars: int = MAX_LINE_CHARS
+                       ) -> tuple[list[str] | None, list[dict]]:
+    """Back-compatible wrapper: (lines, truncated). Prefer
+    read_lines_detailed(), which also hands back WHY the file was not read --
+    a caller that cannot tell "I lacked permission" from "this is not source"
+    has to report both as the same thing."""
+    return read_lines_detailed(path, max_bytes=max_bytes,
+                               max_line_chars=max_line_chars)[:2]
+
+
+def read_lines(path: str, *, max_bytes: int = MAX_FILE_BYTES) -> list[str] | None:
+    """Back-compatible wrapper: lines only. Prefer read_lines_bounded(), which
+    also hands back what it had to shorten."""
+    return read_lines_bounded(path, max_bytes=max_bytes)[0]
 
 
 def plan(paths: list[str], *, seed: int = 0, max_per_file: int = 7,
          feedback: Feedback | None = None,
          diff: dict[str, set[int]] | None = None,
-         use_ast: bool = True, max_bytes: int = MAX_FILE_BYTES) -> dict:
+         use_ast: bool = True, max_bytes: int = MAX_FILE_BYTES,
+         max_line_chars: int = MAX_LINE_CHARS) -> dict:
     feedback = feedback or Feedback()
     files: list[dict] = []
     skipped_files: list[dict] = []
+    truncated_lines: list[dict] = []
+    unparsed_files: list[dict] = []
     by_rule: dict[str, int] = {}
     considered = 0
     capped = 0
@@ -1630,24 +2038,36 @@ def plan(paths: list[str], *, seed: int = 0, max_per_file: int = 7,
                 # Not in the diff. Silence, not a finding: a mutation gate
                 # scoped to a change has nothing to say about untouched files.
                 continue
-        raw = read_lines(path, max_bytes=max_bytes)
+        raw, cut, why_not = read_lines_detailed(path, max_bytes=max_bytes,
+                                                max_line_chars=max_line_chars)
+        truncated_lines.extend(cut)
         if raw is None:
             # A file with no mutants and a file nobody opened produce the same
-            # empty result, so the second one has to say so.
-            try:
-                oversized = os.path.getsize(path) > max_bytes
-            except OSError:
-                oversized = False
+            # empty result, so the second one has to say so -- and say WHICH
+            # of the three things happened. The reason used to be re-derived
+            # here by a second getsize(), a second copy of a rule that
+            # answered "unreadable or binary" to everything the ceiling had
+            # not caught.
             skipped_files.append({
                 "file": path,
-                "reason": (f"larger than {max_bytes} bytes "
-                           f"({max_bytes // (1024 * 1024)}MB ceiling); "
-                           "raise --max-file-bytes to plan it")
-                if oversized else "unreadable or binary",
+                "reason": why_not or "not read, and the reader did not say why",
             })
             continue
         entry = analyse_file(path, raw, lang, seed=seed, max_per_file=max_per_file,
                              feedback=feedback, changed=changed, use_ast=use_ast)
+        if entry.get("ast_unavailable") == AST_TOO_DEEP:
+            # The file WAS read and WAS planned -- so it is not in
+            # skipped_files and it does count in summary.files -- but it was
+            # planned by the weaker of the two scanners. Saying which, and
+            # what that costs, is the difference between a partial analysis
+            # and a partial analysis reported as complete.
+            unparsed_files.append({
+                "file": path,
+                "stage": "ast",
+                "reason": AST_TOO_DEEP_REASON,
+                "fell_back_to": "regex",
+                "not_analysed": AST_TOO_DEEP_LOST,
+            })
         considered += len(entry["candidates"])
         selected += len(entry["selected"])
         for s in entry["suppressed"]:
@@ -1674,10 +2094,28 @@ def plan(paths: list[str], *, seed: int = 0, max_per_file: int = 7,
             else None,
         },
         "skipped_files": skipped_files,
+        # A truncated line is a third state, distinct from both "file not
+        # read" and "file read, no mutants": the file WAS read and WAS
+        # planned, but part of a line was not looked at, so "no mutants on
+        # this line" is a statement about its head only.
+        "truncated_lines": truncated_lines,
+        # A third state again, one level sideways: the file was read in full
+        # and planned in full, but by the regex scanner, because the AST pass
+        # could not run on it. Never a finding -- deeply nested generated code
+        # is legitimate, and a check that fires on it would be switched off
+        # inside a week, taking the rest of the gate with it.
+        "unparsed_files": unparsed_files,
         "files": files,
         "summary": {
+            # S3-1: snippets are verbatim source, so the report has to say
+            # whether anything filtered them. `applied: false` must never be
+            # mistaken for "nothing matched".
+            "redaction": redaction_status(),
             "files": len(files),
             "files_skipped": len(skipped_files),
+            "files_ast_unparsed": len(unparsed_files),
+            "lines_truncated": len(truncated_lines),
+            "files_with_truncated_lines": len({t["file"] for t in truncated_lines}),
             "lines_considered": considered,
             "suppressed_by_rule": dict(sorted(by_rule.items())),
             "suppressed_by_cap": capped,
@@ -1713,6 +2151,31 @@ def render_text(result: dict) -> str:
             out.append(f"  skipped {entry['file']}: {entry['reason']}")
         if len(unread) > 5:
             out.append(f"  ... and {len(unread) - 5} more")
+    # Same distinction one level down: part of this line was never read, so
+    # "no mutant here" is a claim about its first MAX_LINE_CHARS only.
+    cut = result.get("truncated_lines") or []
+    if cut:
+        out.append(f"{len(cut)} line(s) only PARTLY read "
+                   "(see truncated_lines):")
+        for entry in cut[:5]:
+            out.append(f"  truncated {entry['file']}:{entry['line']}: "
+                       f"{entry['chars']} chars, first {entry['read_chars']} "
+                       "considered, the rest NOT read")
+        if len(cut) > 5:
+            out.append(f"  ... and {len(cut) - 5} more")
+    # And the state between the two: fully read, fully planned, but with the
+    # AST pass missing. Out loud in the terminal as well as in the JSON,
+    # because the terminal is where a developer decides the run went fine.
+    deep = result.get("unparsed_files") or []
+    if deep:
+        out.append(f"{len(deep)} file(s) planned WITHOUT the AST pass "
+                   "(see unparsed_files):")
+        for entry in deep[:5]:
+            out.append(f"  not parsed {entry['file']}: nesting too "
+                       f"deep for ast.parse; fell back to {entry['fell_back_to']}, "
+                       "so exact function spans and parameter names were NOT used")
+        if len(deep) > 5:
+            out.append(f"  ... and {len(deep) - 5} more")
     return "\n".join(out)
 
 
@@ -1736,6 +2199,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="skip source files larger than this "
                          f"(default {MAX_FILE_BYTES}, i.e. 2MB); skipped files "
                          "are reported in skipped_files, never ignored")
+    ap.add_argument("--max-line-chars", type=int, default=MAX_LINE_CHARS,
+                    help="consider only the first N characters of a line "
+                         f"(default {MAX_LINE_CHARS}); every line past it is "
+                         "reported in truncated_lines, never silently cut")
     args = ap.parse_args(argv)
 
     missing = [p for p in args.paths if not os.path.exists(p)]
@@ -1751,7 +2218,8 @@ def main(argv: list[str] | None = None) -> int:
         feedback = load_feedback(args.feedback) if args.feedback else None
         result = plan(args.paths, seed=args.seed, max_per_file=args.max_per_file,
                       feedback=feedback, diff=diff,
-                      max_bytes=args.max_file_bytes)
+                      max_bytes=args.max_file_bytes,
+                      max_line_chars=args.max_line_chars)
         payload = (json.dumps(result, indent=2) if args.format == "json"
                    else render_text(result))
         if args.out:
@@ -1760,9 +2228,20 @@ def main(argv: list[str] | None = None) -> int:
             write_text_atomic(args.out, payload + "\n")
         else:
             print(payload)
+        red = result["summary"].get("redaction") or {}
+        if not red.get("applied"):
+            print("warning: snippets NOT redacted: %s" % red.get("reason"),
+                  file=sys.stderr)
         for entry in result["skipped_files"]:
             print(f"warning: not planned: {entry['file']}: {entry['reason']}",
                   file=sys.stderr)
+        for entry in result["truncated_lines"]:
+            print(f"warning: only partly read: {entry['file']}:"
+                  f"{entry['line']}: {entry['reason']}", file=sys.stderr)
+        for entry in result["unparsed_files"]:
+            print(f"warning: planned without the AST pass: {entry['file']}: "
+                  f"{entry['reason']} Fell back to {entry['fell_back_to']}; "
+                  f"NOT analysed: {entry['not_analysed']}.", file=sys.stderr)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

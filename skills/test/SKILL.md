@@ -129,6 +129,16 @@ because you hold the cross-task context the gatekeeper does not.
 up to success. That single behaviour is what the whole design exists to protect, and it
 is the one thing the evals check five times over.
 
+Write the round's findings to **`.testing/findings.json`** in the shape
+`/testsquad:debug` specifies — one object per root cause, `evidence` of `reproduced` or
+`observed`, nothing weaker promoted — and on a clean round still write
+`{"findings": []}`, never `{}` and never `null`, since an absent key reads as "wrote
+this file but not what the reader needs". If you never investigated, write no file.
+It is the PR comment's only findings input, and a
+comment with an empty findings section is indistinguishable from a clean run. Only the
+`findings` array is read from that file, so anything else you put beside it is dropped
+without a word: pre-existing counts belong in the report, not in there.
+
 Delete `.testing/tasks/current` before you finish — on success, on BLOCKED, and on a
 budget stop alike. A stale marker leaves the guard hooks armed over somebody else's work,
 and a guard that fires when it should not is one that gets uninstalled.

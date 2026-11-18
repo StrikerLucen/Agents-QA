@@ -231,24 +231,21 @@ measured GPT-3.5 at **69.1% line coverage on HumanEval-Java and 1.3% on SF110**
 **Design consequence:** our own evals run on seeded fixtures with known answers,
 and any public benchmarking uses ULT and SWT-Bench Verified only.
 
-## 12. Multi-agent orchestration: the cost knee
+## 12. Multi-agent orchestration — merged into §21
 
-- Cost **bottoms out at ~4–6 subagents and rises after**. A 4-agent system can
-  burn 10x a single agent; past ~6 hand-offs, roughly 4x the cost for half the
-  success rate.
-- Under *equal token budgets*, single-agent beat sequential multi-agent on
-  multi-hop reasoning (0.418–0.427 vs 0.379–0.389).
-- Known failure modes (MAST taxonomy): ambiguous delegation, tool-invocation
-  error, **context pollution**, conflicting sub-agent outputs, premature action.
-- A researcher given 4 dimensions and ~20 fetches exhausted its budget and
-  returned **zero salvageable output** — give each specialist one dimension and a
-  hard tool-call budget.
-- **Subagents cannot ask for approval mid-task.** Investigation belongs in
-  subagents; approval-gated writes belong in the parent.
+**Folded into [§21](#21-multi-agent-orchestration-the-cost-knee) on 2026-11-16.** This
+section and §21 carried the *same heading* and the same four figures; §12 cited nothing
+for any of them and §21 cites all of them, so §12 was the copy that went. Nothing sourced
+was removed: §21 keeps every figure, plus the three sources §12 lacked and the hedge that
+labels them directional. §12's two claims that were not already in §21 — that subagents
+cannot ask for approval mid-task, and that writes therefore stay with the parent — moved
+there verbatim.
 
-**Design consequence:** the squad has 8 roles but the orchestrator **selects 2–4
-per run** based on the diff. Workers are read-only where possible; writes stay
-with the parent.
+The number is left as this stub rather than reused, so that §13–§21 keep the numbers every
+`(RESEARCH §n)` pointer downstream already uses. Nothing outside this file cited §12:
+measured before the merge, `grep -rn "§12" . --exclude-dir=.git` returned hits in
+`docs/CITATION-AUDIT.md` only — no agent, skill, stack, template or script pointed here.
+Re-run now, it also returns this stub.
 
 ## 13. What already exists (so we don't rebuild it)
 
@@ -338,12 +335,20 @@ Petrović & Ivanković et al., [TSE 2021](https://arxiv.org/abs/2102.11378) —
 
 | Measure | Value |
 |---|---|
-| Mutants ever shown to a developer | **12.5%** of those generated |
+| Mutants ever shown to a developer | **12.5%** of those generated (2,110,489 of 16,935,148) |
 | Median mutants per changelist, naive | **820** |
 | Median after arid-node suppression + one-per-line | **7** |
 | Median actually surfaced | **2** per changelist (99th pct: 43) |
 | Hard cap | **≤7 mutants per file** |
 | Developer-reported usefulness | **15% → 89%** over six years |
+
+**On that first row.** It is the paper's own arithmetic — *"16,935,148 mutants were
+generated, out of which 2,110,489 were surfaced"* — and it is **the same quantity** as
+TABLE 4's total survivability of 12.5%, because the paper defines survivability as
+surviving the suite *and* being surfaced in code review (*"87.5% of all generated mutants
+are killed by the initial test suite"*). The matching digits in §20 are not a transcription
+error and not two independent measurements; they are one number quoted in two places.
+Checked against the primary source 2026-11-12.
 
 Two mechanisms do the work:
 
@@ -388,10 +393,18 @@ Healthy: StrykerJS (v10.1.1), Stryker.NET (5.1.0), mutmut (3.8.0), cosmic-ray
 
 **Qodo Cover-Agent is abandoned.** The README carries *"This repository is no longer
 maintained"*, dated **2025-06-15**; last release v0.3.10, 2025-05-21; ~5.7k stars, AGPL-3.0.
-There is no canonical successor fork. The parent company raised a
-[$70M Series B on 30 March 2026](https://siliconangle.com/2026/03/30/ai-generated-code-verification-startup-qodo-raises-70m/)
-and pivoted to agentic code review — so popularity and funding say nothing about whether a
-tool is maintained. Read it as a reference implementation; do not depend on it.
+There is no canonical successor fork. The parent company raised a **$70M Series B on
+30 March 2026** — [Qodo's own announcement](https://www.qodo.ai/blog/qodo-70m-series-b-shift-to-artificial-wisdom/)
+is the primary source ("Today, we are thrilled to announce that Qodo has raised $70
+million in Series B funding, bringing total capital raised to $120 million"; led by
+Qumra Capital), corroborated independently by
+[TechCrunch](https://www.techcrunch.com/2026/03/30/qodo-bets-on-code-verification-as-ai-coding-scales-raises-70m/),
+[Globes](https://en.globes.co.il/en/article-1001538970) and
+[SiliconANGLE](https://siliconangle.com/2026/03/30/ai-generated-code-verification-startup-qodo-raises-70m/)
+— and pivoted to agentic code review, so popularity and funding say nothing about whether
+a tool is maintained. Read it as a reference implementation; do not depend on it.
+*Both halves re-verified against the repository README and the primary announcement on
+2026-11-12.*
 
 **Dead or dying — do not adopt:** `mutatest` (Python, last release 2022),
 `go-mutesting` (last commit 2021), and `gremlins` (Go, last commit 2026-03-30,
@@ -625,29 +638,84 @@ From Petrović & Ivanković et al.,
 
 | Operator | Share of mutants | Survive | Judged productive |
 |---|---|---|---|
-| **SBR** statement block removal | 68% | 12.6% | — |
-| **UOI** unary operator insertion | 18.5% | 9.5% | **74.5% (lowest)** |
+| **SBR** statement block removal | 68.0% | 12.7% | — |
+| **UOI** unary operator insertion | 18.5% | 9.6% | **74.5% (lowest)** |
 | **LCR** logical connector replacement | 7.7% | 16.3% | — |
 | **ROR** relational operator replacement | 4.0% | 14.7% | **84.1% (highest)** |
 | **AOR** arithmetic operator replacement | 1.8% | 13.5% | — |
 
-Also from that paper: **~87% of mutant runs kill the mutant**, so only ~13% survive to be
-candidates for reporting; and **context-based selection beats uniform random by >40% on
-survivability and ~50% on productivity.**
+Share and survivability are that paper's **TABLE 4** ("Number of mutants per mutation
+operator"); productivity is quoted from its RQ3 prose — *"ROR mutants are productive 84.1%
+of the time, whereas, UOI mutants are only productive 74.5% of the time."*
 
-**Why not a larger operator set.** Gopinath et al.,
-[On the Limits of Mutation Reduction Strategies, ICSE 2016](https://rahul.gopinath.org/resources/icse2016/gopinath2016on.pdf):
-the maximum achievable improvement of **any** reduction strategy over plain random
-sampling is about **13%**. Earlier work from the same group
-([ISSRE 2015](https://stairs.ics.uci.edu/papers/2015/How_hard_does_mutation_analysis_have_to_be_anyway.pdf))
-found a fixed sample of ~1,000 mutants estimates the full-suite score to within about
-**±7%**, roughly independent of program size, and that operator-based selection is **not**
-superior to uniform random sampling.
+**The paper states SBR and UOI survivability twice and the two do not agree.** TABLE 4 gives
+**12.7%** and **9.6%**; the RQ2 prose and Figure 8 give **12.6%** and **9.5%** (*"SBR mutants
+are surfaced during code review with a probability of 12.6%"*; *"UOI, which has a
+survivability of only 9.5%"*). The same 0.1pp gap appears between TABLE 3 and Figure 8 for
+TypeScript and JavaScript, so it looks like truncation in the figures rather than an error
+in either. **We take TABLE 4**, because the rest of each row comes from TABLE 4 and a row
+should have one source. Nothing in the engine depends on the 0.1pp.
 
-**Design consequence:** ship exactly these five, weight selection toward ROR and away from
-UOI, and spend the engineering effort on *suppression and diff-scoping* rather than on
-exotic operators — the ceiling there is 13%, while suppression is the difference between
-820 and 7 mutants.
+Also from that paper: **87.5% of all generated mutants are killed by the initial test
+suite**, so **12.5%** survive to be candidates for reporting; and **context-based selection
+beats uniform random by >40% on survivability and ~50% on productivity.**
+
+That 12.5% is TABLE 4's *total* survivability, and it is **the same quantity** as §15's
+"mutants ever shown to a developer" row — not an independent corroboration of it. The paper
+defines survivability as surviving the suite and being surfaced in code review, and states
+the underlying counts: *"16,935,148 mutants were generated, out of which 2,110,489 were
+surfaced"* (2,110,489 / 16,935,148 = 12.46%). Cite it once, in either place, and say which.
+
+### Why we stop at five — which part is evidence, which part is a choice
+
+**Evidence.** Five operators is the set Google actually ran at the scale in the table
+above, and it is the only large-scale deployment with published per-operator survivability
+and productivity. That is an existence proof that a five-operator set works in production,
+and it is where every weight below comes from. It is **not** evidence that five is optimal,
+and the paper makes no such claim.
+
+**What the reduction literature does and does not bound.** Gopinath, Alipour, Ahmed, Jensen
+& Groce, [On the Limits of Mutation Reduction Strategies, ICSE 2016](https://rahul.gopinath.org/resources/icse2016/gopinath2016on.pdf)
+(DOI [10.1145/2884781.2884787](https://dl.acm.org/doi/10.1145/2884781.2884787)) bounds
+mutation **reduction** strategies — schemes that pick a subset of the mutants a fixed
+operator set produces, of which operator-based *selective* mutation is one. Empirically the
+advantage of a perfect reduction strategy, with oracular knowledge of which mutants are
+killed, over plain random sampling is a mean of **13.078%** (95% of projects between
+12.218% and 14.26%; 17.545% if skew from redundant mutants is discounted).
+
+**That bound does not apply to adding operators, and the paper says so in the same breath:**
+
+> "Our results show that the limit in improvement of effectiveness over random sampling for
+> real-world open source programs is a mean of only 13.078%. **Interestingly, there is no
+> limit to the improvement that can be made by addition of new mutation operators.**"
+
+Its conclusion is the opposite of a case for a small catalogue: *"more effort should be
+focused on enhancing mutations than removing operators in the name of selective mutation for
+questionable benefit"*, and §8 adds that the maximum *downside* of adding operators is just
+23.268% *"while there is no limit to the achievable improvement."* The companion
+[ISSRE 2015](https://stairs.ics.uci.edu/papers/2015/How_hard_does_mutation_analysis_have_to_be_anyway.pdf)
+paper agrees — its advice to tool implementers is *"to be generous in the operators
+implemented, and use statistics to your advantage"* — and establishes that a fixed sample of
+~1,000 mutants estimates the full-suite score to within **±7%** theoretically, and **±2%**
+measured across 158 open-source Java projects, roughly independent of program size.
+
+**Choice.** So shipping five operators is a *scope decision, not a finding*. Both cited
+papers would have us carry **more** operators and sample randomly among them. We ship five
+because they are the five for which per-operator survivability and productivity are
+published, so they are the five we can weight honestly; a set we can explain beats a larger
+set we would have to guess at. If comparable numbers appear for a sixth operator, the
+honest move is to add it — not to appeal to a 13% ceiling that was never about addition.
+
+**Do not write "exotic operator sets buy ≤13%".** That sentence applies the bound in the one
+direction the paper explicitly exempts, and a reviewer who opens the citation finds it
+saying the opposite. See `docs/CITATION-AUDIT.md` D-1.
+
+**Design consequence:** ship these five, weight selection toward ROR and away from UOI, and
+spend the engineering effort on *suppression and diff-scoping* rather than on a bigger
+catalogue. That last part **is** evidence-backed, but by §15 rather than by Gopinath:
+suppression is the measured difference between **820 and 7** mutants per changelist. The
+claim is "suppression pays more than operators would, for us, at our effort budget" — not
+"operators cannot pay".
 
 Two cautions on applying the table:
 - The weighting is spent at **operator-choice** time. Ranking survivors by productivity
@@ -672,6 +740,11 @@ weakest-sourced numbers in this document, and they are labelled as such.
 - A researcher given four dimensions and ~20 fetches exhausted its budget and returned
   **zero salvageable output**, which is why each specialist gets one dimension and a hard
   tool-call budget.
+- **Subagents cannot ask for approval mid-task.** This is a platform constraint, not a
+  research finding, and it has no citation because none is needed: investigation belongs
+  in subagents, approval-gated writes belong in the parent, and workers stay read-only
+  wherever that is possible. `skills/test/SKILL.md` states the same rule under *"Keep
+  writes with you where approval might be needed."*
 
 **Treat the cost figures as directional.** They justify "select a few agents, not all of
 them"; they do not justify a precise optimum. The squad has **eight roles**: seven agent

@@ -1,24 +1,25 @@
 # testsquad pull-request comment.
 #
-# Copy to .github/workflows/testsquad-pr.yml and edit the two marked steps.
-#
-# Design notes worth reading before changing anything:
+# Copy to .github/workflows/testsquad-pr.yml, set TS_SCRIPTS, edit both EDIT
+# steps. Design notes, worth reading before changing anything:
 #
 #   * No model runs here. The comment is computed from files in .testing/, so
-#     it is exact, free, and reproducible. It also means a pull request from a
-#     fork cannot cause a model to read attacker-controlled text.
+#     it is exact, free and reproducible - and a fork PR cannot make a model
+#     read attacker-controlled text.
 #
 #   * The `pull_request` trigger gives a READ-ONLY token on fork pull requests,
 #     so the comment step is skipped there rather than failing. We deliberately
-#     do NOT use `pull_request_target`: that runs with full write permissions
-#     with the fork's code in scope, and is the most exploited misconfiguration
-#     in GitHub Actions. A missing comment on a fork PR is a far smaller
-#     problem than a repository compromise. If you need fork comments, upload
-#     the rendered comment as an artifact here and post it from a separate
-#     `workflow_run` workflow that checks out your own default branch.
+#     do NOT use `pull_request_target`: full write permissions with the fork's
+#     code in scope is the most exploited misconfiguration in GitHub Actions,
+#     and a missing comment costs far less than a repository compromise. For
+#     fork comments, post the artifact uploaded below from a separate
+#     `workflow_run` workflow on your own default branch.
 #
-#   * It never fails the build. A gate that blocks merges in its first week is
-#     switched off in its second. Turn on gating once the team trusts it.
+#   * It never fails the build over what it *finds*. It does fail when it is
+#     misconfigured: a workflow that silently never runs is worse.
+#
+#   * All it generates lands in .testing/reports/, which /testsquad:start has
+#     you gitignore, so nothing it writes is commit-eligible.
 
 name: testsquad
 
@@ -38,14 +39,22 @@ jobs:
   report:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      TS_SCRIPTS: scripts   # testsquad's scripts/, as vendored in THIS repo
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # the diff and the risk map both need history
+          fetch-depth: 0          # history, for diff-scoped steps
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - name: Check the testsquad scripts are present
+        run: |
+          # The plugin is not on the runner, so its scripts/ is vendored.
+          test -f "$TS_SCRIPTS/pr_comment.py" ||
+            { echo "::error::no pr_comment.py in '$TS_SCRIPTS'"; exit 1; }
 
       # --- EDIT: your project's setup and test command ----------------------
       - name: Run tests with coverage
@@ -63,33 +72,47 @@ jobs:
         env:
           COVERAGE_FILE: coverage/lcov.info   # or coverage.xml, coverage.out
         run: |
-          mkdir -p .testing
+          mkdir -p .testing/reports
+          # Whole-repo figures only. The comment's coverage section reads
+          # .testing/coverage-diff.json - changed lines only, from
+          # /testsquad:diagnose; base_* would need a second suite run at the
+          # merge base, which this does not do. Absent, it is named as missing.
           if [ -f "$COVERAGE_FILE" ]; then
-            python3 scripts/normalize_coverage.py "$COVERAGE_FILE" \
-              --out .testing/coverage-current.json
+            python3 "$TS_SCRIPTS/normalize_coverage.py" "$COVERAGE_FILE" \
+              --strip-prefix "$(pwd)/" --out .testing/coverage-raw.json
           else
-            echo "No coverage at $COVERAGE_FILE - the comment will say"
-            echo "'not measured' rather than inventing a number."
+            echo "No $COVERAGE_FILE - the comment will say 'not measured'."
           fi
 
       - name: Check nothing points at production
         if: always()
         run: |
-          python3 scripts/env_safety_check.py . --out .testing/env-safety.json || true
-          python3 scripts/pr_comment.py --help >/dev/null
+          python3 "$TS_SCRIPTS/env_safety_check.py" . \
+            --out .testing/env-safety.json || true
 
       - name: Static flake and meaningless-test gate
         if: always()
+        # This log only: its schema is not one the comment reads.
         run: |
-          python3 scripts/flake_smells.py tests test src \
+          python3 "$TS_SCRIPTS/flake_smells.py" tests test src \
             --format text --fail-on block || true
 
       - name: Render the comment
         if: always()
         run: |
-          python3 scripts/pr_comment.py --testing-dir .testing \
-            --out .testing/pr-comment.md
-          cat .testing/pr-comment.md
+          mkdir -p .testing/reports
+          out=.testing/reports/pr-comment.md
+          if ! python3 "$TS_SCRIPTS/pr_comment.py" --testing-dir .testing --out "$out"
+          then
+            # It read nothing, or could not run. Either way say so, rather
+            # than leave the last comment standing as if it still held.
+            { echo '<!-- testsquad:pr-comment -->'
+              echo '**testsquad reported nothing.** It read no usable'
+              echo '`.testing/` input, so nothing was checked - this is not a'
+              echo 'pass. The job log says why; start with `/testsquad:health`.'
+            } > "$out"
+          fi
+          cat "$out"
 
       - name: Upload the report
         if: always()
@@ -100,14 +123,18 @@ jobs:
           retention-days: 14
 
       - name: Post or update the comment
-        # Skipped on fork PRs, where the token is read-only. See the note above.
+        # Skipped on fork PRs: the token is read-only. See the note above.
         if: always() && github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
             const marker = '<!-- testsquad:pr-comment -->';
-            const body = fs.readFileSync('.testing/pr-comment.md', 'utf8');
+            const path = '.testing/reports/pr-comment.md';
+            if (!fs.existsSync(path)) {
+              core.setFailed(`no ${path} - see the render step`); return;
+            }
+            const body = fs.readFileSync(path, 'utf8');
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
@@ -116,8 +143,7 @@ jobs:
               per_page: 100,
             });
 
-            // Edit our own comment in place. A new comment per push turns the
-            // thread into a changelog nobody reads.
+            // In place: a comment per push is a changelog nobody reads.
             const mine = comments.find(c => c.body && c.body.includes(marker));
             if (mine) {
               await github.rest.issues.updateComment({

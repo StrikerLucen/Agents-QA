@@ -6,6 +6,7 @@ captured from a previous run. A test that records whatever the code happened
 to produce proves only that the code is deterministic.
 """
 
+import io
 import json
 import os
 import sys
@@ -424,6 +425,200 @@ class TestMalformedJacoco(unittest.TestCase):
                           result["totals"]["lines_hit"]), (8, 2))
         self.assertEqual(result["totals"]["line_pct"], 25.0)
         self.assertEqual(result["totals"]["branches_found"], 0)
+
+
+class TestImpossiblePercentages(unittest.TestCase):
+    """A percentage above 100 is not a measurement, it is a contradiction.
+
+    Each fixture below is a report that disagrees with itself -- more hits than
+    there were things to hit. Emitting 200% or 450% is the same defect class as
+    emitting 0% for an unparseable file: a malformed input rendering as a
+    confident number. The only honest answer is null, said out loud.
+    """
+
+    def _capture(self, text, fmt):
+        """Return (result, stderr). The warning is half the fix: a null that
+        nobody is told about is still a report that lost a measurement."""
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            result = nc.normalize(text, fmt)
+        return result, buf.getvalue()
+
+    def test_jacoco_negative_missed_is_not_two_hundred_percent(self):
+        # missed="-5" covered="10" computed found = -5 + 10 = 5 against 10
+        # hit, and printed line_pct 200.0 without a word of complaint.
+        xml = ('<report><package name="p"><sourcefile name="A.java">'
+               '<counter type="LINE" missed="-5" covered="10"/>'
+               '</sourcefile></package></report>')
+        result, err = self._capture(xml, "jacoco")
+        self.assertIsNone(result["totals"]["line_pct"])
+        self.assertEqual(result["totals"]["lines_found"], 0)
+        self.assertTrue(err.strip(), "a dropped counter must be said out loud")
+        self.assertTrue(result["warnings"],
+                        "the warning must reach the JSON, not only stderr")
+
+    def test_jacoco_counter_that_is_not_a_number_is_reported_not_dropped(self):
+        # int("oops") raised ValueError and the handler did a bare `continue`:
+        # the counter vanished and the report said nothing at all.
+        xml = ('<report><package name="p"><sourcefile name="A.java">'
+               '<counter type="LINE" missed="oops" covered="10"/>'
+               '<counter type="BRANCH" missed="0" covered="4"/>'
+               '</sourcefile></package></report>')
+        result, err = self._capture(xml, "jacoco")
+        self.assertIsNone(result["totals"]["line_pct"])
+        self.assertIn("A.java", err)
+        self.assertTrue(any("A.java" in w for w in result["warnings"]))
+        # The counter that was well-formed still counts: 4 of 4 branches.
+        self.assertEqual(result["totals"]["branch_pct"], 100.0)
+
+    def test_cobertura_condition_coverage_hits_above_total_is_null(self):
+        # '(5/2)' is 5 branches taken out of 2 that exist. That is not 250%.
+        xml = ('<coverage><packages><package><classes>'
+               '<class filename="a.py"><lines>'
+               '<line number="1" hits="1" branch="true" '
+               'condition-coverage="250% (5/2)"/>'
+               '</lines></class></classes></package></packages></coverage>')
+        result, err = self._capture(xml, "cobertura")
+        self.assertIsNone(result["totals"]["branch_pct"])
+        self.assertTrue(any("a.py" in w for w in result["warnings"]))
+
+    def test_coveragepy_covered_lines_above_statements_is_null(self):
+        # 9 covered of 2 statements printed line_pct 450.0.
+        text = '{"files": {"a.py": {"summary": ' \
+               '{"num_statements": 2, "covered_lines": 9}}}}'
+        result, err = self._capture(text, "coveragepy")
+        self.assertIsNone(result["totals"]["line_pct"])
+        self.assertIsNone(result["files"][0]["line_pct"])
+        self.assertTrue(any("a.py" in w for w in result["warnings"]))
+
+    def test_three_branches_covered_out_of_zero_is_not_silence(self):
+        """F9: `condition-coverage="300% (3/0)"` gave hit=3, found=0.
+
+        pct() refused it, so branch_pct came out null -- and null is also
+        what a file with no branches produces. The `found > 0` guard on
+        _flag_contradiction() exempted exactly this case from the warning, so
+        "3 of 0 branches covered", which cannot happen, reached the consumer
+        with an empty `warnings` list, indistinguishable from "this file has
+        no branches at all".
+        """
+        xml = ('<coverage><packages><package><classes>'
+               '<class filename="a.py"><lines>'
+               '<line number="1" hits="1" branch="true" '
+               'condition-coverage="300% (3/0)"/>'
+               '</lines></class></classes></package></packages></coverage>')
+        result, err = self._capture(xml, "cobertura")
+        self.assertIsNone(result["totals"]["branch_pct"])
+        self.assertIsNone(result["files"][0]["branch_pct"])
+        self.assertTrue(any("a.py" in w for w in result["warnings"]),
+                        "a null nobody is told about is a lost measurement")
+        self.assertIn("0 that exist", result["warnings"][0])
+        self.assertIn("a.py", err)
+
+    def test_no_branches_and_impossible_branches_are_different_outputs(self):
+        """The contrast the fix exists for, and the half that must stay quiet.
+
+        Both files report branch_pct null. One of them has nothing to cover,
+        which is legitimate and extremely common; the other is impossible.
+        If the two rendered alike the warning would be worthless -- and if the
+        legitimate one warned, the check would be noise and get switched off.
+        """
+        def one(condition):
+            return ('<coverage><packages><package><classes>'
+                    '<class filename="a.py"><lines>'
+                    '<line number="1" hits="1" branch="true" '
+                    f'condition-coverage="{condition}"/>'
+                    '</lines></class></classes></package></packages></coverage>')
+
+        none_at_all, quiet_err = self._capture(
+            '<coverage><packages><package><classes>'
+            '<class filename="a.py"><lines>'
+            '<line number="1" hits="1"/>'
+            '</lines></class></classes></package></packages></coverage>',
+            "cobertura")
+        zero_of_zero, zero_err = self._capture(one("0% (0/0)"), "cobertura")
+        impossible, loud_err = self._capture(one("300% (3/0)"), "cobertura")
+
+        # All three refuse to invent a percentage.
+        for result in (none_at_all, zero_of_zero, impossible):
+            self.assertIsNone(result["files"][0]["branch_pct"])
+        # Only one of them is a contradiction, and only it says anything.
+        self.assertEqual(none_at_all["warnings"], [])
+        self.assertEqual(quiet_err, "")
+        self.assertEqual(zero_of_zero["warnings"], [])
+        self.assertEqual(zero_err, "")
+        self.assertTrue(impossible["warnings"])
+        self.assertTrue(loud_err.strip())
+
+    def test_the_line_counters_get_the_same_rule(self):
+        # coverage.py's num_statements and covered_lines are independent
+        # fields, so 7 covered of 0 statements is a shape a real report can
+        # take. Zero statements alone stays silent: an empty module.
+        text = '{"files": {"a.py": {"summary": ' \
+               '{"num_statements": 0, "covered_lines": 7}}}}'
+        result, err = self._capture(text, "coveragepy")
+        self.assertIsNone(result["files"][0]["line_pct"])
+        self.assertTrue(any("a.py" in w for w in result["warnings"]))
+        self.assertIn("lines recorded as covered out of 0", result["warnings"][0])
+
+        empty_module, quiet = self._capture(
+            '{"files": {"a.py": {"summary": '
+            '{"num_statements": 0, "covered_lines": 0}}}}', "coveragepy")
+        self.assertEqual(empty_module["warnings"], [])
+        self.assertEqual(quiet, "")
+
+    def test_the_warning_names_branches_not_branchs(self):
+        # The message is the entire new signal for a contradiction nobody can
+        # see in the numbers; it has to read like English.
+        self.assertEqual(nc._plural("branch"), "branches")
+        self.assertEqual(nc._plural("line"), "lines")
+
+    def test_a_consistent_report_carries_no_warnings(self):
+        # The guard must stay silent on the normal case, or it becomes the
+        # noise that gets the whole validator ignored.
+        result, err = self._capture(LCOV, "lcov")
+        self.assertEqual(result["warnings"], [])
+        self.assertEqual(err, "")
+        self.assertEqual(result["totals"]["line_pct"], 83.33)
+
+
+class TestStdinEncoding(unittest.TestCase):
+    """`-` is a documented input. It went through sys.stdin, which decodes as
+    UTF-8 and nothing else, so the UTF-16 fix never reached this path."""
+
+    SCRIPT = os.path.join(os.path.dirname(__file__), "..", "scripts",
+                          "normalize_coverage.py")
+
+    def _run(self, raw, args=()):
+        import subprocess
+        return subprocess.run([sys.executable, self.SCRIPT, "-", *args],
+                              input=raw, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+
+    def test_utf16_on_stdin_is_a_clean_error_not_a_traceback(self):
+        proc = self._run(LCOV.encode("utf-16"))
+        err = proc.stderr.decode("utf-8", "replace")
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("UnicodeDecodeError", err)
+        self.assertEqual(proc.returncode, 0, err)
+        data = json.loads(proc.stdout.decode("utf-8"))
+        # Decoded, it is the same report the file path produces: 6 lines, 5 hit.
+        self.assertEqual((data["totals"]["lines_found"],
+                          data["totals"]["lines_hit"]), (6, 5))
+
+    def test_utf8_bom_on_stdin_matches_the_file_path(self):
+        proc = self._run(b"\xef\xbb\xbf" + LCOV.encode("utf-8"))
+        err = proc.stderr.decode("utf-8", "replace")
+        self.assertEqual(proc.returncode, 0, err)
+        data = json.loads(proc.stdout.decode("utf-8"))
+        self.assertEqual(data["totals"]["files"], 2)
+
+    def test_undecodable_stdin_still_yields_the_report(self):
+        proc = self._run(b"SF:src/caf\xe9.js\nDA:1,1\nend_of_record\n")
+        self.assertEqual(proc.returncode, 0,
+                         proc.stderr.decode("utf-8", "replace"))
+        data = json.loads(proc.stdout.decode("utf-8"))
+        self.assertEqual(data["totals"]["lines_found"], 1)
 
 
 class TestMalformedCoveragePy(unittest.TestCase):

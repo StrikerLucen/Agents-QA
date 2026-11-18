@@ -19,42 +19,88 @@ toolkit to make unaffordable.
 **On demand only.** Never triggered by `/testsquad:diagnose`, never on every push,
 never on a schedule. Mutation runs when someone asks for it on a path they care about.
 
-## The affordability rules — this is the whole skill
+## 1. Plan the mutants with the script — do not re-derive the policy
 
 Google ran 16,935,148 mutants across 776,740 changelists in 10 languages and published
 what made it survivable. The headline number: a naive median of **820 mutants per
 changelist** became **7** after suppression and one-per-line, of which a median of **2**
 were actually surfaced. Developer-reported usefulness went **15% → 89%** over six years.
 
-**1. One mutant per line.** Chosen at random among applicable operators. In **over 90%**
-of lines with multiple applicable mutants, all of them share the same fate — so
-generating more is almost pure waste.
+Those rules are implemented, seeded and tested in
+`${CLAUDE_PLUGIN_ROOT}/scripts/arid_nodes.py`. **Run it.** Do not re-derive which lines
+are worth mutating by reading the source yourself: a suppression policy applied from
+prose is applied differently every run, and the point of this step is that two runs over
+the same input select the same mutants.
 
-**2. Arid-node suppression.** Skip AST nodes whose mutation is almost never informative:
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/arid_nodes.py" <path> \
+  --seed 0 --max-per-file 7 --format json --out .testing/mutation-plan.json
+```
 
-| Suppressed | Because |
-|---|---|
-| Logging and metrics calls | Killing a log line teaches nothing |
-| Debug and assert statements | Not product behaviour |
-| Trivial getters | No logic to break |
-| Pure delegation | The behaviour lives one level down |
-| `toString` / `__repr__` / `Display` | Presentation |
-| String constants in error messages | Changing a message is not a defect |
+Add `--diff <file>` to scope the plan to a unified diff's changed lines, and
+`--feedback .testing/feedback.json` to honour past "not useful" reports. `--out` writes
+atomically; `--format text` gives one line per mutant and a count per suppression rule,
+for reading rather than parsing.
 
-This step is the difference between 820 and 7, and it **matters more than the choice of
-tool**. Google needed 100+ hand-written rules to reach 89% usefulness, grown from
-developer feedback on 66,798 mutants — which is why the affordance below exists.
+What it decides, so you do not: **one mutant per line** (in **over 90%** of lines with
+several applicable mutants all share the same fate, so generating more is near-pure
+waste); **arid-node suppression** — nodes whose mutation teaches nobody anything, such
+as logging, trivial accessors and presentation, while money arithmetic, boundary
+comparisons, authorization connectors and loop conditions stay mutable however they are
+named; the **per-file cap** (`--max-per-file`, default 7); and the weighted operator
+draw. Suppression is the difference between 820 and 7, and it **matters more than the
+choice of tool**.
 
-**3. Hard cap: 7 mutants per file.**
+Exit 0 means a plan was produced — possibly a partial one, see below. **Any non-zero
+exit means no plan exists**: report that the plan could not be produced, quote stderr,
+and stop. Never fall back to judging arid-ness by eye, and never mutate a line that is
+not in the plan.
 
-**4. Budget: 10 minutes or 200 mutants, whichever comes first.** When it expires, report
+## 2. Read the plan — and read what it could not analyse
+
+`.testing/mutation-plan.json` is `testsquad.aridnodes/1`:
+
+- `files[].selected[]` — **mutate exactly these**: `line`, `operator`, `snippet`.
+- `files[].suppressed[]` — `rule` and `why`: the sentence to quote when someone asks why
+  a line was not mutated.
+- `settings` and `summary` — seed, cap, whether it was diff-scoped, and counts per rule
+  and per operator.
+
+**Before reporting anything, collect the "could not analyse" signals.** A file nobody
+opened and a file with nothing worth mutating produce a similarly small result; the
+script states the difference, and the difference is lost unless you carry it through.
+
+- Every `warning:` line on **stderr** names something it could not fully analyse. With
+  `--out` the report goes to the file and stdout is empty, while the warnings still go to
+  stderr — read both streams.
+- In the JSON, **every top-level list besides `files` is a not-analysed record set.**
+  Today: `skipped_files` (over the byte ceiling — never opened), `truncated_lines` (a
+  line past the char ceiling, so "no mutant here" covers its head only), `unparsed_files`
+  (read and planned, but by the weaker regex scanner, so function spans and parameter
+  names were not used). Also `settings.feedback.ignored`, for feedback entries it could
+  not apply. Treat the class, not the list: if a later version adds another such list, or
+  another `summary` counter named for what was *not* analysed, report it the same way
+  without waiting for this skill to name it.
+- Any such list that is non-empty, or any such counter that is non-zero, goes in the
+  report with its `file` and its `reason` — including when plenty of mutants were
+  selected. It is not a finding and not a failure; it is the scope of the run.
+
+So a plan with no selected mutants reports *"N files planned, M not analysed — listed
+below"*. Never *"nothing to mutate"*.
+
+**Budget: 10 minutes or 200 mutants, whichever comes first.** When it expires, report
 what you have, say what was not covered, and pass. An unbounded mutation run is how
 people learn to never run one again.
 
 ## Operators: five, weighted
 
-Exotic operator sets buy **≤13%** over random selection, so there is no reason to carry
-more than these:
+The script draws one of these per line. **Measured:** these five are the ones with
+published per-operator share, survivability and productivity (Petrović et al., TSE 2021 —
+RESEARCH §20), so they are the five we can weight honestly. **A choice, not a finding:**
+stopping at five. No paper says five is optimal; the mutation-reduction literature bounds
+*removing* operators and explicitly exempts *adding* them (RESEARCH §20). What is measured
+is that suppression pays more at this effort budget — 820 mutants down to 7 (RESEARCH §15)
+— so a bigger catalogue is a cost question we have not spent on, not a settled one.
 
 | Operator | Note |
 |---|---|
@@ -66,7 +112,8 @@ more than these:
 
 ## Scoping to the diff
 
-Per-tool, verified flags — these differ more than the docs suggest:
+`--diff` scopes the plan. The mutation tool itself still has to be told, and the
+per-tool flags differ more than the docs suggest:
 
 | Language | Tool | Diff-scoped invocation |
 |---|---|---|
@@ -98,20 +145,25 @@ critical path rather than pretending the ratchet is an audit.
 
 ## The "this mutant is useless" affordance
 
-Every surfaced mutant carries a one-click **not useful** control writing to
-`.testing/feedback.json` with the node type, the file and the operator.
+Every surfaced mutant carries a one-click **not useful** control appending an entry to
+`.testing/feedback.json` — the verdict, and the node type, operator or function pattern
+it applies to, in the shape `--feedback` reads.
 
-This is not a comment box. Those reports are the input to the arid-node rules in
-`.testing/conventions.md`: a node type reported useless twice becomes a suppression
-proposal, which goes through `/testsquad:learn` and needs the user's approval before it
-is applied. This exact loop is what took Google from 15% to 89% usefulness, and it is
-the only mechanism here that improves with use.
+This is not a comment box. It is an input to the next run: pass `--feedback` and those
+nodes are suppressed, with the output recording which suppressions came from feedback
+rather than from a built-in rule. A node type reported useless twice becomes a
+suppression proposal, which goes through `/testsquad:learn` and needs the user's approval
+before it lands in `.testing/conventions.md`. Developer feedback growing the suppression rules is what
+took Google from 15% to 89% usefulness (RESEARCH §15), and it is the only mechanism here
+that improves with use.
 
 ## Output
 
 Per mutant: the file, the line, the operator, the mutated code, **survived or killed**,
 and — for survivors — the test that should have caught it and the assertion it is
-missing. A survivor is a specific, fixable gap; a score is not.
+missing. A survivor is a specific, fixable gap; a score is not. Alongside it, the scope
+of the run: the seed, whether it was diff-scoped, and everything from §2 the script said
+it could not analyse.
 
 Bound by `${CLAUDE_PLUGIN_ROOT}/templates/report/RULES.md`. Nothing executes before the
 environment safety check passes, no mutation tool is installed without permission

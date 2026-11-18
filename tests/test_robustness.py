@@ -22,7 +22,9 @@ Everything is built in a temp directory. Large inputs are generated, never
 committed. Platform-dependent cases skip rather than fail.
 """
 
+import ast
 import contextlib
+import io
 import json
 import os
 import re
@@ -30,8 +32,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
+import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
@@ -41,6 +46,7 @@ import env_safety_check as esc  # noqa: E402
 import flake_smells as fsm  # noqa: E402
 import normalize_coverage as ncov  # noqa: E402
 import pr_comment as prc  # noqa: E402
+import project_state as pstate  # noqa: E402
 import risk_map as rmap  # noqa: E402
 import session_context as sctx  # noqa: E402
 import validate_plugin as vplug  # noqa: E402
@@ -95,6 +101,158 @@ def timed(case, label, budget=SLOW):
                     f"{label} took {elapsed:.1f}s (budget {budget}s) -- "
                     "unbounded work on attacker-controlled input")
 
+
+
+# --------------------------------------------------------------------------
+# ast.parse's depth ceiling -- the one limit these scripts do not control
+# --------------------------------------------------------------------------
+# CPython builds the Python AST objects from the C parse tree with a recursive
+# C function, so a deeply NESTED expression costs C stack and past some depth
+# `ast.parse` raises RecursionError. Three things make this a nightmare to
+# test, and all three are why it reached CI unnoticed:
+#
+#  * the depth is NOT sys.getrecursionlimit(). Measured on this machine,
+#    CPython 3.14.6, `a + a + ... ` chains: raising the limit from 1,000 to
+#    1,000,000 moves the threshold by nothing at all.
+#  * the depth depends on the C stack, so it differs by platform and by
+#    thread. Measured: 3.14.6 on the macOS main thread (8MB) accepts 95,065
+#    and raises at 95,066; the same interpreter on a 512KB thread accepts
+#    2,834 and raises at 2,835. The suite's baits are 4,000 and 20,000 deep --
+#    comfortably fine on macOS, over the line on the Ubuntu runners.
+#  * on an interpreter whose AST builder has no counter, going past the depth
+#    does not raise AT ALL. Measured on CPython 3.9.6, this repo's floor, by
+#    bisecting in child processes: the main thread accepts 260,937 and is
+#    dead by 262,500 (SIGSEGV, rc -11), with NO depth in between that raises
+#    RecursionError. A 512KB thread at depth 20,000 exits 138 (SIGBUS). No
+#    traceback, no output, nothing to catch.
+#
+# So a test that just feeds deeper input is either vacuous (macOS) or fatal to
+# the whole suite (3.9.6). `forced_ast_recursion_error` is the portable half:
+# it makes ast.parse raise on every platform, so the assertion that the
+# scripts REPORT the file is live everywhere and cannot pass by accident.
+# `ast_depth_raises_here` is the honest half: it reproduces the real thing in
+# a child process, where a segfaulting interpreter cannot take the suite down.
+
+AST_RECURSION_DEPTH_KB = 512
+
+
+@contextlib.contextmanager
+def forced_ast_recursion_error():
+    """Make `ast.parse` raise RecursionError, on any platform.
+
+    Not a substitute for the real thing -- see `ast_depth_raises_here` -- but
+    the only way to assert the reporting path identically on macOS, on Linux
+    and on an interpreter that would otherwise crash rather than raise.
+    """
+    with mock.patch.object(
+            ast, "parse",
+            side_effect=RecursionError(
+                "maximum recursion depth exceeded during ast construction")):
+        yield
+
+
+def ast_depth_raises_here(kb=AST_RECURSION_DEPTH_KB, depth=20_000):
+    """Does a `depth`-deep expression make ast.parse RAISE on a `kb` stack?
+
+    Answered in a child process, because on an interpreter without the
+    AST-construction counter the answer is "no, it dies", and finding that out
+    in-process would end the test run. Returns True only when the child came
+    back alive having caught a RecursionError.
+    """
+    probe = textwrap.dedent("""
+        import ast, sys, threading
+        src = "y = " + "a + " * %d + "1\\n"
+        out = []
+        def run():
+            try:
+                ast.parse(src)
+                out.append("parsed")
+            except RecursionError:
+                out.append("raised")
+        threading.stack_size(%d * 1024)
+        t = threading.Thread(target=run)
+        t.start(); t.join()
+        sys.stdout.write(out[0] if out else "lost")
+    """ % (depth, kb))
+    try:
+        done = subprocess.run([sys.executable, "-c", probe],
+                              capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - platform
+        return False
+    return done.returncode == 0 and done.stdout.strip() == "raised"
+
+
+def scan_on_a_thin_stack(script, call, kb=AST_RECURSION_DEPTH_KB):
+    """Run `call` in a child process on a thread with a small C stack.
+
+    `script` is a module name under scripts/ ("arid_nodes", "flake_smells",
+    "project_state"); `call` is the expression to evaluate against it, bound to
+    `mod`. Returns (returncode, parsed_json_or_None, stderr).
+    A child that dies instead of returning is the whole point of using one.
+    """
+    body = textwrap.dedent("""
+        import json, sys, threading
+        sys.path.insert(0, %r)
+        import %s as mod
+        out = {}
+        def run():
+            try:
+                out["result"] = %s
+            except BaseException as exc:
+                out["raised"] = type(exc).__name__ + ": " + str(exc)
+        threading.stack_size(%d * 1024)
+        t = threading.Thread(target=run)
+        t.start(); t.join()
+        sys.stdout.write(json.dumps(out))
+    """ % (SCRIPTS, script, call, kb))
+    done = subprocess.run([sys.executable, "-c", body],
+                          capture_output=True, text=True, timeout=120)
+    try:
+        return done.returncode, json.loads(done.stdout), done.stderr
+    except ValueError:
+        return done.returncode, None, done.stderr
+
+
+def assert_ast_depth_reported(case, result, module, path, *, scanned_key,
+                              scanned_value):
+    """The explicit signal, asserted the same way for both scripts.
+
+    Deliberately NOT a finding: deeply nested generated code is legitimate, a
+    rule that fired on it would run far past this repo's ~10% false-positive
+    threshold, and a check at that rate gets switched off entirely. It is the
+    `skipped_files` precedent instead -- its own top-level list, its own
+    summary counter, and a line in the human-readable render.
+    """
+    deep = result["unparsed_files"]
+    case.assertEqual([d["file"] for d in deep], [path],
+                     "a file whose AST could not be built must be NAMED, not "
+                     "quietly handed to the regex scanner")
+    entry = deep[0]
+    case.assertEqual(entry["stage"], "ast")
+    case.assertEqual(entry["fell_back_to"], "regex")
+    # The fallback DID run, and the output has to say the AST pass did not --
+    # a partial analysis reported as complete is the failure mode here.
+    case.assertIn("RecursionError", entry["reason"])
+    case.assertIn("nesting", entry["reason"])
+    case.assertIn("did NOT run", entry["reason"])
+    case.assertIn("sys.setrecursionlimit", entry["reason"],
+                  "the reason must name the limit that does NOT control this, "
+                  "or a reader will try to raise it")
+    case.assertTrue(entry["not_analysed"],
+                    "the record has to say what was lost, not only that "
+                    "something was")
+    case.assertEqual(result["summary"]["files_ast_unparsed"], 1)
+    # Still read, still analysed: this is a third state, not skipped_files.
+    case.assertEqual(result["skipped_files"], [])
+    case.assertEqual(result["summary"][scanned_key], scanned_value)
+    # Per-file, too: `parsed_with: regex` is also what a Java file says, so it
+    # cannot carry this on its own.
+    case.assertEqual(result["files"][0]["parsed_with"], "regex")
+    case.assertEqual(result["files"][0]["ast_unavailable"], module.AST_TOO_DEEP)
+    # And in the terminal output, where a human decides the run went fine.
+    rendered = module.render_text(result)
+    case.assertIn("WITHOUT the AST pass", rendered)
+    case.assertIn(path, rendered)
 
 
 def grant_session_consent(case, repo_path):
@@ -377,11 +535,37 @@ class EncodingTests(TempMixin, unittest.TestCase):
         self.assertEqual(result["summary"]["files_scanned"], 1)
 
     def test_flake_smells_skips_a_file_with_a_nul_byte(self):
+        """A binary file must be NAMED as skipped, and for the right reason.
+
+        The reason is asserted on its stable half -- that the record exists
+        and identifies the file as binary -- not on the whole sentence. This
+        test used to pin the exact string "unreadable or binary", and a
+        strictly better message broke it: that wording answered a permission
+        error, a broken symlink and a NUL-byte file identically, and the
+        three need three different reactions from a reader. The sentence will
+        be improved again; what must not change is that the skip is recorded
+        and that it says "binary".
+        """
         self.write("test_a.py", b"def test_x():\n\x00    assert 1\n", binary=True)
         result = fsm.scan_paths([self.tmp])
         self.assertEqual(result["summary"]["files_scanned"], 0)
-        self.assertEqual(result["summary"]["skipped"][0]["reason"],
-                         "unreadable or binary")
+        skipped = result["summary"]["skipped"]
+        self.assertEqual(len(skipped), 1, skipped)
+        self.assertIn("test_a.py", skipped[0]["path"])
+        reason = skipped[0]["reason"]
+        self.assertIn("binary", reason)
+        # The same file must not ALSO be called unreadable: "I was denied
+        # permission" and "this is not source text" are different facts and
+        # a reader acts differently on each.
+        self.assertNotIn("unreadable", reason)
+        # And the same fact is worded the same way across the scripts that
+        # state it: risk_map.py, arid_nodes.py and flake_smells.py all emit
+        # this prefix for this condition, and only the tail -- what the
+        # individual tool could not do with the file -- differs. Divergence
+        # between copies of one rule is this repository's most frequent
+        # defect, so the shared half is pinned here rather than left to
+        # three independent wordings.
+        self.assertIn("NUL byte in the first 8000 bytes", reason)
 
     @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
     def test_arid_nodes_handles_latin1_and_nul(self):
@@ -390,6 +574,38 @@ class EncodingTests(TempMixin, unittest.TestCase):
         result = arid.plan([self.tmp])
         # The latin-1 file is planned; the NUL file is dropped as binary.
         self.assertEqual(result["summary"]["files"], 1)
+        # And the drop says WHICH of the three things happened, in the same
+        # words flake_smells.py and risk_map.py use for the same fact.
+        reason = result["skipped_files"][0]["reason"]
+        self.assertIn("NUL byte in the first 8000 bytes", reason)
+        self.assertNotIn("unreadable", reason)
+
+    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    def test_arid_nodes_does_not_publish_a_secret_in_a_snippet(self):
+        """docs/SECURITY-REVIEW.md S3-1, the arid_nodes half.
+
+        The mutation plan carries up to 100 characters of verbatim source
+        into `.testing/` (which skills/start/SKILL.md says to commit), the CI
+        job log and the uploaded artifact. A fixture holding a real-shaped
+        token must not ride along -- and the readable parts of the line must
+        survive, or the plan cannot be reviewed and gets ignored.
+        """
+        self.write("a.py",
+                   'def charge(amount):\n'
+                   '    key = "sk_live_4eC39HqLyjWDarjtT1zdp7dcAbCdEfGh"\n'
+                   '    host = "localhost"\n'
+                   '    if amount > 0:\n'
+                   '        return bill(key, host, amount)\n'
+                   '    return None\n')
+        result = arid.plan([self.tmp])
+        self.assertTrue(result["summary"]["redaction"]["applied"],
+                        result["summary"]["redaction"])
+        blob = json.dumps(result)
+        self.assertNotIn("sk_live_4eC39", blob,
+                         "a live-shaped key reached the mutation plan")
+        # The opposite false positive, and the one that kills the tool: a
+        # plan whose snippets all read "[redacted]" cannot be reviewed.
+        self.assertIn("localhost", blob)
 
 
 # --------------------------------------------------------------------------
@@ -424,10 +640,45 @@ class StructureTests(TempMixin, unittest.TestCase):
         with timed(self, "flake_smells on a 10MB single line", budget=10.0):
             result = fsm.scan_paths([self.tmp])
         self.assertEqual(result["summary"]["files_scanned"], 0)
-        skipped = result["summary"]["skipped"]
-        self.assertEqual([s["file"] for s in skipped],
+        # `skipped_files` is the list that matters, and it is NOT
+        # summary["skipped"]: that one is the full disposition log and
+        # includes "not a test file", which is a decision rather than a
+        # failure. The key is "file" here, matching arid_nodes.py,
+        # risk_map.py and env_safety_check.py; summary["skipped"] keys the
+        # same thing as "path", which is what made this test ERROR with a
+        # KeyError rather than fail. Reported, not papered over.
+        unread = result["skipped_files"]
+        self.assertEqual([s["file"] for s in unread],
                          [self.path("test_huge.py")])
-        self.assertIn("ceiling", skipped[0]["reason"])
+        self.assertIn("ceiling", unread[0]["reason"])
+        # The point of the whole exercise: a reader must be able to tell this
+        # apart from a clean scan. A clean scan has an EMPTY skipped_files,
+        # so a non-empty one is the signal, and the reason names the ceiling.
+        self.assertIn("2MB", unread[0]["reason"])
+        self.assertIn("--max-file-bytes", unread[0]["reason"])
+        # ... and it reaches the human-readable output too, not only the JSON.
+        self.assertIn("NOT scanned", fsm.render_text(result))
+
+    def test_a_clean_scan_and_an_unread_file_do_not_look_alike(self):
+        # The ceiling's whole value is this contrast. Both runs report zero
+        # findings; only one of them actually looked at the file. If these two
+        # results were indistinguishable the gate would be returning a clean
+        # verdict about a file it never opened, which is the worst defect this
+        # build produced.
+        self.write("test_clean.py", "def test_a():\n    assert f(1) == 2\n")
+        clean = fsm.scan_paths([self.tmp])
+        os.remove(self.path("test_clean.py"))
+        self.write("test_huge.py", "x = '" + "a" * 10_000_000 + "'\n")
+        unread = fsm.scan_paths([self.tmp])
+
+        self.assertEqual(clean["summary"]["findings"], 0)
+        self.assertEqual(unread["summary"]["findings"], 0)
+        self.assertEqual(clean["skipped_files"], [])
+        self.assertNotEqual(unread["skipped_files"], [])
+        self.assertEqual(clean["summary"]["files_scanned"], 1)
+        self.assertEqual(unread["summary"]["files_scanned"], 0)
+        self.assertNotIn("NOT scanned", fsm.render_text(clean))
+        self.assertIn("NOT scanned", fsm.render_text(unread))
 
     def test_single_ten_megabyte_line_is_scanned_when_the_ceiling_is_raised(self):
         # The ceiling is a default, not a verdict: --max-file-bytes raises it,
@@ -437,7 +688,140 @@ class StructureTests(TempMixin, unittest.TestCase):
                    budget=20.0):
             result = fsm.scan_paths([self.tmp], max_bytes=64 * 1024 * 1024)
         self.assertEqual(result["summary"]["files_scanned"], 1)
-        self.assertEqual(result["summary"]["skipped"], [])
+        self.assertEqual(result["skipped_files"], [])
+        # Raising the FILE ceiling does not remove the LINE ceiling, and the
+        # line ceiling is what keeps this run fast. Scanning 2,000 of
+        # 10,000,006 characters and reporting zero findings would be the same
+        # silent lie one level down, so the truncation is reported.
+        self.assertEqual(result["summary"]["lines_truncated"], 1)
+        cut = result["truncated_lines"][0]
+        self.assertEqual(cut["file"], self.path("test_huge.py"))
+        self.assertEqual(cut["line"], 1)
+        # 5 ("x = '") + 10,000,000 + 2 ("'\n"). Spelled out so a change in
+        # what gets counted (bytes vs characters, newline in or out) fails
+        # here rather than drifting quietly.
+        self.assertEqual(cut["chars"], 10_000_007)
+        self.assertEqual(cut["scanned_chars"], fsm.MAX_LINE_CHARS)
+        self.assertIn("NOT examined", cut["reason"])
+        self.assertIn("PARTLY scanned", fsm.render_text(result))
+
+    def test_a_long_line_under_the_file_ceiling_is_not_silently_shortened(self):
+        """REGRESSION. A 1.9MB single-line test file is UNDER the 2MB file
+        ceiling, so it is read and counted as scanned. flake_smells then cut
+        every line to MAX_LINE_CHARS and said nothing, so the report read
+        files_scanned=1, findings=0, skipped_files=[] -- a clean verdict about
+        1,898,000 characters nobody looked at. Measured before the fix: 0.002s
+        and zero findings, with no trace of the truncation anywhere in the
+        output.
+        """
+        body = "    assert foo('" + "x" * 1_900_000 + "') == 1\n"
+        self.write("test_oneline.py", "def test_x():\n" + body)
+        self.assertLess(os.path.getsize(self.path("test_oneline.py")),
+                        fsm.MAX_FILE_BYTES)
+        with timed(self, "flake_smells on a 1.9MB single line", budget=10.0):
+            result = fsm.scan_paths([self.tmp])
+        # Read, therefore NOT in skipped_files -- these are different states.
+        self.assertEqual(result["summary"]["files_scanned"], 1)
+        self.assertEqual(result["skipped_files"], [])
+        # But partly unread, and that has to be said.
+        self.assertEqual(result["summary"]["lines_truncated"], 1)
+        self.assertEqual(result["summary"]["files_with_truncated_lines"], 1)
+        cut = result["truncated_lines"][0]
+        self.assertEqual(cut["file"], self.path("test_oneline.py"))
+        self.assertEqual(cut["line"], 2)
+        self.assertEqual(cut["chars"], len(body))
+        self.assertIn("NOT examined", cut["reason"])
+
+    def test_a_short_file_reports_no_truncation_at_all(self):
+        # The other half of the contrast: an ordinary file must come back with
+        # lines_truncated == 0 and nothing in the text output, or the new
+        # signal is noise that gets ignored like any other false positive.
+        self.write("test_ok.py", "def test_a():\n    assert f(1) == 2\n")
+        result = fsm.scan_paths([self.tmp])
+        self.assertEqual(result["summary"]["lines_truncated"], 0)
+        self.assertEqual(result["truncated_lines"], [])
+        self.assertNotIn("PARTLY scanned", fsm.render_text(result))
+
+    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    def test_arid_nodes_does_not_silently_shorten_a_long_line(self):
+        """REGRESSION. arid_nodes.py had a 2MB file ceiling and no per-line
+        bound at all, so a single long line was planned in full. Measured on
+        this machine before the fix: a 1.9MB single line cost 0.517s, and a
+        400,000-character `a + a + a + ...` line raised an uncaught
+        RecursionError out of ast.parse that aborted the whole run.
+        """
+        body = "    return a + " + " + ".join(["1"] * 20_000) + "\n"
+        self.write("long.py", "def g(a):\n" + body)
+        self.assertLess(os.path.getsize(self.path("long.py")),
+                        arid.MAX_FILE_BYTES)
+        result = arid.plan([self.tmp])
+        self.assertEqual(result["summary"]["files"], 1)
+        self.assertEqual(result["skipped_files"], [])
+        self.assertEqual(result["summary"]["lines_truncated"], 1)
+        cut = result["truncated_lines"][0]
+        self.assertEqual(cut["file"], self.path("long.py"))
+        self.assertEqual(cut["line"], 2)
+        self.assertEqual(cut["chars"], len(body))
+        self.assertEqual(cut["read_chars"], arid.MAX_LINE_CHARS)
+        self.assertIn("NOT read", cut["reason"])
+        self.assertIn("PARTLY read", arid.render_text(result))
+
+    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    def test_arid_nodes_cost_is_linear_in_the_lines_of_one_function(self):
+        """REGRESSION. _single_statement_body() rebuilt the whole enclosing
+        function's body list for every candidate line in it, and was called
+        twice per line, so one long function cost O(body^2). Measured before
+        the fix, on files far under the 2MB ceiling: 2,005 lines 0.824s,
+        4,005 lines 3.533s, 8,005 lines 12.192s -- roughly 4x per doubling.
+        The file ceiling bounded the bytes and not the work.
+
+        Asserted as a ratio rather than a wall time: an absolute budget on a
+        shared CI box is a flake, but a quadratic still doubles its ratio.
+
+        The body used to be `x = (a +\n a +\n ... a)`, which is one expression
+        nested n deep. That made the fixture's PARSE PATH depend on the C
+        stack: on the Ubuntu runners 1,000 deep parsed and 4,000 deep did not,
+        so the two halves of the ratio were timed through different scanners
+        and the comparison stopped meaning anything -- on 3.11 it did not even
+        get that far, because the RecursionError escaped plan() and errored
+        the test. It is a flat tuple now: same line count, same
+        lines_considered (measured: 1,003 and 4,003, identical to the nested
+        shape), same ~4x ratio, but AST depth 2 on every platform, so what is
+        being timed is the line count and nothing else. Depth is covered
+        properly by the two dedicated tests in ReDoSTests.
+        """
+        def cost(n):
+            shutil.rmtree(self.tmp, ignore_errors=True)
+            os.makedirs(self.tmp)
+            self.write("mod.py",
+                       "def f():\n    x = (\n" + "        a,\n" * n
+                       + "        a\n    )\n    return x\n")
+            start = time.time()
+            result = arid.plan([self.tmp])
+            return time.time() - start, result
+
+        small, small_result = cost(1000)
+        large, large_result = cost(4000)
+        # Like-for-like or the ratio is noise. Both halves must have gone
+        # through the SAME scanner, and neither may have fallen back -- a
+        # silent fallback is what made the old fixture's number meaningless.
+        for label, result in (("1,000", small_result), ("4,000", large_result)):
+            self.assertEqual(result["files"][0]["parsed_with"], "ast",
+                             f"the {label}-line run did not reach the AST "
+                             "path, so the two timings are not comparable")
+            self.assertEqual(result["unparsed_files"], [])
+            self.assertEqual(result["summary"]["files_ast_unparsed"], 0)
+        self.assertEqual(small_result["summary"]["lines_considered"], 1003)
+        self.assertEqual(large_result["summary"]["lines_considered"], 4003)
+        # 4x the lines. Linear predicts ~4x, quadratic predicts ~16x. A
+        # generous 8x still catches the quadratic and tolerates a noisy box.
+        # The floor guards against a timer too coarse to divide by.
+        self.assertGreater(small, 0.0005,
+                           "timer resolution too coarse to compare")
+        self.assertLess(large / small, 8.0,
+                        f"cost grew {large / small:.1f}x for 4x the lines "
+                        f"({small:.3f}s -> {large:.3f}s): that is the "
+                        "quadratic coming back")
 
     def test_multi_megabyte_test_file_is_read_whole_into_memory(self):
         """FIXED: flake_smells.py now has MAX_FILE_BYTES = 2MB.
@@ -977,31 +1361,222 @@ class ConcurrencyTests(TempMixin, unittest.TestCase):
                       encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["totals"]["lines_found"], 2)
 
-    def test_scripts_do_not_write_atomically(self):
-        """GAP, documented: no script uses temp-file-then-rename for --out.
+    # Every script that declares an `--out` flag. Hard-coded rather than
+    # derived so that a new writer joining the tree fails this test until
+    # somebody has looked at how it writes; `atomic_io.py` is deliberately
+    # absent -- it has no --out of its own, only an `open(args.out, "w")`
+    # quoted in its docstring, which is why the scan keys on the flag.
+    OUT_WRITERS = ["arid_nodes.py", "env_safety_check.py", "flake_smells.py",
+                   "normalize_coverage.py", "pr_comment.py",
+                   "project_state.py", "risk_map.py"]
 
-        Every `--out` path in the tree is a plain `open(path, "w")`, which
-        truncates first and writes after. Two scripts told to write the same
-        .testing/ file -- which is exactly what two parallel agents following
-        the skills will do -- can interleave, and any reader that opens the
-        file mid-write sees a truncated JSON document.
-        The skills promise atomicity (skills/start/SKILL.md: "Writes are atomic
-        (temp file, then rename)"); the scripts the skills invoke do not
-        implement it.
-        SHOULD: write to `path + ".tmp"` and os.replace() onto the target.
+    # Enough rounds that a truncation window of a millisecond or two is
+    # sampled, few enough that seven writers stay well under two seconds.
+    ATOMIC_ROUNDS = 5
+
+    def _probe_inputs(self):
+        """The smallest input that makes each writer produce a report.
+
+        Built once per test: a source tree with one test file and one .env, a
+        large LCOV report, a --data blob and a one-commit git repository.
         """
-        offenders = []
+        src = self.path("probe/src")
+        os.makedirs(src, exist_ok=True)
+        self.write("probe/src/test_probe.py",
+                   "import unittest\n\n\nclass T(unittest.TestCase):\n"
+                   "    def test_a(self):\n        self.assertEqual(1, 1)\n")
+        self.write("probe/src/.env", "API_KEY=abc123\nHOST=api.acme.com\n")
+        # Deliberately large: the wider the document, the wider the window a
+        # truncate-then-write leaves open, and the more of this test's value
+        # survives on a machine faster than the one it was written on.
+        big_lcov = self.write("probe/big.info", "".join(
+            "SF:src/f%d.py\n%send_of_record\n"
+            % (i, "".join("DA:%d,%d\n" % (n, n % 2) for n in range(1, 60)))
+            for i in range(300)))
+        data = self.write("probe/data.json", json.dumps(
+            {"health": {"verdict": "GREEN"}, "coverage": {"totals": {}}}))
+        repo = init_repo(self.path("probe/repo"))
+        self.write("probe/repo/a.py", "def f():\n    return 1\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "seed")
+        os.makedirs(self.path("probe/out"), exist_ok=True)
+        return src, big_lcov, data, repo
+
+    def _out_writer_probes(self):
+        """(script name, run) for every one of the seven `--out` writers.
+
+        In-process rather than by subprocess: `main(argv)` reaches the same
+        writer either way, and seven writers times six interpreter startups
+        would buy nothing but seconds. `project_state`'s ROOT is pointed at
+        the fixture for the reason its own tests do it -- measuring the live
+        repository here would make this test depend on the branch, the dirty
+        list and on whatever another process is writing right now.
+        """
+        self.assertIsNotNone(
+            arid, "arid_nodes.py is missing from scripts/, so one of the "
+                  "seven --out writers cannot be exercised at all")
+        src, big_lcov, data, repo = self._probe_inputs()
+
+        def project_state(out):
+            with mock.patch.object(pstate, "ROOT", src):
+                return pstate.main(["--no-tests", "--out", out])
+
+        return [
+            ("arid_nodes.py", lambda out: arid.main([src, "--out", out])),
+            ("env_safety_check.py", lambda out: esc.main([src, "--out", out])),
+            ("flake_smells.py", lambda out: fsm.main([src, "--out", out])),
+            ("normalize_coverage.py",
+             lambda out: ncov.main([big_lcov, "--out", out])),
+            ("pr_comment.py",
+             lambda out: prc.main(["--data", data, "--out", out])),
+            ("project_state.py", project_state),
+            ("risk_map.py", lambda out: rmap.main([repo, "--out", out])),
+        ]
+
+    def _write_one_report(self, name, run, out):
+        """Run the writer once, quietly, and return the size it left behind.
+
+        The size is the test's floor: a writer that produced nothing would
+        otherwise make every comparison below trivially true.
+        """
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            run(out)
+        self.assertTrue(os.path.exists(out),
+                        f"{name} --out wrote no file at all, so this test "
+                        "would have measured nothing")
+        size = os.path.getsize(out)
+        self.assertGreater(size, 0, f"{name} --out wrote an empty report")
+        return size
+
+    def assert_never_observed_truncated(self, name, run):
+        """Rewrite the destination while a reader samples it, and assert the
+        reader never caught it short.
+
+        The oracle is a size, not a parse, because two of the seven write text
+        rather than JSON: `write_text_atomic` renames a finished temp file
+        onto the destination, so the smallest size a reader can ever observe
+        is the size of a whole report. `open(path, "w")` holds it at zero
+        bytes and then at a prefix -- however the truncation is reached, and
+        whatever else is called afterwards.
+        """
+        out = self.path("probe/out/%s" % name)
+        floor = self._write_one_report(name, run, out)
+        seen = {"min": None, "missing": 0, "reads": 0}
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    with open(out, "rb") as fh:
+                        size = len(fh.read())
+                except FileNotFoundError:
+                    seen["missing"] += 1
+                    continue
+                seen["reads"] += 1
+                if seen["min"] is None or size < seen["min"]:
+                    seen["min"] = size
+
+        watcher = threading.Thread(target=reader)
+        watcher.start()
+        try:
+            for _ in range(self.ATOMIC_ROUNDS):
+                floor = min(floor, self._write_one_report(name, run, out))
+        finally:
+            stop.set()
+            watcher.join()
+
+        # Guard the guard: a reader that never ran would observe nothing and
+        # report it as nothing wrong.
+        self.assertGreater(
+            seen["reads"], self.ATOMIC_ROUNDS,
+            f"the reader sampled {name}'s destination {seen['reads']} times, "
+            "which is too few for this test to have measured anything")
+        self.assertEqual(
+            seen["missing"], 0,
+            f"{name}'s --out destination disappeared {seen['missing']} "
+            "time(s) mid-write; os.replace() never unlinks it, so something "
+            "else is writing that path")
+        self.assertGreaterEqual(
+            seen["min"], floor,
+            f"a reader saw {name}'s --out destination holding "
+            f"{seen['min']} bytes while the smallest complete report it "
+            f"writes is {floor}: the destination is truncated before the new "
+            "report is written, so a parallel agent reading it gets half a "
+            "document, or none of one, and nothing reports an error")
+
+    def test_every_out_writer_never_shows_a_reader_a_truncated_file(self):
+        """The behavioural half, and the one that can actually fail.
+
+        `skills/start/SKILL.md` promises parallel agents "cannot clobber each
+        other or leave a half-written baseline". That is a claim about what a
+        concurrent reader observes, so it is asserted by concurrently reading:
+        each writer rewrites its destination while a reader samples it, and
+        the smallest size ever observed must still be a whole report.
+
+        Its predecessor, kept below as a lint, was two regexes over source
+        text. A truncation reached through a local variable --
+        `_dest = args.out; open(_dest, "w")` -- satisfies both of them, so the
+        whole suite stayed green over a writer that really did clobber its
+        destination for 50ms on every run. A grep is a lint; only a reader can
+        testify about what a reader sees.
+        """
+        probes = self._out_writer_probes()
+        self.assertEqual(
+            [name for name, _ in probes], self.OUT_WRITERS,
+            "every --out writer must be exercised here, not just listed")
+        for name, run in probes:
+            with self.subTest(writer=name):
+                self.assert_never_observed_truncated(name, run)
+
+    def test_every_out_writer_is_atomic(self):
+        """The lint half: all seven `--out` writers go through atomic_io.
+
+        This is a source scan, and a source scan cannot see a truncation that
+        goes through a variable, a helper or a second file -- it was measured
+        surviving exactly that. It is kept because it names the offending
+        script and fails on the naive conversion the moment it lands, before
+        anyone has to reason about a race. The test above it is the one that
+        can testify about behaviour.
+
+        A plain `open(path, "w")` truncates first and writes after, so two
+        agents told to write the same .testing/ file -- which is what the
+        parallel dispatch in the skills does -- could interleave and both exit
+        0, and a reader opening the file mid-write saw a truncated document.
+        `scripts/atomic_io.write_text_atomic()` writes a temp file in the
+        destination directory and os.replace()s it onto the target, so a
+        reader sees the whole old file or the whole new one. This is what
+        makes skills/start/SKILL.md ("Writes are atomic (temp file, then
+        rename)") true rather than aspirational.
+
+        The previous version of this test asserted `assertNotIn("os.replace",
+        offenders)` against a list of FILENAMES, so it could only have failed
+        for a script literally named `os.replace`; four conversions landed
+        under it with no signal. Both assertions below name the offending
+        script, and the first one guarantees the scan looked at anything at
+        all.
+        """
+        writers, offenders = [], []
         for name in sorted(os.listdir(SCRIPTS)):
             if not name.endswith(".py"):
                 continue
             with open(os.path.join(SCRIPTS, name), encoding="utf-8") as fh:
                 src = fh.read()
-            if re.search(r'open\(\s*args\.out', src) and "os.replace" not in src:
+            if '"--out"' not in src:
+                continue
+            writers.append(name)
+            # Atomic means both halves: the atomic call is present AND no
+            # plain open() of the same path survives beside it.
+            if (not re.search(r'write_text_atomic\(\s*args\.out', src)
+                    or re.search(r'open\(\s*args\.out', src)):
                 offenders.append(name)
-        self.assertTrue(offenders, "expected at least one --out writer")
-        # Pinned as the current state. When atomic writes land, this list
-        # shrinks and the assertion below is what tells you.
-        self.assertNotIn("os.replace", offenders)
+        self.assertEqual(
+            writers, self.OUT_WRITERS,
+            "the set of --out writers changed; a new one must be atomic "
+            "before it is added here")
+        self.assertEqual(
+            offenders, [],
+            "these --out writers still truncate-then-write: %s" % offenders)
 
     def test_concurrent_writes_to_the_same_output_file_do_not_crash(self):
         # Both processes exit 0; the surviving file is whatever the last writer
@@ -1070,6 +1645,75 @@ class ResourceBoundTests(unittest.TestCase):
                 self.assertIn("skipped_files", src)
                 self.assertIn("--max-file-bytes", src)
 
+    def _ast_parse_scripts(self):
+        return [n for n in sorted(os.listdir(SCRIPTS))
+                if n.endswith(".py") and "ast.parse(" in self.source(n)]
+
+    def test_the_two_scanners_guard_and_report_ast_recursion(self):
+        """A structural guard, because the next ast.parse call site will be
+        written by someone who never saw this bug.
+
+        `ast.parse` raises RecursionError on deeply nested input at a depth
+        that is not sys.getrecursionlimit() and differs by platform, so a new
+        unguarded site is a crash that only CI will find -- which is exactly
+        what happened. Grepping the source is crude, but it is the only check
+        that fires without depending on the machine's C stack, so it is as
+        true on a developer's Mac as on an Ubuntu runner.
+        """
+        for name in ("arid_nodes.py", "flake_smells.py"):
+            if arid is None and name == "arid_nodes.py":
+                continue
+            self.assertIn(name, self._ast_parse_scripts())
+            src = self.source(name)
+            with self.subTest(script=name):
+                self.assertIn("except RecursionError", src,
+                              f"{name} calls ast.parse without catching "
+                              "RecursionError; a deeply nested expression "
+                              "will kill the whole run")
+                # Catching it is only half. Silence must never look like
+                # success, so the file has to be named in the output too.
+                self.assertIn("unparsed_files", src,
+                              f"{name} catches RecursionError but has no "
+                              "unparsed_files report; a silent fallback to "
+                              "the regex scanner is the same defect in new "
+                              "clothes")
+                self.assertIn("files_ast_unparsed", src,
+                              f"{name} has no summary counter for files "
+                              "whose AST could not be built")
+
+    def test_every_ast_parse_site_guards_against_recursion(self):
+        """FIXED. Was @unittest.expectedFailure while one site was open.
+
+        `scripts/project_state.py:_xfail_tests()` had the identical bug the
+        two scanners had: it wrapped `ast.parse` in
+        `except (SyntaxError, ValueError)` while its docstring promised it
+        "Returns None when the file does not parse, so the caller can fall
+        back". RecursionError was not caught, so a deeply nested expression in
+        any scanned .py propagated out of section_markers() and took down the
+        whole state report -- the script whose entire purpose is to measure
+        the project when nothing else can be trusted. Reproduced before the
+        fix both by forcing ast.parse to raise and by parsing a genuinely
+        20,000-deep expression on a 512KB thread stack in a child process.
+
+        The decorator was removed in the same change as the fix: a defect that
+        is fixed while its test still says expectedFailure reports as an
+        unexpected success, which reads like a failure in the run summary.
+
+        This is the whole-directory sweep. It is deliberately derived from the
+        tree rather than hard-coded, so the NEXT script to call ast.parse is
+        covered by it on the day it lands.
+        """
+        sites = self._ast_parse_scripts()
+        # Guard the guard: a glob that matched nothing would pass every
+        # assertion below without executing one of them.
+        self.assertIn("project_state.py", sites)
+        self.assertGreaterEqual(len(sites), 3, sites)
+        for name in sites:
+            with self.subTest(script=name):
+                self.assertIn("except RecursionError", self.source(name),
+                              f"{name} calls ast.parse without catching "
+                              "RecursionError")
+
     def test_risk_map_counts_lines_without_reading_the_file_whole(self):
         # FIXED. current_files() needs a newline count and nothing else, so
         # holding the file in memory to produce one int bought nothing and
@@ -1120,6 +1764,193 @@ class ResourceBoundTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# project_state.py and the ast.parse depth ceiling
+# --------------------------------------------------------------------------
+
+class ProjectStateAstTests(TempMixin, unittest.TestCase):
+    """The state report is what a fresh session reads when nothing else can
+    be trusted, so it has two jobs here and both are asserted below: survive
+    a file whose AST cannot be built, and never print a count taken from one
+    as though it had been measured.
+
+    Every measurement below is taken over this test's own throwaway tree.
+    `collect()` against the live repository would be ambient state, not
+    behaviour: it walks and reads every file in the checkout -- including the
+    ones another process may be half-way through writing -- shells out to git
+    for the branch and the dirty list, and runs the repository's own
+    `scripts/validate_plugin.py` as a subprocess. A test built on that passes
+    on CI's clean checkout and fails on a developer's dirty one, which is the
+    worst polarity: it teaches the developer to ignore the result.
+    """
+
+    # The ROOT the module computed at import time -- the real repository.
+    # Captured once, so the assertions below can say what was NOT measured.
+    LIVE_ROOT = pstate.ROOT
+
+    def collect_fixture(self, forced_recursion=False):
+        """`collect()` over this test's tree, with ROOT patched for the whole
+        call rather than for one section of it. Tests never run the project's
+        own suite, so skip_tests is not optional here."""
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(pstate, "ROOT", self.tmp))
+            if forced_recursion:
+                stack.enter_context(forced_ast_recursion_error())
+            return pstate.collect(skip_tests=True)
+
+    def assert_measured_the_fixture(self, state, rendered):
+        """Guard the decoupling itself.
+
+        Without this, moving any part of the measurement back outside the ROOT
+        patch would not fail here -- it would fail somewhere else, on one run
+        in five, only when the tree happened to be dirty. These three
+        assertions turn that into an immediate, named failure.
+        """
+        self.assertEqual(state["root"], self.tmp,
+                         "the report was taken over the wrong tree")
+        self.assertNotIn(self.LIVE_ROOT, rendered,
+                         "the rendered report names the real repository, so "
+                         "this test measured the live working tree instead of "
+                         "its own fixture")
+        self.assertFalse(state["validator"]["ran"],
+                         "collect() executed the repository's own "
+                         "validate_plugin.py as a subprocess; the fixture has "
+                         "no scripts/ and that section must report NOT RUN")
+        self.assertIn("validate_plugin.py", state["validator"]["reason"])
+
+    def test_project_state_reports_the_file_it_could_not_parse(self):
+        """Catching it is half. Silence must never look like success.
+
+        A bare `except RecursionError: return None` would make the state
+        report survive and print a `@unittest.expectedFailure` total that LOOKS
+        like every other measured number on the page, while being a text match
+        over a file the parser refused. This is the script a fresh session runs
+        when nothing else can be trusted, so that number has to be labelled at
+        the point it is printed.
+        """
+        # Deliberately a file with a REAL decorator in it: the line scanner
+        # does find it, so the count is not zero and not wrong -- it is
+        # unverified, which is a different thing and has to read differently.
+        self.write("test_deep.py",
+                   "import unittest\n\n\n@unittest.expectedFailure\n"
+                   "def test_x():\n    y = " + "a + " * 400 + "1\n"
+                   "    assert y\n")
+        state = self.collect_fixture(forced_recursion=True)
+        markers = state["markers"]
+
+        self.assertEqual([d["file"] for d in markers["ast_unparsed_files"]],
+                         ["test_deep.py"],
+                         "a file whose AST could not be built must be NAMED, "
+                         "not quietly handed to the line scanner")
+        self.assertEqual(markers["files_ast_unparsed"], 1)
+        self.assertFalse(markers["totals_exact"],
+                         "a total that includes a line-scan estimate must not "
+                         "claim to be exact")
+        entry = markers["ast_unparsed_files"][0]
+        self.assertEqual(entry["stage"], "ast")
+        self.assertEqual(entry["fell_back_to"], "line-scan")
+        self.assertIn("RecursionError", entry["reason"])
+        self.assertIn("nesting", entry["reason"])
+        self.assertIn("did NOT run", entry["reason"])
+        self.assertIn("sys.setrecursionlimit", entry["reason"],
+                      "the reason must name the limit that does NOT control "
+                      "this, or a reader will try to raise it")
+        self.assertTrue(entry["not_measured"],
+                        "the record has to say what was lost, not only that "
+                        "something was")
+        # The fallback really ran: the decorator was counted, the file was not
+        # dropped, and the hit says how it was found and why it has no name.
+        self.assertEqual(entry["line_scan_hits"], 1)
+        self.assertEqual(markers["totals"][pstate.MARKER_XFAIL], 1)
+        hit = markers["expected_failures"][0]
+        self.assertEqual(hit["file"], "test_deep.py")
+        self.assertIsNone(hit["test"])
+        self.assertEqual(hit["counted_by"], "line-scan")
+        self.assertEqual(hit["why_unnamed"], pstate.AST_TOO_DEEP)
+
+        # And in the rendered report, where a human decides the run went fine.
+        rendered = pstate.render(state)
+        self.assert_measured_the_fixture(state, rendered)
+        self.assertIn("NOT EXACT", rendered)
+        self.assertIn("COULD NOT PARSE, counted WITHOUT the AST pass: "
+                      "test_deep.py", rendered)
+        self.assertIn("did NOT run", rendered)
+
+    def test_project_state_still_reports_exactly_when_everything_parses(self):
+        """The other half of the pair, and the reason the first one means
+        anything: the same tree, parsed, must come back exact and silent.
+
+        Without this, `totals_exact: False` and a COULD NOT PARSE block could
+        be printed unconditionally and every assertion above would still pass.
+        """
+        self.write("test_deep.py",
+                   "import unittest\n\n\n@unittest.expectedFailure\n"
+                   "def test_x():\n    y = 1\n    assert y\n")
+        state = self.collect_fixture()
+        markers = state["markers"]
+        self.assertEqual(markers["ast_unparsed_files"], [])
+        self.assertEqual(markers["files_ast_unparsed"], 0)
+        self.assertTrue(markers["totals_exact"])
+        self.assertEqual(markers["totals"][pstate.MARKER_XFAIL], 1)
+        # Parsed means NAMED: that is what the AST pass buys over a text match.
+        self.assertEqual(markers["expected_failures"],
+                         [{"file": "test_deep.py", "line": 4, "test": "test_x"}])
+        rendered = pstate.render(state)
+        self.assert_measured_the_fixture(state, rendered)
+        self.assertNotIn("NOT EXACT", rendered)
+        self.assertNotIn("COULD NOT PARSE", rendered)
+
+    def test_project_state_does_not_announce_a_half_written_file(self):
+        """A SyntaxError stays a silent fallback, on purpose.
+
+        Half-written files are an ordinary state in a working tree, a line
+        scan is the right answer for one, and announcing it on every run would
+        put noise in the one report that has to stay readable. The hit still
+        carries `why_unnamed` so a JSON consumer can tell the two apart; what
+        it must not do is set off the NOT EXACT alarm.
+        """
+        self.write("test_broken.py",
+                   "@unittest.expectedFailure\ndef test_x(:\n    pass\n")
+        with mock.patch.object(pstate, "ROOT", self.tmp):
+            markers = pstate.section_markers()
+        self.assertEqual(markers["ast_unparsed_files"], [])
+        self.assertTrue(markers["totals_exact"])
+        self.assertEqual(markers["totals"][pstate.MARKER_XFAIL], 1)
+        self.assertEqual(markers["expected_failures"][0]["why_unnamed"],
+                         "syntax-error")
+
+    def test_project_state_really_does_survive_a_too_deep_file(self):
+        """The forced test proves the reporting; this proves the catch.
+
+        A real RecursionError out of a real ast.parse, in a child process on a
+        small stack, because on an interpreter without the AST-construction
+        counter the alternative to catching it is the process dying -- and
+        finding THAT out in-process would end the run.
+        """
+        if not ast_depth_raises_here():
+            self.skipTest(
+                "this interpreter does not raise RecursionError from "
+                "ast.parse at a 512KB stack -- it crashes instead, so there "
+                "is no catchable behaviour here to assert. Measured on "
+                "CPython 3.9.6: SIGBUS, exit 138. The forced-RecursionError "
+                "test covers the reporting path on this platform.")
+        self.write("test_deep.py",
+                   "import unittest\n\n\n@unittest.expectedFailure\n"
+                   "def test_x():\n    y = " + "a + " * 20_000 + "1\n")
+        rc, out, err = scan_on_a_thin_stack(
+            "project_state",
+            "(setattr(mod, 'ROOT', %r), mod.section_markers())[1]" % self.tmp)
+        self.assertEqual(rc, 0, f"child died instead of returning: {err}")
+        self.assertIsNotNone(out, f"child produced no JSON: {err}")
+        self.assertNotIn("raised", out,
+                         "section_markers() must never raise -- _xfail_tests' "
+                         f"docstring promises it: {out.get('raised')}")
+        self.assertEqual(
+            [d["file"] for d in out["result"]["ast_unparsed_files"]],
+            ["test_deep.py"])
+        self.assertFalse(out["result"]["totals_exact"])
+
+
+# --------------------------------------------------------------------------
 # ReDoS
 # --------------------------------------------------------------------------
 
@@ -1139,46 +1970,100 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         bait = "HOST=" + "a." * 4000 + "!\n"
         self.write(".env", bait)
         with timed(self, "env_safety_check on dotted-host bait"):
-            esc.scan(self.tmp)
+            result = esc.scan(self.tmp)
+        # The elapsed-time budget inside timed() is this test's point, but on
+        # its own it is satisfied by a scanner that never opened the file --
+        # a ceiling, an unreadable-file path or a classify() change would all
+        # make this "fast" for a reason that has nothing to do with the regex.
+        # So pin that the bait was actually read, and how much of it was
+        # looked at.
+        self.assertEqual(result["scanned_files"], [".env"])
+        self.assertEqual(result["skipped_files"], [])
+        detectors = {f["detector"] for f in result["findings"]}
+        self.assertIn("host_scan_truncated", detectors,
+                      "the value is longer than MAX_HOST_SCAN_CHARS, so the "
+                      "scanner must say it only looked at the head")
 
-    def _email_sub_cost(self, n):
-        # real_hosts_in() is the hot path; drive it through the public scanner
-        # so the measurement is of a real scan, not of one regex.
-        line = "A=" + "a" * n + "\n"
-        start = time.monotonic()
-        esc.scan_text(line, rel=".env", kind="env")
-        return time.monotonic() - start
+    def _dotted_scan_cost(self, pairs, reps):
+        r"""Seconds to scan `reps` values of `pairs` dotted labels.
+
+        Dotted, not a flat run of letters. The flat `"a" * n` this probe used
+        to feed never reaches the host path at all: `scan_value` only calls
+        `real_hosts_in` -- and through it `EMAIL_RE.sub` and `BARE_HOST_RE` --
+        for a value that looks like it could hold a host. So the old probe
+        timed the part of `scan_text` that was never the defect, and stayed
+        green with the lookbehind, the label bound and MAX_HOST_SCAN_CHARS all
+        removed at once. `"a." * pairs + "_"` is the worst case those three
+        guards exist for: a dotted run that can never end in a usable TLD, so
+        every retry walks what is left of it.
+
+        `reps` is what makes the measurement resolvable on a fast machine.
+        Repeating the same scan costs a multiple of the same shape, so the
+        ratio below is unchanged by it -- unlike skipping, which just stops
+        asking the question.
+        """
+        line = "A=" + "a." * pairs + "_\n"
+        start = time.perf_counter()
+        for _ in range(reps):
+            esc.scan_text(line, rel=".env", kind="env")
+        return time.perf_counter() - start
+
+    # 8,001 and 16,001 characters: both past MAX_HOST_SCAN_CHARS (4096), which
+    # is the point -- with the ceiling in place the extra length costs almost
+    # nothing, and without it the quadratic reappears.
+    LINEARITY_PAIRS = 4_000
+    LINEARITY_FLOOR = 0.02   # seconds a measurement must reach to be readable
 
     def test_env_safety_check_cost_is_linear_in_value_length(self):
-        """FIXED: EMAIL_RE.sub() was quadratic in the length of a config value.
+        r"""FIXED: EMAIL_RE.sub() was quadratic in the length of a config value.
 
         real_hosts_in() calls `EMAIL_RE.sub(" ", remainder)` on every value.
         EMAIL_RE is `[A-Za-z0-9._%+\-]+@...`; on a long run of characters with
         no '@' the engine restarts at every offset and scans to the end each
         time, so cost grows with the square of the value's length.
 
-        Measured here: 8k chars ~0.3s, 16k ~1.2s, 40k ~1.9s, 60k ~4.2s -- each
-        doubling costs four times as much. env_safety_check.py's own ceiling is
-        MAX_BYTES = 2MB, so a single 2MB line in a .env -- a minified blob, a
-        base64 payload, a generated fixture -- is fully within what the script
-        will accept and would take on the order of twenty minutes.
+        Measured when it was broken: 8k chars ~0.3s, 16k ~1.2s, 40k ~1.9s, 60k
+        ~4.2s -- each doubling costing four times as much. env_safety_check.py's
+        own ceiling is MAX_BYTES = 2MB, so a single 2MB line in a .env -- a
+        minified blob, a base64 payload, a generated fixture -- is fully within
+        what the script will accept and would take on the order of twenty
+        minutes.
 
         This is the gate that runs BEFORE the test command. Hanging it does not
         fail safe; it stops the run with no verdict at all.
-        SHOULD: anchor or bound EMAIL_RE (a `(?<![A-Za-z0-9._%+-])` lookbehind,
-        or a length cap on the local part), or skip values over a few kB.
 
         Asserted as a growth ratio rather than an absolute time so the test
         says something about the algorithm and not about this machine.
+        Measured fixed, on the machine of record (2026-11-16, CPython 3.14,
+        best of three): 8,001 chars 32.8ms, 16,001 chars 43.4ms, ratio 1.23 --
+        sublinear, because the host scan stops at MAX_HOST_SCAN_CHARS. The
+        3.0 ceiling sits well above that and well below the ~3.9 a scanner
+        with those guards removed measures on the same two payloads.
+
+        There is deliberately no skip here. The version that skipped when the
+        small measurement came in under 20ms was the only skip in the whole
+        suite, which is to say it never ran on this machine at all.
         """
-        small = max(self._email_sub_cost(8_000) for _ in range(3))
-        large = max(self._email_sub_cost(16_000) for _ in range(3))
-        if small < 0.02:
-            self.skipTest("machine too fast to measure the ratio reliably")
-        # Linear would be ~2x for a doubled input. Observed: ~4x.
+        reps = 1
+        for _ in range(14):
+            small = min(self._dotted_scan_cost(self.LINEARITY_PAIRS, reps)
+                        for _ in range(3))
+            if small >= self.LINEARITY_FLOOR:
+                break
+            reps *= 2
+        else:
+            self.fail(
+                "could not scale this probe to a measurable cost: "
+                f"{reps} repeats of a {2 * self.LINEARITY_PAIRS + 1}-character "
+                f"value still ran in under {self.LINEARITY_FLOOR}s. The "
+                "measurement is the test, so this is a failure, not a skip.")
+        large = min(self._dotted_scan_cost(2 * self.LINEARITY_PAIRS, reps)
+                    for _ in range(3))
+        # Linear would be ~2x for a doubled input. Broken, it is ~4x.
         self.assertLess(large / small, 3.0,
                         f"doubling the value length cost {large / small:.1f}x "
-                        f"({small:.3f}s -> {large:.3f}s): superlinear")
+                        f"({small:.3f}s -> {large:.3f}s over {reps} repeat(s)): "
+                        "superlinear")
 
     def test_env_safety_check_on_hyphen_and_url_runs_stays_bounded(self):
         # The shapes that are NOT quadratic, pinned so the fix for the one
@@ -1189,7 +2074,11 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         ]
         self.write(".env", "".join(lines))
         with timed(self, "env_safety_check on hyphen-run bait"):
-            esc.scan(self.tmp)
+            result = esc.scan(self.tmp)
+        self.assertEqual(result["scanned_files"], [".env"])
+        self.assertEqual(result["skipped_files"], [])
+        self.assertIn("host_scan_truncated",
+                      {f["detector"] for f in result["findings"]})
 
     def test_env_safety_check_on_unclosed_interpolation_and_email_bait(self):
         lines = [
@@ -1201,7 +2090,11 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         ]
         self.write(".env", "".join(lines))
         with timed(self, "env_safety_check on interpolation/email bait"):
-            esc.scan(self.tmp)
+            result = esc.scan(self.tmp)
+        self.assertEqual(result["scanned_files"], [".env"])
+        self.assertEqual(result["skipped_files"], [])
+        self.assertIn("host_scan_truncated",
+                      {f["detector"] for f in result["findings"]})
 
     def test_env_safety_check_on_many_pathological_lines(self):
         # 1,000 lines of bait, each under the per-line shapes above. The point
@@ -1209,7 +2102,15 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         body = "".join("K%d=%s\n" % (i, "a." * 100 + "-" * 100) for i in range(1000))
         self.write(".env", body)
         with timed(self, "env_safety_check on 1,000 bait lines"):
-            esc.scan(self.tmp)
+            result = esc.scan(self.tmp)
+        self.assertEqual(result["scanned_files"], [".env"])
+        self.assertEqual(result["skipped_files"], [])
+        # Every value here is ~400 characters, well under
+        # MAX_HOST_SCAN_CHARS, so unlike the three cases above NOTHING was
+        # truncated: all 1,000 lines were matched against in full. That is
+        # what makes this a measurement of per-line cost times line count
+        # rather than of the truncation ceiling.
+        self.assertEqual(result["findings"], [])
 
     def test_flake_smells_on_tautology_backreference_bait(self):
         # Four of the TAUTOLOGY_RES carry a backreference (`([^,()]+?)\s*,\s*\1`).
@@ -1222,7 +2123,20 @@ class ReDoSTests(TempMixin, unittest.TestCase):
             lines.append("    assert " + "a" * n + " == " + "a" * n + "b\n")
         self.write("test_bait.py", "def test_x():\n" + "".join(lines))
         with timed(self, "flake_smells on tautology backreference bait"):
-            fsm.scan_paths([self.tmp])
+            result = fsm.scan_paths([self.tmp])
+        # A time budget alone is satisfied by a scanner that skipped the file.
+        # Pin that it was read, and pin exactly how much of it the regexes
+        # actually saw -- six of these lines are over MAX_LINE_CHARS, so the
+        # default run only feeds them 2,000 characters each.
+        self.assertEqual(result["summary"]["files_scanned"], 1)
+        self.assertEqual(result["skipped_files"], [])
+        self.assertEqual(result["summary"]["lines_truncated"], 6)
+        # ... and the bound has to hold when the whole bait reaches the
+        # regexes, or the only thing being measured is the line ceiling.
+        with timed(self, "flake_smells on tautology bait, line ceiling raised"):
+            full = fsm.scan_paths([self.tmp], max_line_chars=200_000)
+        self.assertEqual(full["summary"]["lines_truncated"], 0)
+        self.assertEqual(full["summary"]["files_scanned"], 1)
 
     def test_flake_smells_on_assertion_and_weak_oracle_bait(self):
         lines = [
@@ -1233,7 +2147,102 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         ]
         self.write("test_bait2.py", "def test_x():\n" + "".join(lines))
         with timed(self, "flake_smells on assertion bait"):
-            fsm.scan_paths([self.tmp])
+            result = fsm.scan_paths([self.tmp])
+        self.assertEqual(result["summary"]["files_scanned"], 1)
+        self.assertEqual(result["skipped_files"], [])
+        self.assertEqual(result["summary"]["lines_truncated"], 4)
+        # Raising the ceiling is what re-exposes ast.parse to the bait: at the
+        # default 2,000 the deep line never reaches the parser. This call used
+        # to die with RecursionError on the Ubuntu runners and pass here, so
+        # it is also the regression site for that.
+        with timed(self, "flake_smells on assertion bait, line ceiling raised"):
+            full = fsm.scan_paths([self.tmp], max_line_chars=200_000)
+        self.assertEqual(full["summary"]["lines_truncated"], 0)
+        # Fed in full, the weak-oracle rule does fire on
+        # `assert aaa... is not None`. That is the proof the regexes really
+        # ran over the bait rather than over a 2,000-character stub of it.
+        self.assertIn("weak-oracle", full["summary"]["by_rule"])
+        # Whether `a.b` x 20,000 is too deep for ast.parse depends on the C
+        # stack, so the only thing true on BOTH platforms is the invariant:
+        # either the AST pass ran, or the file is named. Never a third state,
+        # and never an exception out of scan_paths().
+        self.assertEqual(full["summary"]["files_ast_unparsed"],
+                         len(full["unparsed_files"]))
+        if full["files"][0]["parsed_with"] == "ast":
+            self.assertEqual(full["unparsed_files"], [])
+            self.assertNotIn("ast_unavailable", full["files"][0])
+        else:
+            assert_ast_depth_reported(
+                self, full, fsm, self.path("test_bait2.py"),
+                scanned_key="files_scanned", scanned_value=1)
+
+    def test_flake_smells_reports_a_file_it_could_not_parse(self):
+        """The platform-independent half of the test above.
+
+        That one asserts an invariant that happens to take the `ast` branch on
+        macOS and the `regex` branch on a CI runner -- which is precisely the
+        shape of test that let this defect through, because the branch that
+        matters never ran locally. Here ast.parse is MADE to raise, so the
+        reporting path is exercised on every platform and at every stack size,
+        and a regression cannot hide behind a roomy stack.
+        """
+        # Deliberately a CLEAN test file -- a real oracle, nothing to find.
+        # That is the pointed case: the gate reports zero findings, and the
+        # reader still has to be able to tell that from "the AST pass ran and
+        # found nothing".
+        self.write("test_deep.py",
+                   "def test_x():\n    y = " + "a + " * 400 + "1\n"
+                   "    assert y == 7\n")
+        with forced_ast_recursion_error():
+            result = fsm.scan_paths([self.tmp])
+        assert_ast_depth_reported(self, result, fsm, self.path("test_deep.py"),
+                                  scanned_key="files_scanned", scanned_value=1)
+        # The regex fallback still ran -- the file was scanned, not dropped.
+        self.assertEqual(len(result["files"]), 1)
+        self.assertEqual(result["summary"]["findings"], 0)
+        # ...and it is NOT a finding. `--fail-on` must not fire on it at ANY
+        # severity: deeply nested generated code is legitimate, and a gate
+        # that blocks on it gets switched off, taking every other rule with
+        # it. The report has to live outside --fail-on's path entirely.
+        for severity in fsm.SEVERITIES:
+            self.assertFalse(fsm.breaches(result, severity),
+                             f"--fail-on {severity} fired on an unparsable "
+                             "file; it must be a report, not a finding")
+        self.assertNotIn("ast-nesting-too-deep", result["summary"]["by_rule"])
+        # The whole point, in one pair of assertions: a clean verdict AND a
+        # visible statement that part of the analysis did not run.
+        self.assertEqual(result["summary"]["by_severity"],
+                         {"block": 0, "warn": 0, "info": 0})
+        self.assertEqual(result["summary"]["files_ast_unparsed"], 1)
+
+    def test_flake_smells_really_does_survive_a_too_deep_file(self):
+        """The forced test above proves the reporting; this proves the catch.
+
+        A real RecursionError out of a real ast.parse, in a child process on a
+        small stack, because on an interpreter without the AST-construction
+        counter the alternative to catching it is the process dying -- and
+        finding THAT out in-process would end the run.
+        """
+        if not ast_depth_raises_here():
+            self.skipTest(
+                "this interpreter does not raise RecursionError from "
+                "ast.parse at a 512KB stack -- it crashes instead, so there "
+                "is no catchable behaviour here to assert. Measured on "
+                "CPython 3.9.6: SIGBUS, exit 138. The forced-RecursionError "
+                "test covers the reporting path on this platform.")
+        self.write("test_deep.py",
+                   "def test_x():\n    y = " + "a + " * 20_000 + "1\n    assert y\n")
+        rc, out, err = scan_on_a_thin_stack(
+            "flake_smells",
+            "mod.scan_paths([%r], max_line_chars=200_000)" % self.tmp)
+        self.assertEqual(rc, 0, f"child died instead of returning: {err}")
+        self.assertIsNotNone(out, f"child produced no JSON: {err}")
+        self.assertNotIn("raised", out,
+                         "scan_paths() must never raise -- its docstring "
+                         f"promises it: {out.get('raised')}")
+        assert_ast_depth_reported(self, out["result"], fsm,
+                                  self.path("test_deep.py"),
+                                  scanned_key="files_scanned", scanned_value=1)
 
     def test_flake_smells_on_java_method_signature_bait(self):
         # JVM_METHOD_RE is `\w+\([^;]*\)\s*(?:throws\s[\w.,\s]+)?\{\s*$` -- two
@@ -1241,7 +2250,14 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         sig = "void foo(" + "," * 3000 + ") throws " + "a, " * 3000 + "{\n"
         self.write("FooTest.java", "class FooTest {\n    @Test\n    " + sig + "    }\n}\n")
         with timed(self, "flake_smells on JVM signature bait"):
-            fsm.scan_paths([self.tmp])
+            result = fsm.scan_paths([self.tmp])
+        self.assertEqual(result["summary"]["files_scanned"], 1)
+        self.assertEqual(result["skipped_files"], [])
+        self.assertEqual(result["summary"]["lines_truncated"], 1)
+        with timed(self, "flake_smells on JVM bait, line ceiling raised"):
+            full = fsm.scan_paths([self.tmp], max_line_chars=200_000)
+        self.assertEqual(full["summary"]["lines_truncated"], 0)
+        self.assertEqual(full["summary"]["files_scanned"], 1)
 
     def test_flake_smells_on_shared_mutable_state_quadratic_bait(self):
         """The one superlinear shape found: declarations x in-test lines.
@@ -1260,7 +2276,22 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         body += "".join("    other.append(1)\n" for _ in range(2000))
         self.write("test_quad.py", body)
         with timed(self, "flake_smells on shared-mutable-state bait", budget=10.0):
-            fsm.scan_paths([self.tmp])
+            result = fsm.scan_paths([self.tmp])
+        self.assertEqual(result["summary"]["files_scanned"], 1)
+        self.assertEqual(result["skipped_files"], [])
+        # Every line here is short, so nothing was truncated: all 4,000 lines
+        # went through the rule in full. Pinned, because this is the one case
+        # whose cost comes from the LINE COUNT -- if the line ceiling ever
+        # started biting here the measurement would silently become a
+        # measurement of the ceiling instead of of the quadratic.
+        self.assertEqual(result["summary"]["lines_truncated"], 0)
+        # The bait is a deliberate near-miss: it appends to `other`, which is
+        # not one of the 2,000 declared names, so the rule pays the full
+        # declarations x in-test-lines cost and then fires on nothing. The
+        # only finding is `no-assertion` on the generated test_x, and
+        # asserting exactly that is what proves the block body really was
+        # walked rather than the file being skipped or parsed as empty.
+        self.assertEqual(result["summary"]["by_rule"], {"no-assertion": 1})
 
     @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
     def test_arid_nodes_on_regex_bait(self):
@@ -1271,7 +2302,88 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         ]
         self.write("bait.py", "".join(lines))
         with timed(self, "arid_nodes on regex bait"):
-            arid.plan([self.tmp])
+            result = arid.plan([self.tmp])
+        self.assertEqual(result["summary"]["files"], 1)
+        self.assertEqual(result["skipped_files"], [])
+        # Two of the three lines are over MAX_LINE_CHARS. arid_nodes had no
+        # line ceiling at all until this change, so assert both halves: that
+        # the default run says what it shortened, AND that the bound still
+        # holds when the ceiling is raised and the planner sees every
+        # character the way it used to.
+        self.assertEqual(result["summary"]["lines_truncated"], 2)
+        # Raising the ceiling is what re-exposes ast.parse to the bait: at the
+        # default 2,000 the 20,000-term chain never reaches the parser. This
+        # call used to die with RecursionError on the Ubuntu runners and pass
+        # here, so it is also the regression site for that.
+        with timed(self, "arid_nodes on regex bait, line ceiling raised"):
+            full = arid.plan([self.tmp], max_line_chars=1_000_000)
+        self.assertEqual(full["summary"]["lines_truncated"], 0)
+        self.assertEqual(full["summary"]["files"], 1)
+        # Whether a 20,000-term chain is too deep for ast.parse depends on the
+        # C stack, so the only thing true on BOTH platforms is the invariant:
+        # either the AST pass ran, or the file is named. Never a third state,
+        # and never an exception out of plan().
+        self.assertEqual(full["summary"]["files_ast_unparsed"],
+                         len(full["unparsed_files"]))
+        if full["files"][0]["parsed_with"] == "ast":
+            self.assertEqual(full["unparsed_files"], [])
+            self.assertNotIn("ast_unavailable", full["files"][0])
+        else:
+            assert_ast_depth_reported(self, full, arid, self.path("bait.py"),
+                                      scanned_key="files", scanned_value=1)
+
+    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    def test_arid_nodes_reports_a_file_it_could_not_parse(self):
+        """The platform-independent half of the test above.
+
+        That one asserts an invariant that happens to take the `ast` branch on
+        macOS and the `regex` branch on a CI runner -- which is precisely the
+        shape of test that let this defect through, because the branch that
+        matters never ran locally. Here ast.parse is MADE to raise, so the
+        reporting path is exercised on every platform and at every stack size,
+        and a regression cannot hide behind a roomy stack.
+        """
+        self.write("deep.py", "def f(a):\n    y = " + "a + " * 400 + "1\n    return y\n")
+        with forced_ast_recursion_error():
+            result = arid.plan([self.tmp])
+        assert_ast_depth_reported(self, result, arid, self.path("deep.py"),
+                                  scanned_key="files", scanned_value=1)
+        # The regex fallback still ran -- the file was planned, not dropped.
+        self.assertEqual(len(result["files"]), 1)
+        self.assertGreater(result["summary"]["selected"], 0)
+        # ...and it is NOT a finding. arid_nodes has no --fail-on, but the
+        # same rule applies: it must not appear as a suppression rule either,
+        # or it lands in a count a gate could grow a threshold on.
+        self.assertNotIn("ast-nesting-too-deep", result["summary"]["suppressed_by_rule"])
+
+    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    def test_arid_nodes_really_does_survive_a_too_deep_file(self):
+        """The forced test above proves the reporting; this proves the catch.
+
+        A real RecursionError out of a real ast.parse, in a child process on a
+        small stack, because on an interpreter without the AST-construction
+        counter the alternative to catching it is the process dying -- and
+        finding THAT out in-process would end the run.
+        """
+        if not ast_depth_raises_here():
+            self.skipTest(
+                "this interpreter does not raise RecursionError from "
+                "ast.parse at a 512KB stack -- it crashes instead, so there "
+                "is no catchable behaviour here to assert. Measured on "
+                "CPython 3.9.6: SIGBUS, exit 138. The forced-RecursionError "
+                "test covers the reporting path on this platform.")
+        self.write("deep.py",
+                   "def f(a):\n    y = " + "a + " * 20_000 + "1\n    return y\n")
+        rc, out, err = scan_on_a_thin_stack(
+            "arid_nodes", "mod.plan([%r], max_line_chars=1_000_000)" % self.tmp)
+        self.assertEqual(rc, 0, f"child died instead of returning: {err}")
+        self.assertIsNotNone(out, f"child produced no JSON: {err}")
+        self.assertNotIn("raised", out,
+                         "plan() must never raise -- its docstring promises "
+                         f"it: {out.get('raised')}")
+        assert_ast_depth_reported(self, out["result"], arid,
+                                  self.path("deep.py"),
+                                  scanned_key="files", scanned_value=1)
 
 
 # --------------------------------------------------------------------------
@@ -1519,6 +2631,343 @@ class ManifestTests(TempMixin, unittest.TestCase):
             text = sctx.build(self.tmp)
         self.assertEqual(text.count("\n  - "), sctx.MAX_CONVENTIONS)
 
+
+
+# --------------------------------------------------------------------------
+# the REACHABLE half of ast.parse's depth ceiling
+# --------------------------------------------------------------------------
+# Everything in `ProjectStateAstTests` and the `*AstDepth*` tests above is
+# about RecursionError -- the half of the ceiling a real file never reaches
+# (95,067 chained terms on 3.14.6, and on the 3.9.6 floor no catchable window
+# at all). CPython's tokenizer caps bracket nesting and indentation far
+# earlier, as compile-time constants, and reports both as a SyntaxError:
+# IndentationError is a SyntaxError subclass. So before the fix these landed
+# in the `except (SyntaxError, ValueError)` branch of all three scripts and
+# were classified "syntax-error" -- silent, by design, because a half-written
+# file is an ordinary state. The loud signal covered only the unreachable
+# case; the reachable ones fell back without a word.
+#
+# The depths are NOT hardcoded below. 200 and 99 are what CPython accepts
+# today, not a promise, so each cap is discovered at runtime by bisection and
+# the assertions are written against whatever was found. A CPython that
+# changes MAXLEVEL changes these tests' inputs, not their verdicts.
+#
+# The other half of the specification is the part that protects the signal
+# from itself: an ordinary half-written file must STAY silent. Message
+# matching is the only way CPython lets these be told apart, and message
+# matching is brittle, so the brittleness is one-directional -- an
+# unrecognised message costs a missed report, never a spurious "could not be
+# analysed" on every malformed file in a repo. That is pinned below across
+# four malformed shapes, and separately with a forced unrecognised message.
+
+def _bracket_source(depth):
+    """`depth` nested brackets -- the tokenizer's MAXLEVEL shape."""
+    return "x = " + "(" * depth + ")" * depth + "\n"
+
+
+def _indent_source(depth):
+    """`depth` levels of indentation -- the tokenizer's MAXINDENT shape."""
+    lines = ["    " * i + "if True:\n" for i in range(depth)]
+    lines.append("    " * depth + "pass\n")
+    return "".join(lines)
+
+
+def _parses(source):
+    try:
+        ast.parse(source)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return False
+    return True
+
+
+def discover_cap(make_source, ceiling=8192):
+    """The smallest depth `ast.parse` REFUSES, found by bisection.
+
+    Returns None when the interpreter accepts everything up to `ceiling` --
+    which is the honest answer for the pegen parser-stack shape on 3.9.6,
+    where no cap exists. Never hardcodes a depth: these are CPython's
+    constants today, and a test that asserts 201 would start lying the
+    release they move.
+    """
+    accepted, refused, probe = 0, None, 1
+    while probe <= ceiling:
+        if _parses(make_source(probe)):
+            accepted, probe = probe, probe * 2
+        else:
+            refused = probe
+            break
+    if refused is None:
+        return None
+    while refused - accepted > 1:
+        mid = (accepted + refused) // 2
+        if _parses(make_source(mid)):
+            accepted = mid
+        else:
+            refused = mid
+    return refused
+
+
+class AstNestingCapTests(unittest.TestCase):
+    """All three AST sites must report a nesting cap, and stay silent otherwise.
+
+    One class for three scripts on purpose. The same rule living in three
+    copies is this repository's single most common defect -- one of them had
+    seven copies -- and the cheapest guard against the copies drifting is a
+    test that refuses to let them answer differently.
+    """
+
+    # (label, callable) -- each takes source text and returns
+    # (result_or_None, why_not), with why_not None on success.
+    @classmethod
+    def sites(cls):
+        return (
+            ("flake_smells.python_blocks_ast_detailed",
+             fsm, fsm.python_blocks_ast_detailed),
+            ("arid_nodes.python_funcs_detailed",
+             arid, None if arid is None else arid.python_funcs_detailed),
+            ("project_state._xfail_tests",
+             pstate, pstate._xfail_tests),
+        )
+
+    def each_site(self):
+        """Yields (label, module, probe). Fails -- never skips -- when a
+        production module is missing: a missing script is a broken checkout,
+        not a platform this test does not apply to."""
+        for label, module, probe in self.sites():
+            self.assertIsNotNone(
+                module, f"{label}: its module did not import -- that is a "
+                        "broken checkout, not a reason to pass")
+            yield label, module, probe
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bracket_cap = discover_cap(_bracket_source)
+        cls.indent_cap = discover_cap(_indent_source, ceiling=1024)
+
+    # ---- the caps exist and are reachable ---------------------------------
+
+    def test_both_tokenizer_caps_are_discoverable_and_low(self):
+        """If this fails, every assertion below is testing nothing."""
+        self.assertIsNotNone(self.bracket_cap,
+                             "no bracket-nesting cap found below 8192 -- the "
+                             "cases below would be vacuous")
+        self.assertIsNotNone(self.indent_cap,
+                             "no indentation cap found below 1024 -- the "
+                             "cases below would be vacuous")
+        # The point of the fix: these are depths a generated or vendored file
+        # actually reaches, unlike the ~95,000-term RecursionError shape.
+        self.assertLess(self.bracket_cap, 1000)
+        self.assertLess(self.indent_cap, 1000)
+
+    # ---- the loud signal, at every site -----------------------------------
+
+    def test_bracket_cap_reports_too_deep_at_every_site(self):
+        at_cap = _bracket_source(self.bracket_cap)
+        just_under = _bracket_source(self.bracket_cap - 1)
+        for label, module, probe in self.each_site():
+            with self.subTest(site=label):
+                result, why = probe(just_under)
+                self.assertIsNone(
+                    why, f"{label}: {self.bracket_cap - 1} nested brackets is "
+                         "under CPython's cap and must parse normally")
+                self.assertIsNotNone(result)
+                result, why = probe(at_cap)
+                self.assertIsNone(result)
+                self.assertEqual(
+                    why, module.AST_TOO_DEEP,
+                    f"{label}: {self.bracket_cap} nested brackets went back to "
+                    "being a silent syntax-error fallback")
+
+    def test_indentation_cap_reports_too_deep_at_every_site(self):
+        # The most reachable of all of them, and an IndentationError, so it
+        # was already landing in the silent SyntaxError branch.
+        at_cap = _indent_source(self.indent_cap)
+        just_under = _indent_source(self.indent_cap - 1)
+        for label, module, probe in self.each_site():
+            with self.subTest(site=label):
+                result, why = probe(just_under)
+                self.assertIsNone(
+                    why, f"{label}: {self.indent_cap - 1} indentation levels "
+                         "is under CPython's cap and must parse normally")
+                result, why = probe(at_cap)
+                self.assertIsNone(result)
+                self.assertEqual(
+                    why, module.AST_TOO_DEEP,
+                    f"{label}: {self.indent_cap} indentation levels went back "
+                    "to being a silent syntax-error fallback")
+
+    def test_the_cap_signal_reaches_the_report_not_just_the_helper(self):
+        """A constant returned by a helper nobody surfaces is not a signal.
+
+        project_state keeps its own vocabulary for this -- the file is named
+        in `ast_unparsed_files`, `files_ast_unparsed` counts it and
+        `totals_exact` goes False -- and a cap must route into that machinery
+        rather than into a parallel one.
+        """
+        tmp = tempfile.mkdtemp(prefix="testsquad-nestcap-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        with open(os.path.join(tmp, "deep.py"), "w", encoding="utf-8") as fh:
+            fh.write(_indent_source(self.indent_cap))
+        with mock.patch.object(pstate, "ROOT", tmp):
+            markers = pstate.section_markers()
+        self.assertEqual([d["file"] for d in markers["ast_unparsed_files"]],
+                         ["deep.py"])
+        self.assertEqual(markers["files_ast_unparsed"], 1)
+        self.assertFalse(markers["totals_exact"],
+                         "a file counted by the line scanner must mark the "
+                         "totals inexact -- a confident number nobody "
+                         "measured is the defect this script exists to catch")
+        entry = markers["ast_unparsed_files"][0]
+        self.assertEqual(entry["fell_back_to"], "line-scan")
+        self.assertTrue(entry["reason"].strip())
+        self.assertTrue(entry["not_measured"].strip())
+
+    # ---- and the silence, which is the half that protects the signal ------
+
+    MALFORMED = (
+        # (label, source) -- four shapes a half-written file really takes.
+        ("unclosed bracket", "def f():\n    return (1, 2\n"),
+        ("unexpected indent", "x = 1\n    y = 2\n"),
+        ("unterminated string", "s = 'half a stri\nx = 1\n"),
+        ("truncated def", "def f(:\n"),
+    )
+
+    def test_ordinary_syntax_errors_stay_silent_at_every_site(self):
+        """The false positive that would switch the whole gate off.
+
+        A check above ~10% effective false positives gets ignored entirely.
+        "Could not be analysed" on every malformed file in a repo is 100%.
+        """
+        for shape, source in self.MALFORMED:
+            self.assertFalse(_parses(source),
+                             f"{shape}: fixture must actually be malformed")
+            for label, module, probe in self.each_site():
+                with self.subTest(site=label, shape=shape):
+                    result, why = probe(source)
+                    self.assertIsNone(result)
+                    self.assertEqual(
+                        why, "syntax-error",
+                        f"{label}: an ordinary {shape} must stay a silent "
+                        "syntax-error, not become a too-deep report")
+
+    def test_an_unrecognised_message_stays_silent_at_every_site(self):
+        """Message matching is brittle on purpose, in one direction only.
+
+        If a future CPython rewords "too many nested parentheses", this must
+        degrade to the old silent behaviour -- a missed report -- and never to
+        a spurious refusal on every malformed file.
+        """
+        for label, module, probe in self.each_site():
+            with self.subTest(site=label):
+                with mock.patch.object(
+                        ast, "parse",
+                        side_effect=SyntaxError("some future wording")):
+                    result, why = probe("x = 1\n")
+                self.assertIsNone(result)
+                self.assertEqual(why, "syntax-error",
+                                 f"{label}: an unrecognised message must cost "
+                                 "a missed report, never a spurious one")
+
+    def test_a_recognised_parser_stack_overflow_is_reported_at_every_site(self):
+        """CPython 3.14.6 raises this one as a MemoryError, not a SyntaxError.
+
+        Forced rather than generated: on the 3.9.6 floor the pegen parser has
+        no such cap at all, so the real shape cannot be produced there and an
+        interpreter-dependent test would pass by not running.
+        """
+        for label, module, probe in self.each_site():
+            with self.subTest(site=label):
+                with mock.patch.object(
+                        ast, "parse",
+                        side_effect=MemoryError(
+                            "Parser stack overflowed - Python source too "
+                            "complex to parse")):
+                    result, why = probe("x = 1\n")
+                self.assertIsNone(result)
+                self.assertEqual(why, module.AST_TOO_DEEP)
+
+    def test_a_genuine_memory_error_is_reraised_at_every_site(self):
+        """The same defect inverted: laundering an out-of-memory into a quiet
+        fallback would turn a machine-level failure into a clean-looking run.
+        """
+        for label, module, probe in self.each_site():
+            with self.subTest(site=label):
+                with mock.patch.object(
+                        ast, "parse",
+                        side_effect=MemoryError("Cannot allocate memory")):
+                    with self.assertRaises(MemoryError):
+                        probe("x = 1\n")
+
+    # ---- the drift guard --------------------------------------------------
+
+    def test_all_three_scripts_classify_every_refusal_identically(self):
+        """Three copies of one rule, pinned to answer the same thing.
+
+        Agreement alone would be satisfied by all three being equally wrong,
+        so every probe carries its EXPECTED classification too. The table is
+        the cheapest thing standing between this fix and the next divergence.
+        """
+        probes = [
+            ("valid source", "def test_x():\n    assert True\n", None),
+            ("bracket cap", _bracket_source(self.bracket_cap), "AST_TOO_DEEP"),
+            ("indentation cap", _indent_source(self.indent_cap), "AST_TOO_DEEP"),
+        ]
+        probes += [(shape, source, "syntax-error")
+                   for shape, source in self.MALFORMED]
+
+        forced = [
+            ("forced RecursionError",
+             RecursionError("maximum recursion depth exceeded during ast "
+                            "construction"), "AST_TOO_DEEP"),
+            ("forced parser-stack MemoryError",
+             MemoryError("Parser stack overflowed - Python source too complex "
+                         "to parse"), "AST_TOO_DEEP"),
+            ("forced unrecognised SyntaxError",
+             SyntaxError("some future wording"), "syntax-error"),
+            ("forced unrecognised ValueError",
+             ValueError("source code string cannot contain null bytes"),
+             "syntax-error"),
+            ("forced genuine MemoryError",
+             MemoryError("Cannot allocate memory"), "raised:MemoryError"),
+        ]
+
+        def classify(module, probe, source, exc=None):
+            try:
+                if exc is None:
+                    result, why = probe(source)
+                else:
+                    with mock.patch.object(ast, "parse", side_effect=exc):
+                        result, why = probe(source)
+            except BaseException as raised:  # noqa: BLE001 - that IS the answer
+                return "raised:" + type(raised).__name__
+            if why is None:
+                self.assertIsNotNone(result)
+                return None
+            self.assertIsNone(result)
+            return "AST_TOO_DEEP" if why == module.AST_TOO_DEEP else why
+
+        table = []
+        for name, source, expected in probes:
+            table.append((name, expected,
+                          [(label, classify(module, probe, source))
+                           for label, module, probe in self.each_site()]))
+        for name, exc, expected in forced:
+            table.append((name, expected,
+                          [(label, classify(module, probe, "x = 1\n", exc))
+                           for label, module, probe in self.each_site()]))
+
+        for name, expected, answers in table:
+            with self.subTest(probe=name):
+                got = {label: answer for label, answer in answers}
+                self.assertEqual(
+                    len(set(got.values())), 1,
+                    f"{name}: the three scripts disagree -- {got}")
+                self.assertEqual(
+                    sorted(got), sorted(l for l, _, _ in self.sites()),
+                    "a site dropped out of the drift guard")
+                self.assertEqual(
+                    set(got.values()), {expected},
+                    f"{name}: expected {expected!r} from all three, got {got}")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

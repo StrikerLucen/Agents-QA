@@ -44,7 +44,7 @@ the list has stopped meaning anything.
 | Max suite duration | {{N}} min | `{{TEST_CMD}}` wall clock |
 | Flake budget | ≤{{N}}% of runs, 0 in critical areas | `/testsquad:health` |
 | Skip allowance | ≤{{N}} skipped, each with an open issue id | `{{SKIP_COUNT_CMD}}` |
-| `.only` / `fdescribe` | 0 | `python3 scripts/flake_smells.py test/ --format text` |
+| `.only` / `fdescribe` | 0 | `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/flake_smells.py" {{TEST_DIR}} --format text` |
 
 ## 5. Changing a threshold
 

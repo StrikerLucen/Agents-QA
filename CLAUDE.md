@@ -13,14 +13,17 @@ that belong to the owner rather than to you.
 Then re-measure before trusting anything written down:
 
 ```
-cd examples/fixtures && ./regen_git_history.sh    # required on a fresh clone
+cd examples/fixtures && ./regen_git_history.sh
 cd tests && ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest
 python3 scripts/validate_plugin.py . --strict
 ```
 
-Expect **717 tests with 3 failures**, all named in `HANDOFF.md` §2. None is a broken
-feature; each is a test that outlived the behaviour it asserted. Start there — it is
-about half an hour of work and takes the suite green.
+Expect the suite **all passing**, with no skips and one expected failure. Run it rather
+than trusting a count here — it moved from 717 to over 900 in a single session, and three
+different counts were measured in one afternoon, so any number written down goes stale
+before it is read. The three failures the previous handoff named are fixed, as are two it
+did not know about. The suite's only skip was removed when the test holding it turned out
+to be unable to fail on a fast machine.
 
 **Ask, do not assume**, on anything in `HANDOFF.md` §4. Those are the owner's calls.
 
@@ -36,12 +39,20 @@ against it — and it is not committed, because an embedded repo would not survi
 ## Commands
 
 ```
-cd tests && ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest   # the suite
-python3 scripts/validate_plugin.py . --strict                            # manifests + context budgets
-python3 scripts/flake_smells.py tests scripts --fail-on block            # our own standards, on us
+cd tests && ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest
+python3 scripts/validate_plugin.py . --strict
+python3 scripts/flake_smells.py tests scripts --fail-on block
 ```
 
-`unittest discover` does not work in `tests/`; use the form above. Python 3.9 is the
+In order: the suite; manifests plus context budgets; our own flake standards applied to
+us. No `#` comments in these blocks — zsh leaves `interactive_comments` off, so a pasted
+trailing comment becomes an argument and argparse rejects the line.
+
+Use the form above — it is what CI runs. (`unittest discover` works too: measured
+2026-11-16, both forms collect the same tests and both pass. This file claimed
+otherwise since the initial commit and the claim was never checked. What really
+produces a wall of failures is skipping the fixture regeneration above, from *either*
+form.) Python 3.9 is the
 floor. Everything is stdlib — there is nothing to install, and that is deliberate.
 
 ## How work is done here
@@ -50,9 +61,22 @@ These are not style preferences. Each one exists because its absence caused a re
 defect in this repo, and most were caught by the project's own tools.
 
 - **Prove the test can fail.** After it passes, break the production code it covers,
-  confirm it goes red, restore. Use **absolute paths and verify the restore** — one
-  agent's entire mutation run was silently invalidated by a failed `cp`. Tests that
-  passed while being unable to fail have been found here repeatedly.
+  confirm it goes red, restore. The order is **purge bytecode → mutate → run →
+  restore → verify by SHA-256**, using absolute paths throughout. All three steps
+  exist because skipping one has silently invalidated a mutation run here:
+  - a failed `cp` left the mutant in place, and nobody checked;
+  - a stale `__pycache__` served the *pre-mutation* bytecode, so the mutant reported
+    GREEN while SHA-256 said the restore was byte-perfect. Three agents hit this
+    independently in one session. One mutant had an identical file size and was
+    restored inside the same clock second, so the `.pyc` mtime+size validity check
+    passed and the test went on running the mutant. **Hash-verifying the restore is
+    necessary but not sufficient** — `rm -rf scripts/__pycache__ tests/__pycache__`
+    before *every* invocation, and pass `-B`.
+  - **Include a control mutant**: a comment-only edit that changes the file's hash
+    and nothing else. It must stay GREEN. Without it you cannot distinguish a blind
+    test from a mutation that did nothing, and a no-op mutant reads exactly like a
+    coverage gap. One was nearly misdiagnosed as a blind test for this reason.
+  Tests that passed while being unable to fail have been found here repeatedly.
 - **Never state a number you did not measure.** `null` / "not measured" is a valid
   answer; `0` is not. Several of the worst bugs found here were a malformed input
   rendering as a confident, wrong number.
@@ -83,6 +107,12 @@ defect in this repo, and most were caught by the project's own tools.
 ## Known state
 
 `evals/SCORECARD.md` is still a template. **No behavioural claim has been measured.**
-The README says so, and it should keep saying so until the evals actually run.
-`claude plugin validate --strict` has never run — `scripts/validate_plugin.py` is a
-stand-in, not a substitute.
+`README.md` says so, under *Read this before you believe anything else here* — its
+opening section, before anything about what the plugin does — and it should keep saying
+so until the evals actually run. (That README was written 2026-11-16. Before then there
+was none, and the three files claiming one carried the disclaimer were telling users
+nothing.)
+`claude plugin validate --strict` passes (run 2026-11-16, CLI 2.1.276), but it is not a
+substitute for `scripts/validate_plugin.py`: it validates the marketplace manifest only
+and says nothing about the other 25 components. The CLI is at `~/.local/bin/claude` and
+is NOT on the default PATH — `which claude` will tell you it is missing.

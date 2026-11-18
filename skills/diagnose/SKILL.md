@@ -97,7 +97,10 @@ The output is a list of **named, untested, high-risk things**:
 
 If `risk-map.json` carries `warnings` or is empty, say so plainly. **An empty risk map
 means no data, not no risk** — a shallow clone or a squashed history produces one, and
-reporting it as "nothing risky found" is a lie by omission.
+reporting it as "nothing risky found" is a lie by omission. Read `skipped_files` and
+`summary.files_skipped` next to `summary.files_ranked` and name any skip: a map that
+ranks what it could read and silently omits what it could not looks complete, and
+testing effort gets aimed at exactly that list.
 
 ## Step 4 — Mutation: available, not run
 
@@ -130,8 +133,36 @@ a strong one, on the path that matters, on demand.
 
 ## Output
 
-Write `.testing/coverage-state.md` and update the dashboard via `/testsquad:report`,
-both bound by `${CLAUDE_PLUGIN_ROOT}/templates/report/RULES.md`. Per that contract: no
+Write `.testing/coverage-state.md` and **`.testing/coverage-diff.json`**, then update the
+dashboard via `/testsquad:report`.
+
+`coverage-diff.json` is the only source for the PR comment's coverage section, and it is
+scoped to the **changed lines**, never the whole repo — a project-wide figure under a
+heading that says "the lines this PR changed" is a wrong number, not a spare one:
+
+```json
+{"line_pct": 83.0, "base_line_pct": 71.0, "branch_pct": 60.0,
+ "base_branch_pct": null, "uncovered_changed_lines": 4}
+```
+
+The PR comment counts this file as having run only if it carries at least one of
+`line_pct`, `base_line_pct`, `branch_pct`, `base_branch_pct` or
+`uncovered_changed_lines` — presence is what is checked, so write them even where the
+value is `null`, which renders as "not measured" and is correct. A file carrying none of
+them is reported as recording no coverage figure.
+
+Derive it from `coverage-raw.json`: take its `files[]` entries whose `path` the diff
+touched, and intersect each one's `uncovered_lines` with the lines the diff added or
+changed. **Any figure you did not measure is `null`, never `0`** — the renderer prints
+`null` as "not measured" and omits the delta, which is the honest output. The `base_*`
+fields need coverage measured at the base commit; a single `/testsquad:diagnose` run has
+only one measurement, so leave them `null` unless you were given a base to compare
+against. CI does not fill them either: `templates/ci/testsquad-pr.yml` would have to
+re-run the suite at the merge base, and it deliberately does not. With no diff scope at all, do not write the file: a missing input is reported
+by name, and that is better than a mislabelled one.
+
+`coverage-state.md` and the dashboard are bound by
+`${CLAUDE_PLUGIN_ROOT}/templates/report/RULES.md`: no
 coverage percentage appears above the Findings section, every number carries the literal
 command that reproduces it, and every figure is stamped with the health verdict and
 commit it was measured under.

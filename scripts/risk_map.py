@@ -97,10 +97,22 @@ class GitError(RuntimeError):
 # --------------------------------------------------------------------------
 
 def run_git(repo: str, args: list[str]) -> str:
+    # core.quotePath=false: by default git renders a non-ASCII path as an
+    # escaped, quoted string ("\303\274nicode.py"). `ls-files` and `log
+    # --numstat` agree with each other in that form, so the churn still lines
+    # up -- but os.path.join(repo, '"\\303\\274nicode.py"') names a file that
+    # does not exist, so the file was unreadable, unscored and absent from the
+    # map, with nothing said. Turning quoting off makes both commands emit the
+    # real path, so the file is counted like any other.
+    # errors="replace" rather than the default strict: a filename that is not
+    # valid UTF-8 would otherwise raise UnicodeDecodeError out of here. With
+    # replace, the mangled path simply fails to open and is reported in
+    # skipped_files, which is the same promise this script makes everywhere
+    # else -- say what was not read.
     try:
         proc = subprocess.run(
-            ["git", "-C", repo, *args],
-            capture_output=True, text=True, check=False,
+            ["git", "-C", repo, "-c", "core.quotePath=false", *args],
+            capture_output=True, text=True, errors="replace", check=False,
         )
     except FileNotFoundError:
         raise GitError("git is not installed or not on PATH")
@@ -197,6 +209,35 @@ def _unrename(path: str) -> str:
     return new.strip()
 
 
+def symlink_lines(full: str) -> int | None:
+    """Line count for a symbolic link ITSELF, or None to let it be skipped.
+
+    git stores a symlink as a blob whose content is the target path, so
+    `git log --numstat` -- the churn numerator this script divides -- reports
+    a repointed link as one line changed. The denominator has to measure the
+    same object. open() followed the link instead and counted the TARGET,
+    which may not even be inside this repository, so `lines` named one file
+    and described another and `relative_churn` divided one file's churn by a
+    different file's size. Counting the link's own stored target path keeps
+    both halves of that ratio on the same blob, which is the only reading of
+    it that means anything.
+
+    None for the two cases already reported in skipped_files -- a broken link
+    and a link to a directory. Neither hands a reader a number at all, so
+    neither is the defect this function exists to close, and both keep the
+    named skip entry they were given.
+    """
+    if not os.path.exists(full) or os.path.isdir(full):
+        return None
+    try:
+        raw = os.fsencode(os.readlink(full))
+    except OSError:
+        return None
+    # Same trailing-newline rule as count_lines(). A target path normally has
+    # no newline at all, which is why git calls a repointed link one line.
+    return raw.count(b"\n") + (1 if raw and not raw.endswith(b"\n") else 0)
+
+
 def count_lines(full: str, *, max_bytes: int = MAX_FILE_BYTES) -> int | None:
     """Newline count for one file, or None when it must not be counted.
 
@@ -204,7 +245,13 @@ def count_lines(full: str, *, max_bytes: int = MAX_FILE_BYTES) -> int | None:
     holding the file in memory to produce it buys nothing and costs the file's
     size in RAM. Returns None for a directory, an unreadable file, a binary
     one, or one over `max_bytes` -- the caller reports which.
+
+    A symbolic link is measured as the link, never as whatever it points at:
+    see symlink_lines(). The `max_bytes` ceiling does not apply to one, because
+    the thing being read is a target path of a few dozen bytes.
     """
+    if os.path.islink(full):
+        return symlink_lines(full)
     try:
         if os.path.getsize(full) > max_bytes:
             return None
@@ -228,36 +275,110 @@ def count_lines(full: str, *, max_bytes: int = MAX_FILE_BYTES) -> int | None:
 
 
 def current_files(repo: str, *, max_bytes: int = MAX_FILE_BYTES
-                  ) -> tuple[dict[str, int], list[dict]]:
-    """(path -> line count, skipped) for files that exist right now.
+                  ) -> tuple[dict[str, int], list[dict], dict[str, str]]:
+    """(path -> line count, skipped, path -> symlink target) for files that
+    exist right now.
 
     History for deleted files is dropped: a file that no longer exists cannot
     carry risk. A file that exists but was skipped is NOT the same thing, so
     it is returned separately rather than silently missing from the map -- a
     file that vanishes from a risk report reads exactly like a safe one.
+
+    The third mapping holds only the ranked symlinks. Their `lines` is an
+    honest count of the link, but a reader scanning a ranking has no way to
+    tell a one-line link from a one-line file, so the target travels with the
+    entry and is said out loud in `why`.
     """
     sizes: dict[str, int] = {}
     skipped: list[dict] = []
+    links: dict[str, str] = {}
     for path in run_git(repo, ["ls-files"]).splitlines():
         path = path.strip()
         if not path:
             continue
         full = os.path.join(repo, path)
-        try:
-            oversized = os.path.getsize(full) > max_bytes
-        except OSError:
-            oversized = False
         lines = count_lines(full, max_bytes=max_bytes)
         if lines is None:
-            if oversized:
-                skipped.append({
-                    "file": path,
-                    "reason": f"larger than {max_bytes} bytes "
-                              f"({max_bytes // (1024 * 1024)}MB ceiling)",
-                })
+            # Only the over-ceiling case used to be recorded here; every other
+            # reason count_lines() can return None -- unreadable, binary,
+            # tracked-but-gone, a broken symlink, a gitlink -- fell through a
+            # bare `continue`. The file then vanished from the ranking, and a
+            # file absent from a risk map reads exactly like a file with no
+            # risk. Name every one of them, and say which kind it was.
+            skipped.append({"file": path, "reason": skip_reason(full, max_bytes)})
             continue
+        if os.path.islink(full):
+            try:
+                links[path] = os.readlink(full)
+            except OSError:
+                # count_lines() just read it, so this is a race rather than a
+                # state. Rank it anyway and say the target is unknown: an
+                # unnamed link is still better than an unmarked one.
+                links[path] = "?"
         sizes[path] = lines
-    return sizes, skipped
+    return sizes, skipped, links
+
+
+def human_bytes(n: int) -> str:
+    """`2MB`, not `0MB`. Integer-dividing a 1000-byte ceiling by a megabyte
+    printed "0MB ceiling", which is a number nobody measured."""
+    mb = n / (1024 * 1024)
+    if mb >= 1:
+        return f"{mb:g}MB"
+    kb = n / 1024
+    return f"{kb:g}KB" if kb >= 1 else f"{n} bytes"
+
+
+def oversize_reason(max_bytes: int) -> str:
+    return (f"larger than the {human_bytes(max_bytes)} ceiling "
+            f"({max_bytes} bytes); raise --max-file-bytes to count it")
+
+
+# A gitlink is the one entry here that is not a failure to read: a submodule's
+# contents belong to another repository and were never in scope. It is still
+# listed, because it IS in `git ls-files` and so a reader could otherwise
+# wonder where it went -- but it is counted separately from the files this
+# script tried and failed to read.
+SUBMODULE_REASON = ("a directory (git submodule / gitlink); its contents "
+                    "belong to another repository and are not ranked here")
+
+
+def skip_reason(full: str, max_bytes: int) -> str:
+    """Why count_lines() refused this path. Prose, not a code: it is printed.
+
+    Deliberately re-derived from the filesystem rather than threaded back out
+    of count_lines(), so that function keeps returning one int and callers
+    that only want the count are unaffected.
+    """
+    try:
+        os.lstat(full)
+    except FileNotFoundError:
+        return "tracked by git but missing from the working tree"
+    except OSError as exc:
+        return ("tracked by git but not reachable at that path "
+                f"({exc.strerror or exc})")
+    if os.path.islink(full) and not os.path.exists(full):
+        try:
+            target = os.readlink(full)
+        except OSError:
+            target = "?"
+        return f"a symbolic link whose target does not exist (-> {target!r})"
+    if os.path.isdir(full):
+        return ("a symbolic link to a directory" if os.path.islink(full)
+                else SUBMODULE_REASON)
+    try:
+        if os.path.getsize(full) > max_bytes:
+            return oversize_reason(max_bytes)
+        with open(full, "rb") as fh:
+            if b"\x00" in fh.read(8000):
+                return ("binary (a NUL byte in the first 8000 bytes); line "
+                        "counts and churn-per-line are meaningless for it")
+    except OSError as exc:
+        return f"unreadable ({exc.strerror or exc})"
+    # count_lines() said no and a second look cannot say why. Still reported:
+    # an unexplained skip is a worse answer than a named one, but both are
+    # better than a file that silently disappears.
+    return "could not be read (reason not determined)"
 
 
 # --------------------------------------------------------------------------
@@ -301,7 +422,7 @@ def build(repo: str, *, since: str | None = None, max_commits: int = 20000,
         for commit in commits
         for path, _ in commit["files"]
     } - set(modified_churn)
-    sizes, skipped_files = current_files(repo, max_bytes=max_file_bytes)
+    sizes, skipped_files, symlinks = current_files(repo, max_bytes=max_file_bytes)
 
     churn: dict[str, int] = defaultdict(int)
     commit_count: dict[str, int] = defaultdict(int)
@@ -347,6 +468,11 @@ def build(repo: str, *, since: str | None = None, max_commits: int = 20000,
         files.append({
             "path": path,
             "lines": sizes.get(path, 0),
+            # None for an ordinary file; the stored target for a symlink. The
+            # entry's `lines` counts the link, not the target, so a reader who
+            # wonders why a tracked path is one line long gets the answer in
+            # the same record rather than having to go and stat it.
+            "symlink": symlinks.get(path),
             "churned_lines": churn.get(path, 0),
             "new_in_window": path in created_in_window,
             "relative_churn": round(relative_churn, 4),
@@ -375,16 +501,34 @@ def build(repo: str, *, since: str | None = None, max_commits: int = 20000,
     elif not files:
         warnings.append(
             "Commits were found but no scoreable files: everything was "
-            "excluded, deleted, or a test file."
+            "excluded, deleted, a test file" +
+            (", or could not be read (see skipped_files)."
+             if skipped_files else ".")
         )
     if skipped_files:
         # A file that was never read cannot be scored, and an unscored file is
         # absent from the ranking -- which reads exactly like a quiet, safe
-        # file. Say it out loud instead.
+        # file. Say it out loud instead. The warning used to claim every skip
+        # was an over-ceiling one, which was the only kind it recorded; now it
+        # counts what actually happened.
+        oversized = sum(1 for s in skipped_files
+                        if s["reason"] == oversize_reason(max_file_bytes))
+        gitlinks = sum(1 for s in skipped_files
+                       if s["reason"] == SUBMODULE_REASON)
+        unread = len(skipped_files) - oversized - gitlinks
+        parts = []
+        if unread:
+            parts.append(f"{unread} could not be read")
+        if oversized:
+            parts.append(f"{oversized} over the {human_bytes(max_file_bytes)} "
+                         "ceiling (raise --max-file-bytes)")
+        if gitlinks:
+            parts.append(f"{gitlinks} submodule(s)")
         warnings.append(
-            f"{len(skipped_files)} tracked file(s) were skipped as larger than "
-            f"{max_file_bytes // (1024 * 1024)}MB and carry no score; see "
-            "skipped_files (raise --max-file-bytes to include them)."
+            f"{len(skipped_files)} tracked path(s) carry no score and are "
+            f"absent from the ranking: {'; '.join(parts)}. That is 'not "
+            "analysed', not 'no risk' -- see skipped_files for each path and "
+            "why."
         )
 
     return {
@@ -404,6 +548,13 @@ def build(repo: str, *, since: str | None = None, max_commits: int = 20000,
         ),
         "warnings": warnings,
         "skipped_files": skipped_files,
+        # Two counts, never one: "ranked 3" alone cannot tell a reader whether
+        # the fourth tracked file was safe or simply never opened. The same
+        # pair is what arid_nodes.summary.files / files_skipped carries.
+        "summary": {
+            "files_ranked": len(files),
+            "files_skipped": len(skipped_files),
+        },
         "files": files,
     }
 
@@ -489,6 +640,14 @@ def _explain(f: dict) -> str:
     ships with the sentence that justifies it."""
     bits = []
 
+    # First, and before any number: this row's counts describe a link, and
+    # nothing else in the row says so. A reader aiming testing effort at a
+    # path needs to know the path is a pointer before they read its size.
+    target = f.get("symlink")
+    if target:
+        bits.append(f"a symbolic link to {target}, counted as the link "
+                    "itself rather than as its target")
+
     # Churn: exactly one phrase, chosen by magnitude. Below 1% the percentage
     # rounds to "0% churned", which reads as a contradiction beside a real
     # signal, so give the raw count instead.
@@ -565,7 +724,6 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(f"{len(result['files'])} files scored from "
               f"{result['window']['commits_analyzed']} commits "
-              f"({len(result['skipped_files'])} skipped as too large) "
               f"-> {args.out}",
               file=sys.stderr)
         for f in result["files"][:5]:
@@ -575,7 +733,28 @@ def main(argv: list[str] | None = None) -> int:
 
     for warning in result["warnings"]:
         print(f"warning: {warning}", file=sys.stderr)
+    render_skipped(result, sys.stderr)
     return 0
+
+
+def render_skipped(result: dict, stream) -> None:
+    """The ranking's companion line: what is NOT in it, and why.
+
+    Both output modes get this. Without it `3 files scored` is the same
+    sentence whether the fourth tracked file was safe or was never opened --
+    and the one a reader must act on is the second.
+    """
+    skipped = result.get("skipped_files") or []
+    summary = result.get("summary") or {}
+    ranked = summary.get("files_ranked", len(result.get("files") or []))
+    if not skipped:
+        return
+    print(f"{ranked} file(s) ranked; {len(skipped)} tracked path(s) NOT "
+          "ranked (see skipped_files):", file=stream)
+    for entry in skipped[:5]:
+        print(f"  skipped {entry['file']}: {entry['reason']}", file=stream)
+    if len(skipped) > 5:
+        print(f"  ... and {len(skipped) - 5} more", file=stream)
 
 
 if __name__ == "__main__":

@@ -82,6 +82,72 @@ SEVERITIES = ("block", "warn", "info")
 
 
 # --------------------------------------------------------------------------
+# snippet redaction -- docs/SECURITY-REVIEW.md S3-1
+# --------------------------------------------------------------------------
+# Every finding carries up to 100 characters of verbatim source, and that
+# goes three places a secret must not: `.testing/`, which
+# `skills/start/SKILL.md` tells people to commit; the CI job log, which is
+# public on a public repository; and the uploaded artifact. A fixture holding
+# a real-shaped token -- `TEST_API_KEY = "sk_live_..."`, precisely the thing
+# `env_safety_check.py` exists because people do -- is copied into all three
+# the moment any rule fires on that line.
+#
+# The patterns are NOT redefined here. `pr_comment.py` already has a
+# `redact()` that reuses `env_safety_check`'s own `VENDOR_TOKEN_RES`,
+# `AWS_KEY_RE`, `STRIPE_LIVE_RE` and `AZURE_CONN_RE`, so this is the third
+# consumer of one definition rather than a third copy of it. Two copies of a
+# rule drifting apart is this repository's most frequent defect, and a
+# redaction rule that is right in one copy and stale in another leaks exactly
+# the shapes the stale copy has not heard of.
+#
+# The false-positive direction matters here too, and in the opposite sense to
+# a detector: over-redaction destroys the thing the snippet is for. A finding
+# whose evidence reads `[redacted]` cannot be judged, so it gets ignored, and
+# the gate goes with it. Nothing is added on top of `pr_comment.redact()`,
+# which is already calibrated for readability -- its key-name pattern keeps
+# the key name and drops only the value, and its length/charset/entropy gate
+# leaves `localhost` and `change-me-later` legible.
+#
+# The import is lazy and may fail (this gate runs when other things are
+# broken). If it does, snippets are emitted VERBATIM and the report says so,
+# in `summary.redaction` and on stderr -- an unredacted report that claims to
+# be redacted is worse than one that admits it is not.
+_REDACTOR = None
+
+
+def _redactor():
+    """(fn | None, source | None, reason | None). Resolved once."""
+    global _REDACTOR
+    if _REDACTOR is None:
+        try:
+            from pr_comment import redact as _fn
+            _REDACTOR = (_fn, "pr_comment.redact", None)
+        except Exception as exc:   # pragma: no cover - depends on sys.path
+            _REDACTOR = (None, None,
+                         "scripts/pr_comment.py could not be imported "
+                         "(%s: %s), so the snippets below are VERBATIM "
+                         "SOURCE and have NOT been checked for credentials"
+                         % (type(exc).__name__, exc))
+    return _REDACTOR
+
+
+def redact_snippet(text: str) -> str:
+    """Secret-shaped runs removed. Call this BEFORE truncating to 100
+    characters: half a key is still a leak, and truncating first would
+    publish the half that fell inside the window."""
+    fn = _redactor()[0]
+    return fn(text) if fn is not None else text
+
+
+def redaction_status() -> dict:
+    """What the reader needs to know about the line above -- `applied: false`
+    is a different report from `applied: true`, and must not read the same."""
+    fn, source, reason = _redactor()
+    return ({"applied": True, "source": source} if fn is not None
+            else {"applied": False, "source": None, "reason": reason})
+
+
+# --------------------------------------------------------------------------
 # languages and file selection
 # --------------------------------------------------------------------------
 
@@ -274,6 +340,20 @@ RULES: dict[str, dict] = {
             "on the day the remote service is slow.",
         fix="Stub the call (responses/nock/WireMock) or point it at a local "
             "fixture server on 127.0.0.1.",
+    ),
+    "live-repo": dict(
+        category="flake", severity="warn", family="os",
+        why="The test takes its answer from the checkout it happens to be "
+            "running in -- which files are on disk right now, which branch is "
+            "out, what is uncommitted. It passes on CI's clean checkout and "
+            "fails on a developer's dirty one, which is the worst polarity a "
+            "test can have: the failure is unreproducible on CI, so it trains "
+            "everyone to ignore the suite rather than to read it.",
+        fix="Name the tree the test means instead of inheriting one. Pass "
+            "cwd= (or git -C <dir>) to the subprocess; point the walk at a "
+            "tempfile.TemporaryDirectory or a committed fixture directory; "
+            "and patch the module's ROOT around the WHOLE call, not part of "
+            "it, then assert the fixture is what got measured.",
     ),
     "fs-order": dict(
         category="flake", severity="info", family="os",
@@ -707,6 +787,129 @@ FS_ORDER_RE = re.compile(
 SORTED_RE = re.compile(r"\bsorted\s*\(|\.\s*sort\s*\(|\bsort\s*\.\s*\w+\s*\("
                        r"|\bOrderBy\s*\(|\.\s*toSorted\s*\(")
 
+# --------------------------------------------------------------------------
+# live-repo: ambient filesystem / VCS coupling
+# --------------------------------------------------------------------------
+#
+# The gap this closes was found in this project's OWN suite: two tests called
+# project_state.collect() with the module's ROOT left pointing at the real
+# checkout, so they walked every file in the working tree, shelled out to git
+# four times and ran scripts/validate_plugin.py as a subprocess. They passed
+# on CI and failed on a dirty tree. `real-network` was the only rule in this
+# file about ambient environment, and it only knows about the network.
+#
+# WHY THIS RULE IS NARROW, AND WHAT IT DELIBERATELY WILL NOT SAY
+# --------------------------------------------------------------
+# The obvious rule -- "a test that touches the filesystem, runs git, or
+# shells out to a project script is ambient" -- is useless, and this repo is
+# the proof: tests/test_integration.py runs the scripts under test as
+# subprocesses by design, most tests here build and read temp directories,
+# and tests/test_fixture_manifest.py reads examples/fixtures/ on purpose. A
+# rule firing on those is above the ~10% false-positive line on its first
+# run, and a rule above that line gets the whole gate switched off.
+#
+# The distinction that carries the signal is AMBIENT state versus FIXTURE
+# state -- not filesystem versus no filesystem:
+#
+#   controlled  a tempdir, a fixture directory, a path the test built, a
+#               subprocess told which directory to stand in
+#   ambient     the repository root itself, the current working directory,
+#               git asked about "here", a module-level ROOT the test left
+#               pointing at the real checkout
+#
+# So all three detectors below are shaped the same way: they look for the
+# ambient form AND for the absence of the thing that would have named the
+# tree. Each one has an explicit suppressor for its legitimate twin, and each
+# one is written to stay silent when it cannot tell -- the misses are listed
+# at each detector.
+
+# Subcommands whose answer is a property of whatever repository the process
+# is standing in. `clone` and `init` are absent on purpose: both are told
+# their source and their destination, so the working directory does not
+# change what they do, and firing on them was a false positive on this repo's
+# own `git clone --depth 1` shallow-clone fixture.
+#
+# This is the one rule that has to read `raw` rather than `code`: the
+# program name lives in a string literal and the scrubber exists precisely to
+# hide those. The guard against the usual consequence -- firing on a
+# commented-out or merely-mentioned command -- is that the statement's CODE
+# must independently show a subprocess invocation. A comment lives in
+# `comments`, never in `code`, so `# like git status` cannot reach this.
+GIT_AMBIENT_RE = re.compile(
+    r"""(?:["']git["']\s*,\s*["']|["']git\s+)"""
+    r"(status|rev-parse|log|diff|branch|remote|describe|show|ls-files"
+    r"|rev-list|symbolic-ref|blame|stash|shortlog|whatchanged|ls-remote)"
+    r"\b"
+)
+SUBPROCESS_RE = re.compile(
+    r"\bsubprocess\s*\.\s*(?:run|call|check_call|check_output|Popen)\s*\("
+    r"|\bos\s*\.\s*(?:system|popen)\s*\("
+    r"|\bexecSync\s*\(|\bspawnSync\s*\(|\bexecFileSync\s*\("
+    r"|\bexec\s*\.\s*Command\s*\(|\bIO\s*\.\s*popen\s*\("
+    r"|\bRuntime\s*\.\s*getRuntime\s*\(\s*\)\s*\.\s*exec\s*\("
+)
+# Any of these names the tree, so the call is deterministic.
+#
+# Measured, because it is not what it looks like: the `-C` alternatives are
+# belt-and-braces, not the working part. `["git", "-C", repo, "status"]` --
+# which is how every git call in this repository's own suite is written --
+# never reaches here at all, because GIT_AMBIENT_RE requires the subcommand
+# to follow `git` immediately and `-C` is in the way. The alternatives that
+# a real call can actually reach are `cwd=` and `--git-dir`/`--work-tree` in
+# the argv after the subcommand. The `-C` ones are kept against a future
+# relaxation of that adjacency, and a mutant that neuters this whole pattern
+# is killed by the `cwd=` case, not by a `-C` one.
+GIT_SCOPED_RE = re.compile(
+    r"\bcwd\s*=" r"|[\"']-C[\"']" r"|[\"']--git-dir" r"|[\"']--work-tree"
+    r"|(?<![\w.])git\s+-C\b" r"|--git-dir\s*=" r"|--work-tree\s*="
+)
+
+# Enumerating a directory: the RESULT is the set of files that happen to be
+# there, which is the ambient half. Reading one NAMED committed file is not
+# this rule's business -- scripts/arid_nodes.py is the same bytes on CI and
+# on a dirty tree.
+ENUMERATE_RE = re.compile(
+    r"\bos\s*\.\s*(?:walk|listdir|scandir)\s*\("
+    r"|\bglob\s*\.\s*i?glob\s*\("
+    r"|\bPath\s*\([^)]*\)\s*\.\s*(?:glob|rglob|iterdir)\s*\("
+    r"|\bos\s*\.\s*ReadDir\s*\(|\bfs\s*\.\s*readdir(?:Sync)?\s*\("
+)
+# The repository root, written directly. Uppercase only, and `os.getcwd()`:
+# a LOWERCASE `root` is the commonest local variable name for a tempdir in
+# this repo's own suite (`os.listdir(root)` in tests/test_atomic_io.py), and
+# matching it case-insensitively would have made this rule's first finding a
+# false positive.
+#
+# Known miss, accepted: one level of indirection defeats it.
+# `base = os.path.join(ROOT, "agents")` then `os.walk(base)` is invisible
+# here -- and that shape, in tests/test_consent_contract.py, is a deliberate
+# sweep of a committed directory rather than of the checkout, so the miss and
+# the correct silence point the same way.
+REPO_ROOT_EXPR_RE = re.compile(
+    r"\b(?:[A-Z][A-Z0-9_]*_)?(?:ROOT|CHECKOUT)\b"
+    r"|\bos\s*\.\s*getcwd\s*\(\s*\)"
+    r"|\bPath\s*\(\s*__file__\s*\)(?:\s*\.\s*parent){2,}"
+    r"|\bos\s*\.\s*path\s*\.\s*dirname\s*\(\s*os\s*\.\s*path\s*\.\s*dirname\s*\("
+)
+# A tree the test built or a fixture it committed. Present anywhere in the
+# statement, the statement is controlled.
+CONTROLLED_PATH_RE = re.compile(
+    r"\btmp\w*|\btemp\w*|\bmkdtemp\b|\bTemporaryDirectory\b"
+    r"|\bfixtures?\b|\bsandbox\b|\bworkdir\b|\bself\s*\.\s*dir\b",
+    re.IGNORECASE,
+)
+
+# A module-level root the test file itself knows about. The file patching it
+# ANYWHERE is the evidence: the author has already established that this
+# module reads a root from module scope. A call into that module that is not
+# covered by such a patch runs against the real one.
+ROOT_ATTR_RE = r"(?:[A-Z][A-Z0-9_]*_)?(?:ROOT|BASE_DIR|BASEDIR|CHECKOUT|CWD)"
+ROOT_PATCH_RE = re.compile(
+    r"patch\s*\.\s*object\s*\(\s*(?P<mod1>\w+)\s*,\s*[\"'](?P<a1>%s)[\"']" % ROOT_ATTR_RE
+    + r"|(?:mock\s*\.\s*)?patch\s*\(\s*[\"'](?P<mod2>[\w.]+)\.(?P<a2>%s)[\"']" % ROOT_ATTR_RE
+    + r"|setattr\s*\(\s*(?P<mod3>\w+)\s*,\s*[\"'](?P<a3>%s)[\"']" % ROOT_ATTR_RE
+)
+
 ITERATION_ORDER_RE = re.compile(
     r"\.\s*keys\s*\(\s*\)|\.\s*values\s*\(\s*\)|\.\s*items\s*\(\s*\)"
     r"|\bObject\s*\.\s*(?:keys|values|entries)\s*\("
@@ -969,13 +1172,206 @@ def _python_blocks_regex(code: list[str]) -> list[Block]:
     return blocks
 
 
-def python_blocks_ast(source: str) -> list[Block] | None:
-    """Exact block boundaries from Python's own parser. Returns None if the
-    file does not parse, so the caller can fall back to the regex path."""
+# The one ceiling in this file we do NOT set and cannot raise.
+#
+# `ast.parse` builds the Python AST objects from the C parse tree with a
+# recursive C function (`ast2obj_expr` in Python-ast.c), so a deeply NESTED
+# expression costs C stack, and past some depth `ast.parse` raises
+# `RecursionError`. That depth is not `sys.getrecursionlimit()`. Measured
+# here, binop chains (`a + a + a + ...`, nesting depth = term count):
+#
+#   CPython 3.14.6, macOS, main thread   accepts 95,065; RecursionError at
+#                                        95,066; still RecursionError at
+#                                        400,000 -- it never crashes
+#   CPython 3.14.6, 512KB thread stack   accepts 2,834; RecursionError at 2,835
+#   CPython 3.9.6 (this repo's FLOOR),   accepts 260,937; SIGSEGV (rc -11) by
+#   macOS, main thread                   262,500. Bisected in child processes.
+#                                        The macOS crash report for one of
+#                                        those runs names the cause: "Thread
+#                                        stack size exceeded due to excessive
+#                                        recursion", dead at recursion level
+#                                        261,942 -- inside the bracket above.
+#   CPython 3.9.6, 512KB thread stack,   SIGBUS, exit 138
+#   depth 20,000
+#
+# Three consequences, all measured rather than assumed:
+#
+#  1. `sys.setrecursionlimit()` is NOT the knob. On 3.14.6 at a 512KB stack and
+#     depth 3,000 the result is RecursionError at limits of 1,000, 10,000,
+#     100,000 and 1,000,000 alike.
+#  2. On 3.9.6 there is NO depth at which this raises. The bisect found no
+#     RecursionError anywhere between "accepted" and "crashed": it goes
+#     straight from OK at 260,937 to SIGSEGV. So the margin that raising the
+#     limit would be spending is not small -- on the interpreter this repo
+#     declares as its floor it does not exist. A RecursionError is catchable
+#     and can be reported; a SIGSEGV has no exception, no traceback, no output
+#     and no exit code a caller can act on. Raising the limit trades the
+#     former for the latter, which is strictly worse than the bug it would be
+#     trying to fix. We therefore do NOT raise it, and do not call
+#     threading.stack_size() either -- both are depth guesses, and a depth
+#     guess is exactly what is not portable here.
+#  3. The depth at which it bites depends on the C stack, which differs
+#     between macOS and Linux and between the main thread and a worker. A file
+#     that parses on a developer's machine can fail on a CI runner. That is
+#     exactly how this escaped: one machine could not have told us.
+#
+# Catching RecursionError at the call site needs no depth guess at all, which
+# is why it is the fix. Residual risk, stated plainly: on an interpreter whose
+# AST builder has no counter (3.9.6) a deep enough file still kills the
+# process, and nothing in this script can catch that. What this script
+# controls is that where the interpreter DOES raise, the run survives and says
+# so.
+#
+# So it has to be REPORTED, not merely survived. The AST pass is what gives
+# exact test-block boundaries; without it the regex scanner guesses them from
+# indentation, so a rule can fire on the wrong block or not at all. A file
+# where that happened is in `unparsed_files` and is counted in
+# summary.files_ast_unparsed -- a third state, distinct from both "not scanned
+# at all" (skipped_files) and "scanned in full".
+# ---- the REACHABLE half of the same ceiling --------------------------------
+#
+# Everything above is about RecursionError, which is the half of this ceiling
+# a real file almost never reaches. CPython's tokenizer and PEG parser cap
+# nesting far earlier, and those caps are compile-time constants rather than a
+# function of the C stack. Measured here with ast.parse, macOS arm64, by
+# bisection in child processes:
+#
+#                                        3.9.6 (this repo's    3.14.6
+#                                        FLOOR)
+#   (, [ or { nesting (tokenizer         accepts 200,          accepts 200,
+#   MAXLEVEL)                            raises at 201         raises at 201
+#       -> SyntaxError: "too many nested parentheses"
+#   indentation levels (tokenizer        accepts 99,           accepts 99,
+#   MAXINDENT)                           raises at 100         raises at 100
+#       -> IndentationError: "too many levels of indentation"
+#   nested unary (`not not not ...`,     no cap found;         accepts 5,966,
+#   pegen parser stack)                  parses 100,000        raises at 5,967
+#       -> MemoryError: "Parser stack overflowed - Python source too complex
+#          to parse"
+#   binop chain (`a + a + ...`)          no cap; 100,000 ok    accepts 95,066,
+#       -> RecursionError                (SIGSEGV past         raises at 95,067
+#                                         ~262,000)
+#
+# 201 nested brackets is a thing generated code and vendored data literals do.
+# 95,067 chained terms is not. Before this was fixed, the loud AST_TOO_DEEP
+# signal covered only the depth nobody reaches, while the depth a real file
+# actually hits was classified "syntax-error" and fell back to the regex
+# scanner in silence -- `parsed_with: regex`, `files_ast_unparsed: 0`,
+# `unparsed_files: []`, empty stderr, exit 0. The signal added for this defect
+# class was missing the only case in range.
+#
+# Telling the two apart is only possible from the exception's MESSAGE. CPython
+# gives "this source is malformed" and "the parser hit its nesting cap" the
+# same exception type -- IndentationError is itself a SyntaxError subclass --
+# and attaches no code, no attribute and no flag that distinguishes them. So
+# message matching it is, and message matching is BRITTLE: these strings are
+# not API, a future CPython may reword them, and a translated or patched build
+# may not produce them at all. Verified verbatim on CPython 3.9.6 and 3.14.6
+# (macOS arm64) only.
+#
+# The brittleness is therefore made one-directional, which is the part that
+# matters:
+#
+#   recognised message  -> AST_TOO_DEEP, the loud signal
+#   ANY other message   -> "syntax-error", silent, exactly as before
+#
+# An unrecognised message can only ever cost a MISSED too-deep report. It can
+# never produce a spurious "this file could not be analysed" on an ordinary
+# half-written file -- which is the false positive that would fire on every
+# malformed file in a repo and get the whole signal switched off, taking the
+# rest of the gate with it. If CPython rewords one of these, this degrades to
+# the old silent behaviour rather than to noise.
+_NESTING_CAP_MESSAGES = (
+    "too many nested parentheses",     # tokenizer MAXLEVEL; 3.9.6 and 3.14.6
+    "too many levels of indentation",  # tokenizer MAXINDENT; 3.9.6 and 3.14.6
+    "parser stack overflowed",         # pegen; 3.14.6, arrives as MemoryError
+)
+
+
+def _is_nesting_cap(exc: BaseException) -> bool:
+    """Does this exception mean "too deeply nested", rather than "malformed"?
+
+    Message text is the only signal CPython offers (see above). Both the
+    SyntaxError `.msg` and `str(exc)` are read: `.msg` is the documented
+    attribute and carries the bare text, `str()` appends "(<unknown>, line N)"
+    around it, and MemoryError has no `.msg` at all. On both interpreters
+    verified here the two overlap, so a mutant that reads only `str(exc)`
+    SURVIVES -- recorded rather than removed, because `.msg` is the stable
+    half (str()'s formatting has changed between CPython releases; the
+    attribute has not) and str() is the only half MemoryError has.
+    Unrecognised -> False -> the caller stays silent, which is the status quo.
+    """
+    text = "{} {}".format(getattr(exc, "msg", "") or "", exc).lower()
+    return any(fragment in text for fragment in _NESTING_CAP_MESSAGES)
+
+
+AST_TOO_DEEP = "ast-nesting-too-deep"
+AST_TOO_DEEP_REASON = (
+    "ast.parse refused this file for nesting depth. It arrives as a "
+    "RecursionError (the AST builder running out of C stack), or as one of "
+    "CPython's parser nesting caps: SyntaxError \"too many nested "
+    "parentheses\" at 201 nested brackets, IndentationError \"too many levels "
+    "of indentation\" at 100 levels, or MemoryError \"Parser stack "
+    "overflowed\". Nothing about the file is wrong and no flag raises any of "
+    "these ceilings -- they are CPython's own limits, not --max-file-bytes, "
+    "--max-line-chars or sys.setrecursionlimit, and the stack-dependent one "
+    "moves between platforms. The AST pass did NOT run on this file."
+)
+AST_TOO_DEEP_LOST = (
+    "exact test-block boundaries; the regex scanner ran instead, inferring "
+    "blocks from indentation, so a per-block rule (no-assertion, weak-oracle, "
+    "shared-mutable-state) may have been applied to the wrong span or to no "
+    "span at all"
+)
+
+
+def python_blocks_ast_detailed(source: str) -> tuple[list[Block] | None, str | None]:
+    """(blocks, why_not) -- blocks is None when Python's own parser refused it.
+
+    `why_not` exists because those refusals are not one thing. A SyntaxError is
+    an ordinary, expected state: the file is half-written, the regex path is
+    the right answer and saying so every time would be noise. A RecursionError
+    is not: nothing about the file is wrong, the limit is the interpreter's C
+    stack (see AST_TOO_DEEP above), it differs per platform, and the caller
+    MUST be able to tell the reader that the AST pass did not run. Falling back
+    silently in that case is the whole defect class this gate exists to catch.
+
+    This function never raises for a refusal -- only a MemoryError that is NOT
+    the parser's own stack overflow is re-raised, unchanged, because a real
+    out-of-memory must not be reported as a parse fallback. The docstring used
+    to promise "never raises" while the code only caught SyntaxError and
+    ValueError, so a deeply nested expression
+    killed the entire run from inside scan_paths().
+    """
     try:
         tree = ast.parse(source)
-    except (SyntaxError, ValueError):
-        return None
+    except (SyntaxError, ValueError) as exc:
+        # The reachable ceiling arrives here, not below: CPython caps bracket
+        # nesting at 200 and indentation at 100, and reports both as a
+        # SyntaxError (IndentationError is one). Same fact about the file as
+        # the RecursionError case -- too deeply nested for the AST builder --
+        # under a different exception type, so it gets the same loud signal.
+        # Anything whose message we do not recognise stays an ordinary,
+        # deliberately silent syntax error. See _is_nesting_cap above for why
+        # the fallback direction is the one that matters.
+        if _is_nesting_cap(exc):
+            return None, AST_TOO_DEEP
+        return None, "syntax-error"
+    except RecursionError:
+        # Caught here and NOT re-raised, but the caller is handed the reason so
+        # it can put the file in unparsed_files. Catch-and-continue on its own
+        # would be silence wearing a fix's clothes.
+        return None, AST_TOO_DEEP
+    except MemoryError as exc:
+        # CPython 3.14.6 reports its own parser-stack overflow as a
+        # MemoryError. A MemoryError we do NOT recognise is a real one, and is
+        # re-raised unchanged -- precisely what this function did before, since
+        # it never caught MemoryError at all. Swallowing a genuine out-of-memory
+        # would turn a machine-level failure into a quiet regex fallback, which
+        # is the defect class this guard exists to prevent, inverted.
+        if _is_nesting_cap(exc):
+            return None, AST_TOO_DEEP
+        raise
     blocks: list[Block] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -988,7 +1384,15 @@ def python_blocks_ast(source: str) -> list[Block] | None:
         decl = min([node.lineno] + [d.lineno for d in node.decorator_list])
         blocks.append(Block(node.name, decl, start, end))
     blocks.sort(key=lambda b: b.decl)
-    return blocks
+    return blocks, None
+
+
+def python_blocks_ast(source: str) -> list[Block] | None:
+    """Back-compatible wrapper: blocks only. Prefer
+    python_blocks_ast_detailed(), which also hands back WHY the parser refused
+    -- a caller that cannot tell "half-written" from "too deeply nested"
+    cannot report the second one."""
+    return python_blocks_ast_detailed(source)[0]
 
 
 def _brace_blocks(code: list[str], patterns: list[tuple[re.Pattern, int]]) -> list[Block]:
@@ -1104,10 +1508,16 @@ class FileScan:
         self.code, self.strings, self.comments = scrub(raw, lang)
         self.has_seed = any(SEED_RE.search(c) for c in self.code)
         self.ast_used = False
+        # None unless the AST pass was attempted and the interpreter refused
+        # the file for depth. "Not attempted" (Java, use_ast=False) and
+        # "attempted and failed" must not look alike downstream.
+        self.ast_unavailable: str | None = None
         blocks = None
         if lang == "python" and use_ast:
-            blocks = python_blocks_ast("".join(raw))
+            blocks, why = python_blocks_ast_detailed("".join(raw))
             self.ast_used = blocks is not None
+            if why == AST_TOO_DEEP:
+                self.ast_unavailable = why
         self.blocks = blocks if blocks is not None else find_blocks(self.code, lang)
         self.findings: list[dict] = []
         self.suppressed = 0
@@ -1123,7 +1533,9 @@ class FileScan:
             self.suppressed += 1
             return
 
-        snippet = raw.strip()
+        # Redact first, truncate second: a token straddling the 100-character
+        # boundary would otherwise have its first 97 characters published.
+        snippet = redact_snippet(raw).strip()
         if len(snippet) > 100:
             snippet = snippet[:97] + "..."
         finding = {
@@ -1248,6 +1660,9 @@ def _flake_rules(scan: FileScan) -> None:
                 scan.add("real-network", i, severity="warn")
                 break
 
+    # -- ambient repository / VCS coupling ---------------------------------
+    _live_repo(scan)
+
     # -- filesystem order ---------------------------------------------------
     for i, line in enumerate(code, 1):
         if FS_ORDER_RE.search(line) and not SORTED_RE.search(line):
@@ -1289,6 +1704,186 @@ def _flake_rules(scan: FileScan) -> None:
 
     # -- shared mutable state ----------------------------------------------
     _shared_state(scan)
+
+
+def _bracket_delta(line: str) -> int:
+    return (line.count("(") + line.count("[") + line.count("{")
+            - line.count(")") - line.count("]") - line.count("}"))
+
+
+def _statement_spans(code: list[str]) -> list[tuple[int, int]]:
+    """[(first, last)] 0-based line ranges of bracket-balanced statements.
+
+    A subprocess call is routinely written over three lines and the `cwd=`
+    that makes it deterministic is as likely to be on the last as on the
+    first. Reading one line at a time would report every multi-line call as
+    unscoped -- a false positive on the commonest way to write one -- so the
+    whole statement is the unit here.
+    """
+    spans: list[tuple[int, int]] = []
+    start, depth = 0, 0
+    for i, line in enumerate(code):
+        if depth <= 0:
+            start, depth = i, 0
+        depth += _bracket_delta(line)
+        if depth <= 0:
+            spans.append((start, i))
+            depth = 0
+    if depth > 0:                       # unbalanced tail; keep it addressable
+        spans.append((start, len(code) - 1))
+    return spans
+
+
+def _statement_index(code: list[str]) -> list[tuple[int, int]]:
+    """Per line, the (first, last) of the statement it belongs to."""
+    index = [(i, i) for i in range(len(code))]
+    for first, last in _statement_spans(code):
+        for i in range(first, min(last, len(code) - 1) + 1):
+            index[i] = (first, last)
+    return index
+
+
+PY_ANY_DEF_RE = re.compile(r"^(\s*)(?:async\s+)?def\s+\w+\s*\(")
+
+
+def _def_spans(code: list[str]) -> list[tuple[int, int]]:
+    """[(first, last)] 0-based line ranges of every `def` body, test or not.
+
+    `find_blocks` only knows about test functions, and the fix for this smell
+    is usually to move the call into a helper that patches the root -- a
+    helper is not a test function, so a test-block-only view would report the
+    fixed shape as broken.
+    """
+    spans: list[tuple[int, int]] = []
+    for i, line in enumerate(code):
+        m = PY_ANY_DEF_RE.match(line)
+        if not m:
+            continue
+        indent = len(m.group(1))
+        end = len(code) - 1
+        for j in range(i + 1, len(code)):
+            nxt = code[j]
+            if not nxt.strip():
+                continue
+            if len(nxt) - len(nxt.lstrip()) <= indent:
+                end = j - 1
+                break
+        spans.append((i, max(end, i)))
+    return spans
+
+
+_KWARG_RE = re.compile(r"^(?:\*\*)?\s*\w+\s*=(?!=)")
+
+
+def _has_positional_arg(args: list[str]) -> bool:
+    """True when the call was handed a subject rather than told only how to
+    behave. `collect(skip_tests=True)` was handed nothing; `render(state)`
+    was handed the thing it renders."""
+    for a in args:
+        s = a.strip()
+        if not s or s.startswith("**") or _KWARG_RE.match(s):
+            continue
+        return True
+    return False
+
+
+def _live_repo(scan: FileScan) -> None:
+    """Three ambient-state shapes, each with its controlled twin suppressed.
+
+    Deliberately NOT here, after measuring the cost on this repository:
+
+      * running the project's own scripts as a subprocess. This repo's
+        tests/test_integration.py does that by design, dozens of times, and
+        statically there is no way to tell "ran the script against a tempdir"
+        from "ran it against the checkout" once the target arrives through a
+        variable. The expected false-positive rate is high and the marginal
+        detection is nil -- in the real defect this rule was built for, the
+        subprocess was inside the production code, not the test.
+      * reading a named committed file (scripts/foo.py, a fixture). Those
+        bytes are identical on CI and on a dirty tree, so they are not
+        ambient at all.
+    """
+    code, raw = scan.code, scan.raw
+    stmt = _statement_index(code)
+
+    def statement_text(i: int, lines: list[str]) -> str:
+        first, last = stmt[i - 1]
+        return " ".join(lines[k].strip() for k in range(first, last + 1))
+
+    # (1) git asked about "here". The subcommand list is positive, so a
+    # cwd-independent command (clone, init, --version) cannot reach it.
+    # Once per STATEMENT, not once per file: a suite with two of these has
+    # two of these.
+    reported: set[int] = set()
+    for i in range(1, len(code) + 1):
+        first = stmt[i - 1][0]
+        if first in reported or not SUBPROCESS_RE.search(statement_text(i, code)):
+            continue
+        text = statement_text(i, raw)
+        if GIT_AMBIENT_RE.search(text) and not GIT_SCOPED_RE.search(text):
+            reported.add(first)
+            scan.add("live-repo", first + 1)
+
+    # (2) enumerating the checkout itself. The set of files in the repository
+    # root is whatever is on disk right now, editor leftovers and all.
+    #
+    # The controlled side is read from `raw`, strings included, because that
+    # is where it lives: `os.walk(os.path.join(ROOT, "examples", "fixtures"))`
+    # names a committed fixture tree, and the word that says so is a string
+    # literal the scrubber has already collapsed. Reading only `code` made
+    # this rule's first measured finding a false positive on exactly that
+    # shape -- which is how tests/test_fixture_manifest.py is written.
+    for i, line in enumerate(code, 1):
+        if not ENUMERATE_RE.search(line):
+            continue
+        if not REPO_ROOT_EXPR_RE.search(statement_text(i, code)):
+            continue
+        if CONTROLLED_PATH_RE.search(statement_text(i, raw)):
+            continue
+        scan.add("live-repo", i)
+
+    # (3) a module-level root the file itself knows is patchable, left
+    # pointing at the real checkout for one call.
+    #
+    # The evidence is intra-file and self-calibrating: this file patches
+    # `pstate.ROOT` somewhere, so its author has already established that
+    # `pstate` reads a root from module scope. A call into `pstate` that no
+    # enclosing `def` patches is running against the real one. Two
+    # suppressors, both load-bearing, both measured against the fixed version
+    # of the test that prompted this rule:
+    #
+    #   * a call with a POSITIONAL argument is given its subject by the test
+    #     -- `pstate.render(state)` renders what it was handed. Only a call
+    #     told nothing can be taking its input from the environment.
+    #   * a patch anywhere in ANY enclosing `def` covers the call, not just a
+    #     lexically enclosing `with`. The fix for this smell puts the patch
+    #     and the call in the same helper, often via ExitStack, where there
+    #     is no `with` block to be inside.
+    patched_modules: set[str] = set()
+    patch_lines: list[int] = []
+    for i, line in enumerate(raw, 1):
+        for m in ROOT_PATCH_RE.finditer(line):
+            mod = m.group("mod1") or m.group("mod2") or m.group("mod3")
+            if mod:
+                patched_modules.add(mod.split(".")[-1])
+                patch_lines.append(i)
+    if not patched_modules:
+        return
+    defs = _def_spans(code)
+    covered = set()
+    for first, last in defs:
+        if any(first + 1 <= p <= last + 1 for p in patch_lines):
+            covered.update(range(first + 1, last + 2))
+    call_re = re.compile(r"(?<![\w.])(%s)\s*\.\s*(\w+)\s*\("
+                         % "|".join(sorted(re.escape(m) for m in patched_modules)))
+    for i, line in enumerate(code, 1):
+        if i in covered:
+            continue
+        for m in call_re.finditer(line):
+            if _has_positional_arg(_call_args(line, m.end() - 1)):
+                continue        # given its subject by the test, not by the tree
+            scan.add("live-repo", i)
+            break
 
 
 def _shared_state(scan: FileScan) -> None:
@@ -1477,6 +2072,15 @@ def iter_paths(paths: list[str]):
 # characters wide -- a line that is, is minified or generated -- so scanning is
 # capped there. Line numbers and the file's line count are unchanged, so every
 # finding still points where it did.
+#
+# The cap is NOT silent. Until this was fixed the tail past 2,000 characters
+# was dropped with nothing said, so a 1.9MB single-line test file -- under the
+# file ceiling, therefore "scanned" -- came back files_scanned=1, findings=0,
+# skipped_files=[]: a clean verdict about 1,898,000 characters nobody looked
+# at, which is exactly the shape of the worst defect in this build. Measured
+# before the fix: 0.002s and zero findings on that file. Every truncated line
+# now appears in `truncated_lines`, is counted in summary.lines_truncated, is
+# printed by render_text() and is warned about on stderr.
 MAX_LINE_CHARS = 2000
 
 # The line cap above bounds the work per line; this bounds the work per FILE,
@@ -1491,34 +2095,102 @@ MAX_LINE_CHARS = 2000
 MAX_FILE_BYTES = 2 * 1024 * 1024
 
 
-def read_lines(path: str, *, max_bytes: int = MAX_FILE_BYTES) -> list[str] | None:
-    """None when the file is unreadable, binary or over `max_bytes`. A
-    generated-test gate that crashes on one odd file blocks the whole
-    pipeline, so this never raises."""
+def read_lines_detailed(path: str, *, max_bytes: int = MAX_FILE_BYTES,
+                        max_line_chars: int = MAX_LINE_CHARS
+                        ) -> tuple[list[str] | None, list[dict], str | None]:
+    """(lines, truncated, why_not) -- lines is None when the file was not
+    read; `why_not` then says which of the three reasons it was.
+
+    `truncated` is the whole point of the second element: a gate that
+    shortens its own input and says nothing reports "nothing found" about
+    text it never read, so the caller is given what it would have to lie
+    about otherwise.
+
+    `why_not` is the same argument one level up. The caller already recorded
+    every unread file in `skipped_files`, but under a single string --
+    "unreadable or binary" -- that collapsed three causes needing three
+    different reactions: a permission error or a broken symlink is wrong with
+    the CHECKOUT, a NUL-byte file is a file that is not source, and an
+    oversize file is a ceiling this tool chose and can raise. The wording
+    follows `risk_map.py`'s `skip_reason()` rather than inventing a fourth
+    phrasing of the same idea.
+
+    Measured, so it is not guessed at: there is NO fourth cause here.
+    `latin-1` maps all 256 byte values, so `blob.decode("latin-1")` cannot
+    raise on a bytes input -- verified over every single byte and over a
+    200,000-byte random blob on CPython 3.14.6. The `except Exception` that
+    used to guard it was unreachable, and a reachable-looking guard around an
+    unreachable branch is how a reader is told a case is handled when nothing
+    handles it. It is gone; if a future encoding change makes decoding
+    fallible again, it must come back WITH a reason string, not with a bare
+    `return None`.
+
+    A generated-test gate that crashes on one odd file blocks the whole
+    pipeline, so this never raises.
+    """
     try:
-        if os.path.getsize(path) > max_bytes:
-            return None
+        size = os.path.getsize(path)
+        if size > max_bytes:
+            return None, [], (f"larger than {max_bytes} bytes "
+                              f"({max_bytes // (1024 * 1024)}MB ceiling); "
+                              "raise --max-file-bytes to scan it")
         with open(path, "rb") as fh:
             blob = fh.read()
-    except OSError:
-        return None
+    except OSError as exc:
+        return None, [], (f"unreadable ({exc.strerror or exc}); the file was "
+                          "NOT scanned and nothing here is a verdict on it")
     if b"\x00" in blob[:8000]:
-        return None
+        return None, [], ("binary (a NUL byte in the first 8000 bytes); it "
+                          "carries a source extension but is not source "
+                          "text, so it was NOT scanned")
     try:
         text = blob.decode("utf-8")
     except UnicodeDecodeError:
-        try:
-            text = blob.decode("latin-1")
-        except Exception:
-            return None
-    return [line if len(line) <= MAX_LINE_CHARS else line[:MAX_LINE_CHARS]
-            for line in text.splitlines(keepends=True)]
+        text = blob.decode("latin-1")
+
+    lines: list[str] = []
+    truncated: list[dict] = []
+    for n, line in enumerate(text.splitlines(keepends=True), start=1):
+        if len(line) > max_line_chars:
+            truncated.append({
+                "file": path,
+                "line": n,
+                "chars": len(line),
+                "scanned_chars": max_line_chars,
+                "reason": (f"line is {len(line)} characters, over the "
+                           f"{max_line_chars}-character line ceiling; only "
+                           f"the first {max_line_chars} were analysed and "
+                           "the rest was NOT examined"),
+            })
+            line = line[:max_line_chars]
+        lines.append(line)
+    return lines, truncated, None
+
+
+def read_lines_bounded(path: str, *, max_bytes: int = MAX_FILE_BYTES,
+                       max_line_chars: int = MAX_LINE_CHARS
+                       ) -> tuple[list[str] | None, list[dict]]:
+    """Back-compatible wrapper: (lines, truncated). Prefer
+    read_lines_detailed(), which also hands back WHY the file was not read --
+    a caller that cannot tell "I lacked permission" from "this is not source"
+    has to report both as the same thing."""
+    return read_lines_detailed(path, max_bytes=max_bytes,
+                               max_line_chars=max_line_chars)[:2]
+
+
+def read_lines(path: str, *, max_bytes: int = MAX_FILE_BYTES) -> list[str] | None:
+    """Back-compatible wrapper: lines only. Prefer read_lines_detailed(),
+    which also hands back what it had to shorten and why it read nothing."""
+    return read_lines_detailed(path, max_bytes=max_bytes)[0]
 
 
 def scan_paths(paths: list[str], use_ast: bool = True, *,
-               max_bytes: int = MAX_FILE_BYTES) -> dict:
+               max_bytes: int = MAX_FILE_BYTES,
+               max_line_chars: int = MAX_LINE_CHARS) -> dict:
     files: list[dict] = []
     skipped: list[dict] = []
+    truncated_lines: list[dict] = []
+    unparsed_files: list[dict] = []
     by_rule: dict[str, int] = {}
     counts = {"block": 0, "warn": 0, "info": 0}
     categories = {"flake": 0, "meaningless": 0}
@@ -1532,20 +2204,20 @@ def scan_paths(paths: list[str], use_ast: bool = True, *,
             # code is not a smell.
             skipped.append({"path": path, "reason": "not a test file"})
             continue
-        raw = read_lines(path, max_bytes=max_bytes)
+        raw, cut, why_not = read_lines_detailed(path, max_bytes=max_bytes,
+                                                max_line_chars=max_line_chars)
+        truncated_lines.extend(cut)
         if raw is None:
-            # Name the ceiling when that is what happened: "unreadable" and
-            # "too big to look at" need different reactions from the reader.
-            try:
-                oversized = os.path.getsize(path) > max_bytes
-            except OSError:
-                oversized = False
+            # The reason comes from the reader, which is the only place that
+            # knows which of the three things happened. It used to be
+            # re-derived here by a second getsize() -- a second copy of a
+            # rule, which is this repository's most frequent defect, and one
+            # that answered "unreadable or binary" to everything the ceiling
+            # had not caught. A permission error, a broken symlink and a
+            # NUL-byte file need three different reactions from a reader.
             skipped.append({
                 "path": path,
-                "reason": (f"larger than {max_bytes} bytes "
-                           f"({max_bytes // (1024 * 1024)}MB ceiling); "
-                           "raise --max-file-bytes to scan it")
-                if oversized else "unreadable or binary",
+                "reason": why_not or "not read, and the reader did not say why",
             })
             continue
         scan = analyse_file(path, raw, lang, use_ast=use_ast)
@@ -1553,12 +2225,32 @@ def scan_paths(paths: list[str], use_ast: bool = True, *,
             counts[f["severity"]] += 1
             categories[f["category"]] += 1
             by_rule[f["rule"]] = by_rule.get(f["rule"], 0) + 1
-        files.append({
+        entry = {
             "path": path,
             "language": lang,
             "parsed_with": "ast" if scan.ast_used else "regex",
             "findings": scan.findings,
-        })
+        }
+        if scan.ast_unavailable:
+            # `parsed_with: "regex"` is also what a Java file and a
+            # use_ast=False run say, so it cannot carry this on its own. A
+            # separate key, named for what happened, so "regex because that is
+            # the right tool here" and "regex because the AST pass could not
+            # run" stay distinguishable.
+            entry["ast_unavailable"] = scan.ast_unavailable
+            # The file WAS read and WAS scanned -- so it is not in
+            # skipped_files and it does count in files_scanned -- but it was
+            # scanned by the weaker of the two block finders. Saying which,
+            # and what that costs, is the difference between a partial
+            # analysis and a partial analysis reported as complete.
+            unparsed_files.append({
+                "file": path,
+                "stage": "ast",
+                "reason": AST_TOO_DEEP_REASON,
+                "fell_back_to": "regex",
+                "not_analysed": AST_TOO_DEEP_LOST,
+            })
+        files.append(entry)
 
     total = sum(counts.values())
     # "not a test file" is a decision, not a failure. `skipped_files` carries
@@ -1566,15 +2258,35 @@ def scan_paths(paths: list[str], use_ast: bool = True, *,
     # ones whose silence would otherwise be mistaken for a clean result.
     unread = [{"file": s["path"], "reason": s["reason"]} for s in skipped
               if s["reason"] != "not a test file"]
+    # A truncated line is a *third* state, and it has to stay distinguishable
+    # from both of the other two: the file was read (so it is not in
+    # skipped_files) and it was scanned (so files_scanned counts it), but part
+    # of it was not looked at. Reported per line, with the real character
+    # count, so "nothing found here" can never be read as "nothing is here".
     return {
         "schema": SCHEMA,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "skipped_files": unread,
+        "truncated_lines": truncated_lines,
+        # A third state again, one level sideways: the file was read in full
+        # and scanned in full, but by the regex block finder, because the AST
+        # pass could not run on it. Never a finding -- deeply nested generated
+        # code is legitimate, and a check that fires on it would be switched
+        # off inside a week, taking the rest of the gate with it. So it stays
+        # out of by_severity, out of the counts and out of --fail-on's path.
+        "unparsed_files": unparsed_files,
         "files": files,
         "summary": {
+            # S3-1: snippets are verbatim source, so the report has to say
+            # whether anything filtered them. `applied: false` must never be
+            # mistaken for "nothing matched".
+            "redaction": redaction_status(),
             "files_scanned": len(files),
             "files_skipped": len(skipped),
+            "files_ast_unparsed": len(unparsed_files),
             "skipped": skipped,
+            "lines_truncated": len(truncated_lines),
+            "files_with_truncated_lines": len({t["file"] for t in truncated_lines}),
             "findings": total,
             "by_severity": counts,
             "by_category": categories,
@@ -1608,6 +2320,31 @@ def render_text(result: dict) -> str:
             out.append(f"  skipped {s['file']}: {s['reason']}")
         if len(unread) > 5:
             out.append(f"  ... and {len(unread) - 5} more")
+    # Same reasoning one level down: a line that was shortened was partly not
+    # read, and a count of zero findings on it says nothing about the tail.
+    cut = result.get("truncated_lines") or []
+    if cut:
+        out.append(f"{len(cut)} line(s) only PARTLY scanned "
+                   "(see truncated_lines):")
+        for t in cut[:5]:
+            out.append(f"  truncated {t['file']}:{t['line']}: "
+                       f"{t['chars']} chars, first {t['scanned_chars']} "
+                       "analysed, the rest NOT examined")
+        if len(cut) > 5:
+            out.append(f"  ... and {len(cut) - 5} more")
+    # And the state between the two: fully read, fully scanned, but with the
+    # AST pass missing. Out loud in the terminal as well as in the JSON,
+    # because the terminal is where a developer decides the gate went fine.
+    deep = result.get("unparsed_files") or []
+    if deep:
+        out.append(f"{len(deep)} file(s) scanned WITHOUT the AST pass "
+                   "(see unparsed_files):")
+        for d in deep[:5]:
+            out.append(f"  not parsed {d['file']}: nesting too "
+                       f"deep for ast.parse; fell back to {d['fell_back_to']}, "
+                       "so exact test-block boundaries were NOT used")
+        if len(deep) > 5:
+            out.append(f"  ... and {len(deep) - 5} more")
     return "\n".join(out)
 
 
@@ -1631,6 +2368,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="skip test files larger than this "
                          f"(default {MAX_FILE_BYTES}, i.e. 2MB); skipped files "
                          "are reported in skipped_files, never ignored")
+    ap.add_argument("--max-line-chars", type=int, default=MAX_LINE_CHARS,
+                    help="analyse only the first N characters of a line "
+                         f"(default {MAX_LINE_CHARS}); every line past it is "
+                         "reported in truncated_lines, never silently cut")
     args = ap.parse_args(argv)
 
     missing = [p for p in args.paths if not os.path.exists(p)]
@@ -1639,7 +2380,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        result = scan_paths(args.paths, max_bytes=args.max_file_bytes)
+        result = scan_paths(args.paths, max_bytes=args.max_file_bytes,
+                            max_line_chars=args.max_line_chars)
         payload = (json.dumps(result, indent=2) if args.format == "json"
                    else render_text(result))
         if args.out:
@@ -1649,9 +2391,20 @@ def main(argv: list[str] | None = None) -> int:
             write_text_atomic(args.out, payload + "\n")
         else:
             print(payload)
+        red = result["summary"].get("redaction") or {}
+        if not red.get("applied"):
+            print("warning: snippets NOT redacted: %s" % red.get("reason"),
+                  file=sys.stderr)
         for s in result["skipped_files"]:
             print(f"warning: not scanned: {s['file']}: {s['reason']}",
                   file=sys.stderr)
+        for t in result["truncated_lines"]:
+            print(f"warning: only partly scanned: {t['file']}:{t['line']}: "
+                  f"{t['reason']}", file=sys.stderr)
+        for d in result["unparsed_files"]:
+            print(f"warning: scanned without the AST pass: {d['file']}: "
+                  f"{d['reason']} Fell back to {d['fell_back_to']}; "
+                  f"NOT analysed: {d['not_analysed']}.", file=sys.stderr)
     except OSError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

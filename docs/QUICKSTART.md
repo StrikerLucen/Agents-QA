@@ -10,16 +10,28 @@ tells you more than anything written here.
 ## 1. Install
 
 ```
-/plugin marketplace add thomaspino/testsquad
+/plugin marketplace add StrikerLucen/Agents-QA
 /plugin install testsquad
 ```
 
+Typed **inside Claude Code** — `/plugin` is a slash command, and a shell answers it with
+`zsh: no such file or directory`. From a shell the equivalent is `claude plugin ...`.
+
+That form needs the repository to be public. For a private repository, a local folder, a
+non-default branch, or checking that the install worked, see
+**[INSTALL.md](INSTALL.md)**, which is the fuller version of this section.
+
 **Prerequisites:** Python 3.9+ and `git`. That is the whole list.
 
-The analysis scripts (`scripts/*.py`, ~5,600 lines) use the Python standard
-library only — no `pip install`, no virtualenv, no lockfile. `git` is needed
-because the risk map is computed from `git log`; without a history you get an
-empty risk map, reported as "no data", not "no risk". Everything else it runs is
+The analysis scripts (`scripts/*.py`, ten modules; `cat scripts/*.py | wc -l`
+for the size, which this page got wrong by nearly half until 2026-11-16 and
+which moved twice more the same day) use the Python standard library only — no
+`pip install`, no virtualenv, no lockfile. `git` is needed
+because the risk map is computed from `git log`. A directory with no history of its
+own does **not** give you an empty risk map: it falls through to the enclosing
+repository's history and ranks those files, with no warning. Measured 2026-11-17 on a
+clean clone — this page claimed the opposite until then, and the claim had never been
+run. See the warning in [INSTALL.md](INSTALL.md#the-zero-token-check). Everything else it runs is
 your project's own tooling, invoked exactly as your own config invokes it.
 
 ---
@@ -43,18 +55,56 @@ API cost:
 
 ```sh
 cd examples/fixtures
-python3 ../../scripts/env_safety_check.py node-ts      # must print UNSAFE
-python3 ../../scripts/env_safety_check.py python-pkg   # must print SAFE
-python3 ../../scripts/risk_map.py node-ts --since ""   # src/cart.ts must rank first
+python3 ../../scripts/env_safety_check.py node-ts
+python3 ../../scripts/env_safety_check.py python-pkg
+python3 ../../scripts/risk_map.py node-ts --since ""
 python3 ../../scripts/flake_smells.py node-ts python-pkg java-min
 ```
 
-`flake_smells.py` must fire on every weak test and report **nothing** on
-`tests/good.spec.ts`, `tests/test_good.py` and `GoodTest.java`. A finding on a
-good test is a false positive, which matters more here than a miss.
+No `#` comments in that block, deliberately: zsh does not enable
+`interactive_comments`, so a pasted trailing comment arrives as an argument and
+argparse rejects the whole command. The expected results go here instead, where
+they cannot be pasted by accident. Measured 2026-11-16:
 
-To check the scripts themselves: `python3 -m unittest discover -s tests` —
-484 tests, ~1.3s.
+| Command | Expected |
+|---|---|
+| `env_safety_check.py node-ts` | `UNSAFE`, 3 critical — and **exit 1**, which is the gate working, not a crash |
+| `env_safety_check.py python-pkg` | `SAFE`, 0 findings, exit 0 |
+| `risk_map.py node-ts` | `src/cart.ts` ranked first, likelihood 5 |
+| `flake_smells.py` | findings on the weak tests, **nothing** on the good ones |
+
+That last row is the one to check first. `flake_smells.py` must report
+**nothing** on `tests/good.spec.ts`, `tests/test_good.py` and `GoodTest.java`. A
+finding on a good test is a false positive, which matters more here than a miss.
+
+To check the scripts themselves, from the repository root:
+
+```sh
+cd examples/fixtures && ./regen_git_history.sh
+cd ../../tests && ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest
+```
+
+The first line is required on a fresh clone; see
+[CONTRIBUTING.md](../CONTRIBUTING.md#first-after-cloning) for why.
+
+Expect **green, with one expected failure**, in well under a minute. The *count* is
+deliberately not printed here: it went 922 → 957 → 966 over a single afternoon on
+2026-11-16 while this page was being written, so any number on this line would be wrong
+before you read it. The command is the answer; the number is not.
+
+**Use the `ls | xargs` form above**, not `python3 -m unittest discover`. It is what CI
+runs, what `CONTRIBUTING.md` asks contributors for, and the one invocation every page
+here names — so a failure you hit is a failure someone else can reproduce.
+
+*Until 2026-11-16 this paragraph said something stronger and wrong: that `discover` "is
+not equivalent: it reports 10 failures on a clean tree, because the test modules import
+each other by bare module name". Measured that day, at `HEAD` and in the working tree,
+none of it holds. No test module imports another — `grep -nE '^(import|from) test_'
+tests/*.py` returns nothing, because each one inserts `../scripts` itself, relative to
+`__file__` — and both forms collect the same number of tests and both pass. What does
+produce a wall of failures is a tree whose fixture git history has not been regenerated:
+15 of them, from either form equally. The step above this one is the one that is not
+optional, and that is what the warning was really about.*
 
 ### The agent check
 
@@ -101,6 +151,13 @@ shows everything remembered, with dates, and lets you withdraw any of it.
 - **Run nothing before the safety check.** Step 3 is `env_safety_check.py`. On
   UNSAFE it stops and asks before a single test command executes. A suite
   pointed at a live database deletes real data.
+- **Run nothing from your repo before you have seen it and agreed.** Step 4
+  profiles the project without executing any of it; step 5 then prints the
+  commands it found — whole-suite, changed-files, coverage, any dependency
+  install — verbatim, names what the runner invokes implicitly (`npm` runs
+  `pretest` before `test`), and says plainly that agreeing runs code written by
+  whoever wrote that repository, as you, on this machine. On a no, every later
+  stage reports "cannot execute" and the command it would have run.
 - **Install nothing without permission**, even when that leaves a stage
   unanswerable.
 - **Edit no product code.** Push nothing, merge nothing.
@@ -109,11 +166,15 @@ shows everything remembered, with dates, and lets you withdraw any of it.
 
 ### The stages
 
-Profile → safety → health → risk map → agents → diagnose → contract → roadmap.
-Each is a separate command you can re-run on its own; `/testsquad:start` only
-chains them. Two stages ask for agreement before writing: the `CLAUDE.md` block
-(diff shown first) and `.testing/acceptance-contract.md`, which includes naming
-the handful of features where failure costs money.
+Targets → questions → safety → profile → **agree to execute** → health → risk
+map → `CLAUDE.md` → agents → diagnose → contract → roadmap → report. Each is a
+separate command you can re-run on its own; `/testsquad:start` only chains them.
+
+Four stages stop for you: the safety check if it returns UNSAFE; the agreement
+to execute the repo's own commands (step 5, before anything of its runs); the
+`CLAUDE.md` block, with the diff shown first; and
+`.testing/acceptance-contract.md`, which includes naming the handful of features
+where failure costs money.
 
 ### How long, and what it costs
 
@@ -123,10 +184,29 @@ measure flakiness. Budget roughly three suite runs plus a coverage run, plus
 model time. On a monorepo it prints its estimated time and token cost before any
 long stage and waits.
 
-The plugin's own context cost is measurable: the always-on session preamble is
-~150 tokens (578 characters on a filled-in repo; a test caps it at 1,500), and a
-`/testsquad:test` run loads roughly 6,000 tokens of plugin — the skill (~1,250),
-the report rules (~790), and the 2–4 agents it selects (~2,100–3,200 each).
+The plugin's own context cost is measurable, so here it is measured rather than
+estimated. All figures below are from 2026-11-16, using the same `size // 4` estimator
+`scripts/validate_plugin.py` enforces its budgets with.
+
+The always-on session preamble: **555 characters, ~139 tokens**, on a `.testing/` holding
+a stack profile, a health baseline, three conventions and one known issue. It scales with
+those files, so your repo will differ — **the number that does not differ is the ceiling**,
+which `tests/test_integration.py` enforces at **2,000 characters** (anchor: *"the session
+preamble is {0} characters and is charged on every request in this repo"*), fed ten
+conventions and six 200-character blockers to prove the caps hold under hostile input.
+
+A `/testsquad:test` run loads the skill (**1,890 tokens**) plus the report rules
+(**957**) plus the 2–4 agents it selects, which range from **2,398** (`unit-test-engineer`)
+to **3,486** (`automation-engineer`). That is **~7,900 tokens at the two-agent floor and
+~15,300 at the four-agent ceiling** — not a single figure, because the whole point of
+selecting 2–4 specialists rather than all 7 is that the cost varies.
+
+Reproduce any of these yourself:
+
+```sh
+python3 -c "import sys; sys.path.insert(0,'scripts'); import validate_plugin as v; \
+print(v.estimate_tokens('agents/automation-engineer.md'))"
+```
 
 ### When the answer is bad news
 

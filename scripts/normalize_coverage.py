@@ -24,6 +24,10 @@ import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
+if __package__ in (None, ""):  # run as a script: scripts/ is already sys.path[0]
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from atomic_io import write_text_atomic  # noqa: E402
+
 SCHEMA = "testsquad.coverage/1"
 
 
@@ -63,8 +67,17 @@ class FileCoverage:
 
 def pct(hit: int, found: int) -> float | None:
     """None, not 0.0, when nothing was measured. A file with no branches has
-    no branch coverage; reporting that as 0% would be a lie that reads as a gap."""
+    no branch coverage; reporting that as 0% would be a lie that reads as a gap.
+
+    None again when the report contradicts itself -- more hits than there were
+    things to hit. 250% is not a measurement anybody took, and the arithmetic
+    that produced it says the inputs are wrong, not that coverage is excellent.
+    Clamping to 100 would be worse still: it would turn a broken report into a
+    perfect score, which is the one shape a normalizer must never produce.
+    """
     if found <= 0:
+        return None
+    if hit > found:
         return None
     return round(100.0 * hit / found, 2)
 
@@ -72,6 +85,14 @@ def pct(hit: int, found: int) -> float | None:
 class Accumulator:
     def __init__(self) -> None:
         self._files: dict[str, FileCoverage] = {}
+        # Every measurement that was dropped, and why. These travel in the
+        # output JSON as well as to stderr: a consumer that only reads the
+        # JSON must not see a null and assume the file simply had no branches.
+        self.warnings: list[str] = []
+
+    def warn(self, message: str) -> None:
+        self.warnings.append(message)
+        print(f"warning: {message}", file=sys.stderr)
 
     def file(self, path: str) -> FileCoverage:
         path = normalize_path(path)
@@ -104,6 +125,17 @@ def read_text(path: str) -> str:
     """
     with open(path, "rb") as fh:
         raw = fh.read()
+    return decode_bytes(raw)
+
+
+def decode_bytes(raw: bytes) -> str:
+    """The decode half of read_text(), reusable by the stdin path.
+
+    `-` is a documented input and it used to go through sys.stdin, which
+    decodes UTF-8 and nothing else: the same UTF-16 report that normalizes
+    correctly from a file died on a UnicodeDecodeError traceback from a pipe.
+    One decoder for both paths is the only way those two stay in agreement.
+    """
     if raw.startswith(b"\xef\xbb\xbf"):
         return raw.decode("utf-8-sig", errors="replace")
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
@@ -259,15 +291,29 @@ def parse_jacoco(text: str, acc: Accumulator) -> None:
                 # a perfect score straight through.
                 raw_missed = counter.get("missed")
                 raw_covered = counter.get("covered")
+                label = f"{path}: {ctype or 'untyped'} counter"
                 if raw_missed is None or raw_covered is None:
-                    print(f"warning: {path}: {ctype or 'untyped'} counter is missing "
-                          "'missed' or 'covered'; skipping it — the totals below "
-                          "exclude this counter", file=sys.stderr)
+                    acc.warn(f"{label} is missing 'missed' or 'covered'; "
+                             "skipping it — the totals exclude this counter")
                     continue
                 try:
                     missed = int(raw_missed)
                     covered = int(raw_covered)
                 except ValueError:
+                    # A bare `continue` here dropped the counter without a
+                    # word, and a silently dropped counter is a silently
+                    # wrong total.
+                    acc.warn(f"{label} has non-integer values "
+                             f"(missed={raw_missed!r}, covered={raw_covered!r}); "
+                             "skipping it — the totals exclude this counter")
+                    continue
+                if missed < 0 or covered < 0:
+                    # missed="-5" covered="10" made found = 5 against 10 hit,
+                    # and printed 200%. Negative counts are not a measurement
+                    # of anything, so nothing here is salvageable.
+                    acc.warn(f"{label} has a negative count "
+                             f"(missed={missed}, covered={covered}); "
+                             "skipping it — the totals exclude this counter")
                     continue
                 if ctype == "LINE":
                     fc.lines_found += missed + covered
@@ -388,14 +434,54 @@ def normalize(text: str, fmt: str, *, source: str = "", strip_prefix: str = "",
     totals["line_pct"] = pct(totals["lines_hit"], totals["lines_found"])
     totals["branch_pct"] = pct(totals["branches_hit"], totals["branches_found"])
 
+    # pct() has already refused to turn a self-contradicting count into a
+    # percentage. That refusal shows up as a null, and a null is also what a
+    # file with no branches produces -- so without this, "nothing to measure"
+    # and "the report disagrees with itself" render identically.
+    for fc in files:
+        _flag_contradiction(acc, fc.path, "line", fc.lines_hit, fc.lines_found)
+        _flag_contradiction(acc, fc.path, "branch",
+                            fc.branches_hit, fc.branches_found)
+
     return {
         "schema": SCHEMA,
         "source_format": fmt,
         "source_file": source,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "warnings": list(acc.warnings),
         "totals": totals,
         "files": [f.to_dict(max_uncovered) for f in files],
     }
+
+
+def _flag_contradiction(acc: Accumulator, path: str, kind: str,
+                        hit: int, found: int) -> None:
+    """Warn when more was hit than exists. `found == 0` is deliberately NOT
+    exempt.
+
+    There used to be a `found > 0` guard here, and it carved out the one case
+    where silence is most dangerous. Cobertura's `condition-coverage="(3/0)"`
+    gives hit=3, found=0: pct() already refuses it, so branch_pct is null --
+    and null is also what a file with no branches produces. With the guard,
+    warnings stayed empty too, so "3 of 0 branches covered", which cannot
+    happen, rendered indistinguishably from "this file has no branches",
+    which happens constantly.
+
+    The line between the two is hit, not found:
+      * hit == 0 and found == 0 -- nothing to cover. Legitimate, common, and
+        stays silent: `hit > found` is False, so this function says nothing.
+      * hit  > 0 and found == 0 -- impossible. Warned, like every other
+        self-contradicting count.
+    """
+    if hit > found:
+        acc.warn(f"{path}: {hit} {_plural(kind)} recorded as covered out of "
+                 f"{found} that exist — the report contradicts itself, so "
+                 f"{kind} coverage for this file is reported as null, not as "
+                 "a percentage")
+
+
+def _plural(kind: str) -> str:
+    return f"{kind}es" if kind.endswith("ch") else f"{kind}s"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -415,7 +501,13 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if args.input == "-":
-        text, source = sys.stdin.read(), "<stdin>"
+        # Read bytes, not sys.stdin's UTF-8-only text: a UTF-16 report piped
+        # in used to die on a UnicodeDecodeError traceback while the identical
+        # file normalized correctly. getattr() because a test double, or any
+        # caller that replaced sys.stdin with a StringIO, has no .buffer.
+        buffer = getattr(sys.stdin, "buffer", None)
+        text = decode_bytes(buffer.read()) if buffer is not None else sys.stdin.read()
+        source = "<stdin>"
     else:
         if not os.path.exists(args.input):
             print(f"error: no such file: {args.input}", file=sys.stderr)
@@ -453,11 +545,17 @@ def main(argv: list[str] | None = None) -> int:
 
     payload = json.dumps(result, indent=2)
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as fh:
-            fh.write(payload + "\n")
+        write_text_atomic(args.out, payload + "\n")
         t = result["totals"]
+        # "null" rather than a number, spelled out: a percentage that is
+        # missing has to look different from one that is zero.
+        def shown(value):
+            return "not measured" if value is None else f"{value}%"
+        dropped = len(result["warnings"])
+        note = f", {dropped} measurement(s) dropped — see warnings above" if dropped else ""
         print(f"{source} [{fmt}] -> {args.out}: "
-              f"{t['files']} files, lines {t['line_pct']}%, branches {t['branch_pct']}%",
+              f"{t['files']} files, lines {shown(t['line_pct'])}, "
+              f"branches {shown(t['branch_pct'])}{note}",
               file=sys.stderr)
     else:
         print(payload)
