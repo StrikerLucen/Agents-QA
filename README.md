@@ -123,7 +123,8 @@ the incidents behind them, are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 | | |
 |---|---|
-| [docs/QUICKSTART.md](docs/QUICKSTART.md) | install, the zero-token fixture check, a first real run, reading a report |
+| [docs/INSTALL.md](docs/INSTALL.md) | step-by-step install, including from a private repo or a local folder, and what it costs in context |
+| [docs/QUICKSTART.md](docs/QUICKSTART.md) | the zero-token fixture check, a first real run, reading a report |
 | [docs/FAQ.md](docs/FAQ.md) | what this gets wrong, stated specifically — start here if you are skeptical |
 | [docs/RESEARCH.md](docs/RESEARCH.md) | the citation behind every non-obvious design decision |
 | [evals/SCORECARD.md](evals/SCORECARD.md) | the template that is still empty |

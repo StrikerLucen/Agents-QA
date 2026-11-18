@@ -14,14 +14,24 @@ tells you more than anything written here.
 /plugin install testsquad
 ```
 
+Typed **inside Claude Code** — `/plugin` is a slash command, and a shell answers it with
+`zsh: no such file or directory`. From a shell the equivalent is `claude plugin ...`.
+
+That form needs the repository to be public. For a private repository, a local folder, a
+non-default branch, or checking that the install worked, see
+**[INSTALL.md](INSTALL.md)**, which is the fuller version of this section.
+
 **Prerequisites:** Python 3.9+ and `git`. That is the whole list.
 
 The analysis scripts (`scripts/*.py`, ten modules; `cat scripts/*.py | wc -l`
 for the size, which this page got wrong by nearly half until 2026-11-16 and
 which moved twice more the same day) use the Python standard library only — no
 `pip install`, no virtualenv, no lockfile. `git` is needed
-because the risk map is computed from `git log`; without a history you get an
-empty risk map, reported as "no data", not "no risk". Everything else it runs is
+because the risk map is computed from `git log`. A directory with no history of its
+own does **not** give you an empty risk map: it falls through to the enclosing
+repository's history and ranks those files, with no warning. Measured 2026-11-17 on a
+clean clone — this page claimed the opposite until then, and the claim had never been
+run. See the warning in [INSTALL.md](INSTALL.md#the-zero-token-check). Everything else it runs is
 your project's own tooling, invoked exactly as your own config invokes it.
 
 ---
