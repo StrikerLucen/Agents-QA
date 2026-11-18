@@ -587,9 +587,132 @@ def readable_size(path: str) -> int:
     return size
 
 
-def estimate_tokens(path: str) -> int:
-    """Roughly 4 characters per token. Raises Unreadable, never OSError."""
-    return readable_size(path) // 4
+# --------------------------------------------------------------------------
+# Calibration
+# --------------------------------------------------------------------------
+#
+# What was measured: characters per token, for this corpus.
+# When:              2026-11-18.
+# With what:         `claude plugin details testsquad`, Claude Code CLI 2.1.276.
+# Over what:         the 23 shipped components (7 agents + 16 skills),
+#                    171,793 characters of frontmatter-stripped body.
+#
+# The CLI prints an always-on total of 3,121 tokens and a per-component
+# on-invoke figure for each of the 23. Solving those 23 constraints against the
+# measured character counts gives 2.86 chars/token for body prose and 3.11 for
+# the shorter, denser frontmatter prose. Reconstructing the always-on total
+# from 3.11 gives 3,110 against the printed 3,121 -- 0.35% out, which is what
+# makes the method believable.
+#
+# The honest limit of all of this: the CLI tokenizes two concatenated corpora
+# once and splits each total across components in proportion to character
+# count. So only the two corpus totals are measured. The per-component figures
+# are allocations of them, and NO tool available here -- including the CLI --
+# measures any single file's true token count. These numbers are a calibrated
+# estimate. They are not a tokenizer, and nothing should describe them as one.
+#
+# Why two constants and not one: frontmatter prose is denser than body prose.
+# Using 2.86 on the frontmatter corpus yields 3,374 for the always-on cost, a
+# number no tokenizer produced and 8% above the measured figure.
+#
+# Held as integers scaled by 100 so the arithmetic below stays exact and the
+# number printed is the number compared. The float forms are documentation;
+# they are derived from the integers, never written twice.
+CHARS_PER_TOKEN_BODY_X100 = 286
+CHARS_PER_TOKEN_FRONTMATTER_X100 = 311
+
+CALIBRATION = {
+    "measured_on": "2026-11-18",
+    "measured_against": "claude plugin details, Claude Code CLI 2.1.276",
+    "components": 23,
+    "body_chars": 171_793,
+    "chars_per_token_body": CHARS_PER_TOKEN_BODY_X100 / 100,
+    "chars_per_token_frontmatter": CHARS_PER_TOKEN_FRONTMATTER_X100 / 100,
+}
+
+# The provenance line the budget check prints. It lives in the output rather
+# than in a docstring on purpose: estimate_tokens() carried "Roughly 4
+# characters per token" in its docstring for the whole life of this file and
+# went stale invisibly, because a docstring is read never and the output is
+# read every run.
+#
+# Must not contain the substring "warn": scripts/project_state.py classifies
+# any line of this program's output containing it as a warning.
+BUDGET_UNIT_NOTE = (
+    f"unit: body characters / {CALIBRATION['chars_per_token_body']}, "
+    f"calibrated {CALIBRATION['measured_on']} against "
+    f"{CALIBRATION['measured_against']}; a calibrated estimate, not a tokenizer"
+)
+
+
+def tokens_from_chars(chars: int, per_token_x100: int) -> int:
+    """Characters to tokens, rounded up, in integer arithmetic throughout.
+
+    Rounded up so the gate never under-reports: a file is silent at exactly
+    the ceiling and warns one character past it, which makes the boundary
+    expressible as a character count a test can write.
+
+    Integer because the number printed must be the number compared. Computing
+    in float and formatting for display gives you two numbers that can
+    disagree, and `f"{4545.4545:,}"` renders the full repeating tail into a
+    message template that promises a token count.
+    """
+    return -(-chars * 100 // per_token_x100)
+
+
+def calibration_corpus(root: str) -> tuple[int, int]:
+    """The component count and body-character total the divisor was measured on.
+
+    Lives here rather than in the test that asserts on it for two reasons. The
+    validator is the thing that owns the calibration, so it should be able to
+    say what corpus the calibration describes. And a test that walks the live
+    checkout itself is what this project's own flake detector calls a
+    `live-repo` test -- it takes its answer from whichever tree happens to be
+    checked out. Keeping the walk here means the test names the tree it means
+    and asserts on a returned value.
+
+    Unreadable components are skipped rather than raising: this answers "has
+    the corpus drifted", and one unreadable file is a question for the checks
+    that open it, not a reason to refuse to answer this one. The count returned
+    is therefore a floor, and the caller is told so by name.
+    """
+    count = chars = 0
+    for pattern in ("agents/*.md", os.path.join("skills", "*", "SKILL.md")):
+        for path in sorted(glob.glob(os.path.join(root, pattern))):
+            try:
+                text = read_text(path)
+            except Unreadable:
+                continue
+            split = split_frontmatter(text)
+            chars += len(split[1] if split else text)
+            count += 1
+    return count, chars
+
+
+def body_tokens(path: str) -> int:
+    """Estimated tokens for the part of a component that is loaded on invoke.
+
+    The frontmatter is deliberately excluded. It is not free -- its name and
+    description are charged on *every* request, which is what
+    check_always_on_budget measures -- but it is not charged again when the
+    component runs, so counting it here would bill it twice and would do so
+    unevenly: frontmatter is 2.3% of agents/automation-engineer.md and 13.3%
+    of skills/scout/SKILL.md.
+
+    A file with no usable frontmatter block is measured whole. That is not a
+    silent fallback: check_markdown_component already errors on a missing or
+    unterminated block, so the loud verdict exists; this function just does
+    not invent a second one.
+
+    Characters, not bytes. A UTF-16 component weighs what it costs a model,
+    not what it costs a disk.
+
+    Raises Unreadable, never OSError.
+    """
+    text = read_text(path)
+    split = split_frontmatter(text)
+    body = split[1] if split else text
+    return tokens_from_chars(len(body), CHARS_PER_TOKEN_BODY_X100)
 
 
 def check_context_budget(root: str, r: Report) -> None:
@@ -607,8 +730,11 @@ def check_context_budget(root: str, r: Report) -> None:
     its bytes could be obtained, and there are not too many of them. It says
     nothing about placeholders, frontmatter or whether the file is coherent.
     Both halves are load-bearing: a size alone is not a verdict on contents,
-    and until estimate_tokens() opened the file a mode-000 template produced
-    a clean "Validation passed" about a file nobody had read.
+    and until the size came from a call that opens the file, a mode-000
+    template produced a clean "Validation passed" about a file nobody had
+    read. (That call was estimate_tokens(), retired 2026-11-18; the opening
+    is now readable_size() / read_text() directly. The property it bought is
+    what matters, not which function held it.)
     """
     # The fourth field is whether this is the ONLY check in the program that
     # opens these files. It decides what the messages below are allowed to

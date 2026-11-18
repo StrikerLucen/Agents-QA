@@ -22,10 +22,12 @@ finding must be actionable, its reasoning obvious, and it must arrive in the wor
 
 ## Binding
 
-`${CLAUDE_PLUGIN_ROOT}/templates/report/STYLE.md` is binding, not advisory. Its 13-point
-review checklist runs against the draft **before publishing**, and a `no` on any line
-blocks publication. The `reporter` agent reads it and complies; you check the result
-before it ships. The lines most often broken: one verdict sentence of ≤25 words at the
+`${CLAUDE_PLUGIN_ROOT}/templates/report/RULES.md` is binding, not advisory. Its **Hard
+rules** run against the draft **before publishing**, and a `no` on any line blocks
+publication. The `reporter` agent reads it and complies; you check the result before it
+ships. `STYLE.md` holds the reasoning, the evidence and the before/after examples behind
+those rules — read it to justify a rule or to change one, not on every run. The lines
+most often broken: one verdict sentence of ≤25 words at the
 very top, symptom headlines with no file paths or exception names, ≤10 items in the top
 section, emphasis on no more than `max(2, floor(0.30 × rows))` of the rows, a literal
 command under every number, and bugs (product) separated from issues (testing) in two
@@ -98,17 +100,43 @@ did not ask you to comment on.
 
 ## Default — the dashboard
 
-**Dispatch the `reporter` agent.** Assembling the dashboard is its whole job: it is bound
-to `STYLE.md`, it separates reproduced bugs from unreproduced issues, it clusters by root
-cause, and it tracks which checks produce findings nobody acts on. Hand it the run's
+**This path is deterministic too. The agent writes prose; a script writes the page.**
+
+**Step 1 — dispatch the `reporter` agent.** Judging the findings is its whole job: it is
+bound to `RULES.md`, it separates reproduced bugs from unreproduced issues, it clusters by
+root cause, and it tracks which checks produce findings nobody acts on. Hand it the run's
 findings and the paths under `.testing/` they came from. Keep for yourself anything that
 needs the user — it cannot prompt, and it has no `Bash`, so it measures nothing and
 publishes nothing.
 
-It renders `.testing/reports/dashboard-<date>.html` from
-`${CLAUDE_PLUGIN_ROOT}/templates/report/dashboard.html`, in the fixed section order:
-verdict, what changed since the last report, top actions, the capped findings queue,
-coverage and health, exploratory charters, collapsed appendix.
+It writes **`.testing/report-data.json`** — the prose only: the verdict sentence, the top
+actions, each finding's title, cause and cost, the coverage note, the charters, the
+appendix. It does not write HTML, and it never opens `dashboard.html`.
+
+**Step 2 — render the page:**
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/render_dashboard.py" \
+  --testing-dir .testing --out ".testing/reports/dashboard-$(date +%F).html"
+```
+
+The script splices that JSON into the template's data slot and emits the fixed section
+order: verdict, what changed since the last report, top actions, the capped findings
+queue, coverage and health, exploratory charters, collapsed appendix.
+
+**Two things the split buys, and they are the reason for it:**
+
+- **Every measured number is computed by the script and overwrites whatever the agent
+  supplied.** "Never state a number you did not measure" stops being a rule the agent is
+  asked to follow and becomes one it cannot break: the trust counts come from
+  `health-baseline.json`, the qualifying count from `findings.json`. `--explain` lists
+  every field a measurement overrode. When an input could not be read, the number is
+  **dropped** and the page says which rerun would produce it — an absent count sends the
+  reader somewhere, an invented one does not.
+- **The fork-safety above now covers this path as well.** Finding text comes from branch
+  names, test names and assertion messages, which on a fork are attacker-controlled. A
+  model hand-writing HTML from that text is the hole the `--pr` path was careful not to
+  have; here the text goes in as JSON and the template escapes it.
 
 It must read correctly in light mode, dark mode, grayscale and at 360px with no
 horizontal scroll — colour is never the only signal, so every status carries an icon and

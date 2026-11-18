@@ -48,6 +48,7 @@ import flake_smells as fsm  # noqa: E402
 import normalize_coverage as ncov  # noqa: E402
 import pr_comment as prc  # noqa: E402
 import project_state as pstate  # noqa: E402
+import render_dashboard as rdash  # noqa: E402
 import risk_map as rmap  # noqa: E402
 import session_context as sctx  # noqa: E402
 import validate_plugin as vplug  # noqa: E402
@@ -1408,10 +1409,10 @@ class ConcurrencyTests(TempMixin, unittest.TestCase):
     # quoted in its docstring, which is why the scan keys on the flag.
     OUT_WRITERS = ["arid_nodes.py", "env_safety_check.py", "flake_smells.py",
                    "normalize_coverage.py", "pr_comment.py",
-                   "project_state.py", "risk_map.py"]
+                   "project_state.py", "render_dashboard.py", "risk_map.py"]
 
     # Enough rounds that a truncation window of a millisecond or two is
-    # sampled, few enough that seven writers stay well under two seconds.
+    # sampled, few enough that eight writers stay well under two seconds.
     ATOMIC_ROUNDS = 5
 
     def _probe_inputs(self):
@@ -1439,14 +1440,26 @@ class ConcurrencyTests(TempMixin, unittest.TestCase):
         self.write("probe/repo/a.py", "def f():\n    return 1\n")
         git(repo, "add", "-A")
         git(repo, "commit", "-q", "-m", "seed")
+        # render_dashboard.py reads a directory, not a file: the reporter's
+        # prose plus at least one measured input, or it refuses with exit 2
+        # and writes nothing, which would make the oracle below trivially
+        # true. findings.json is the cheapest input that counts as measured.
+        testing = self.path("probe/testing")
+        os.makedirs(testing, exist_ok=True)
+        self.write("probe/testing/report-data.json", json.dumps(
+            {"meta": {"title": "probe"},
+             "verdict": {"state": "info", "text": "probe"},
+             "coverage": {"note": "probe"}}))
+        self.write("probe/testing/findings.json", json.dumps(
+            {"findings": [{"severity": "S3", "title": "probe finding"}]}))
         os.makedirs(self.path("probe/out"), exist_ok=True)
-        return src, big_lcov, data, repo
+        return src, big_lcov, data, repo, testing
 
     def _out_writer_probes(self):
-        """(script name, run) for every one of the seven `--out` writers.
+        """(script name, run) for every one of the eight `--out` writers.
 
         In-process rather than by subprocess: `main(argv)` reaches the same
-        writer either way, and seven writers times six interpreter startups
+        writer either way, and eight writers times seven interpreter startups
         would buy nothing but seconds. `project_state`'s ROOT is pointed at
         the fixture for the reason its own tests do it -- measuring the live
         repository here would make this test depend on the branch, the dirty
@@ -1454,8 +1467,8 @@ class ConcurrencyTests(TempMixin, unittest.TestCase):
         """
         self.assertIsNotNone(
             arid, "arid_nodes.py is missing from scripts/, so one of the "
-                  "seven --out writers cannot be exercised at all")
-        src, big_lcov, data, repo = self._probe_inputs()
+                  "eight --out writers cannot be exercised at all")
+        src, big_lcov, data, repo, testing = self._probe_inputs()
 
         def project_state(out):
             with mock.patch.object(pstate, "ROOT", src):
@@ -1470,6 +1483,9 @@ class ConcurrencyTests(TempMixin, unittest.TestCase):
             ("pr_comment.py",
              lambda out: prc.main(["--data", data, "--out", out])),
             ("project_state.py", project_state),
+            ("render_dashboard.py",
+             lambda out: rdash.main(["--testing-dir", testing,
+                                     "--repo", repo, "--out", out])),
             ("risk_map.py", lambda out: rmap.main([repo, "--out", out])),
         ]
 
@@ -1493,8 +1509,8 @@ class ConcurrencyTests(TempMixin, unittest.TestCase):
         """Rewrite the destination while a reader samples it, and assert the
         reader never caught it short.
 
-        The oracle is a size, not a parse, because two of the seven write text
-        rather than JSON: `write_text_atomic` renames a finished temp file
+        The oracle is a size, not a parse, because three of the eight write
+        text or HTML rather than JSON: `write_text_atomic` renames a finished temp file
         onto the destination, so the smallest size a reader can ever observe
         is the size of a whole report. `open(path, "w")` holds it at zero
         bytes and then at a prefix -- however the truncation is reached, and
@@ -1570,7 +1586,7 @@ class ConcurrencyTests(TempMixin, unittest.TestCase):
                 self.assert_never_observed_truncated(name, run)
 
     def test_every_out_writer_is_atomic(self):
-        """The lint half: all seven `--out` writers go through atomic_io.
+        """The lint half: all eight `--out` writers go through atomic_io.
 
         This is a source scan, and a source scan cannot see a truncation that
         goes through a variable, a helper or a second file -- it was measured

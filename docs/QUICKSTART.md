@@ -242,7 +242,7 @@ Reproduce any of these yourself:
 
 ```sh
 python3 -c "import sys; sys.path.insert(0,'scripts'); import validate_plugin as v; \
-print(v.estimate_tokens('agents/automation-engineer.md'))"
+print(v.body_tokens('agents/automation-engineer.md'))"
 ```
 
 ### When the answer is bad news
