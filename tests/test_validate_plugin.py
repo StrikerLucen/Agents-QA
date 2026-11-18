@@ -1328,5 +1328,112 @@ class CalibrationStalenessTests(unittest.TestCase):
             f"property of the text it was measured on. Re-measure it.")
 
 
+# --------------------------------------------------------------------------
+# reading a value nothing in scripts/ could read before
+# --------------------------------------------------------------------------
+
+class FieldTextTests(unittest.TestCase):
+    """field_text() against the shapes that actually occur."""
+
+    def test_a_plain_scalar_reads_as_itself(self):
+        self.assertEqual(vp.field_text("name: alpha\n", "name"), "alpha")
+
+    def test_a_folded_scalar_returns_its_text_not_its_marker(self):
+        """The whole reason this function exists: field() returns '>'."""
+        fm = "name: a\ndescription: >\n  one two\n  three\n"
+        self.assertEqual(vp.field("description" and fm, "description"), ">")
+        self.assertEqual(vp.field_text(fm, "description"), "one two three")
+
+    def test_a_literal_block_is_read_too(self):
+        fm = "description: |\n  one\n  two\n"
+        self.assertEqual(vp.field_text(fm, "description"), "one two")
+
+    def test_every_block_marker_variant_is_recognised(self):
+        for marker in vp.BLOCK_SCALAR_MARKERS:
+            with self.subTest(marker=marker):
+                fm = f"description: {marker}\n  body text\n"
+                self.assertEqual(vp.field_text(fm, "description"), "body text")
+
+    def test_an_unindented_line_ends_the_block(self):
+        """Without this the reader swallows the rest of the frontmatter and
+        the always-on total silently inflates."""
+        fm = "description: >\n  wanted\ntools: Read, Grep\nmodel: opus\n"
+        self.assertEqual(vp.field_text(fm, "description"), "wanted")
+
+    def test_quotes_are_stripped_from_a_plain_scalar(self):
+        self.assertEqual(vp.field_text('name: "alpha"\n', "name"), "alpha")
+
+    def test_a_missing_field_is_none_not_empty(self):
+        """None and "" mean different things: absent, versus present and
+        empty. A caller that cannot tell them apart reports 0 for both."""
+        self.assertIsNone(vp.field_text("name: a\n", "description"))
+
+    def test_every_shipped_component_has_readable_frontmatter_text(self):
+        """If this fails the always-on total is a floor and nobody noticed."""
+        import glob as _glob
+        for pattern in ("agents/*.md", "skills/*/SKILL.md"):
+            for path in sorted(_glob.glob(os.path.join(PLUGIN_ROOT, pattern))):
+                with self.subTest(component=os.path.basename(os.path.dirname(path))):
+                    fm, _ = vp.split_frontmatter(vp.read_text(path))
+                    self.assertTrue(vp.field_text(fm, "name"))
+                    desc = vp.field_text(fm, "description")
+                    self.assertTrue(desc)
+                    self.assertNotIn(desc, vp.BLOCK_SCALAR_MARKERS)
+
+
+class AlwaysOnBudgetTests(PluginTreeMixin, unittest.TestCase):
+    """The bill that is paid when nothing runs."""
+
+    def test_a_clean_tree_is_silent_and_reports_a_total(self):
+        report = vp.validate(self.tmp)
+        self.assertEqual([w for w in report.warnings if "always-on" in w], [])
+        self.assertGreater(report.always_on_tokens, 0)
+        self.assertEqual(report.always_on_components, 5)   # 3 agents + 2 skills
+
+    def test_a_fat_description_breaches_the_budget(self):
+        self.write("agents/alpha.md",
+                   "---\nname: alpha\ndescription: >\n  " + ("word " * 4000) +
+                   "\n---\n" + BODY)
+        report = vp.validate(self.tmp)
+        self.assertSurvivors(report, "always-on budget")
+        self.assertTrue(any("over the" in w and "always-on" in w
+                            for w in report.warnings), report.warnings)
+
+    def test_an_unreadable_component_makes_the_total_a_floor_and_says_so(self):
+        """Silence must never look like success: a component that could not be
+        measured contributed 0, and a total that quietly includes a 0 is a
+        wrong number stated confidently."""
+        self.replace_with_dir("agents/alpha.md")
+        report = vp.validate(self.tmp)
+        self.assertTrue(report.always_on_incomplete)
+        self.assertTrue(any("floor and not a total" in w for w in report.warnings),
+                        report.warnings)
+
+    def test_a_floor_already_over_the_ceiling_still_reports_the_breach(self):
+        """Reporting only 'incomplete' when the measured part is already over
+        would be silence wearing a hedge."""
+        self.write("agents/bravo.md",
+                   "---\nname: bravo\ndescription: >\n  " + ("word " * 4000) +
+                   "\n---\n" + BODY)
+        self.replace_with_dir("agents/alpha.md")
+        report = vp.validate(self.tmp)
+        breach = [w for w in report.warnings if "over the" in w and "always-on" in w]
+        self.assertTrue(breach, report.warnings)
+        self.assertIn("at least", breach[0])
+
+    def test_templates_are_not_counted(self):
+        """They ship into a user's repo; they are not in this plugin's
+        listing, so charging them here would invent a cost."""
+        before = vp.validate(self.tmp).always_on_tokens
+        self.write("templates/agents/zz.tmpl",
+                   "---\nname: zz\ndescription: >\n  " + ("word " * 2000) + "\n---\n")
+        self.assertEqual(vp.validate(self.tmp).always_on_tokens, before)
+
+    def test_the_quotable_summary_line_is_still_untouched(self):
+        """r.checked must not move: the stdout summary is pinned byte-for-byte
+        elsewhere and quoted verbatim in two docs."""
+        self.assertEqual(vp.validate(self.tmp).checked, 7)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

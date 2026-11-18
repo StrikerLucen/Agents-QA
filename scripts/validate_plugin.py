@@ -61,6 +61,12 @@ class Report:
         # Set when a directory could not be listed while enumerating the
         # above: the counts are then floors, not totals, and must say so.
         self.budget_scan_incomplete = False
+        # The same shape for the always-on measurement: components whose
+        # frontmatter could not be read or parsed contributed nothing to the
+        # total, so the total is a floor and the output must say whose.
+        self.always_on_tokens = 0
+        self.always_on_components = 0
+        self.always_on_incomplete: list[str] = []
 
     def error(self, where: str, message: str) -> None:
         self.errors.append(f"{where}: {message}")
@@ -177,6 +183,48 @@ def split_frontmatter(text: str) -> tuple[str, str] | None:
 def field(frontmatter: str, name: str) -> str | None:
     m = re.search(rf"^{re.escape(name)}:\s*(.+?)\s*$", frontmatter, re.M)
     return m.group(1) if m else None
+
+
+# A YAML block scalar: `>` folds newlines to spaces, `|` keeps them, and the
+# -/+ suffixes control the trailing newline.
+BLOCK_SCALAR_MARKERS = (">", "|", ">-", "|-", ">+", "|+")
+
+
+def field_text(frontmatter: str, name: str) -> str | None:
+    """field(), but it can read a block scalar's actual text.
+
+    field() returns the marker for these, not the value: against every shipped
+    component in this repo `field(fm, "description")` returns ">". Nothing in
+    scripts/ could read one of these values before -- check_markdown_component
+    works around it by *detecting* a folded description with a separate regex
+    and never extracting it -- so this is new, and it is why it is separate
+    rather than a fix to field(): field()'s other callers want the raw line.
+
+    The fold-versus-literal distinction is deliberately not implemented. The
+    only caller counts characters, and `>` and `|` differ solely in whether
+    the joiner is a space or a newline -- one character either way, per line.
+    Implementing YAML to decide that would be the wrong trade; implementing
+    half of YAML and calling it YAML would be worse.
+    """
+    m = re.search(rf"^{re.escape(name)}:[ \t]*(.*)$", frontmatter, re.M)
+    if m is None:
+        return None
+    first = m.group(1).strip()
+    if first not in BLOCK_SCALAR_MARKERS:
+        return first.strip("\"'")
+    lines, started = [], False
+    for line in frontmatter[m.end():].splitlines():
+        if not line.strip():
+            # Blank lines inside the block are part of it; blank lines before
+            # it starts are not.
+            if started:
+                lines.append("")
+            continue
+        if not line[:1].isspace():
+            break          # an unindented line ends the block
+        started = True
+        lines.append(line.strip())
+    return " ".join(x for x in lines if x)
 
 
 def check_plugin_json(root: str, r: Report) -> str | None:
@@ -556,6 +604,19 @@ BUDGETS = {
 # count to enumerate files that are not shipped components at all.
 # test_every_shipped_exemption_is_reachable in tests/test_validate_plugin.py
 # measures this by deletion and fails if an entry stops mattering again.
+# What the component listing costs on EVERY request: the name and description
+# of each agent and skill, which the host shows the model whether or not any of
+# them runs. Measured 2026-11-18 at ~3,110 tokens over 9,672 characters across
+# 23 components (the CLI printed 3,121; see CALIBRATION for why they differ by
+# 0.35%).
+#
+# 3,200 is ~3% of headroom. Enough that rewording one description for clarity
+# does not turn CI red; tight enough that a 24th component -- roughly 135
+# tokens of name and description -- breaches it, which is exactly the decision
+# that should be made deliberately rather than discovered in a bill. A ceiling
+# set at the measurement is a ceiling people route around.
+ALWAYS_ON_BUDGET = 3_200
+
 EXEMPT = {
     "templates/report/STYLE.md":     "rationale; only the reporter and humans read it",
 }
@@ -848,6 +909,75 @@ def check_context_budget(root: str, r: Report) -> None:
                    ".testing/profile.json, which /start already distilled")
 
 
+def check_always_on_budget(root: str, r: Report) -> None:
+    """Budget the cost this plugin charges on EVERY request.
+
+    The per-file ceilings govern what a component costs when it runs. This
+    governs what the plugin costs when nothing runs at all: the host puts each
+    component's name and description in the listing it shows the model on
+    every single request, used or not. Measured 2026-11-18 at ~3,110 tokens
+    across 23 components, and until this check existed nothing in this
+    repository measured it -- while every file here argued about the ceilings
+    on the other, smaller bill.
+
+    It is the cheapest thing in the plugin to regress: a new skill adds ~130
+    tokens to every request, forever, and the diff that adds it looks like one
+    more directory.
+
+    Scope is agents/ and skills/ only, because that is what the host lists.
+    Templates ship into a user's repository and are not in this plugin's
+    listing; hooks are not either.
+
+    A warning, not an error, for consistency with every other budget breach --
+    and because --strict, which is what CI runs, fails on warnings anyway.
+    """
+    total = count = 0
+    for pattern in ("agents/*.md", os.path.join("skills", "*", "SKILL.md")):
+        for path in sorted(glob.glob(os.path.join(root, pattern))):
+            rel = os.path.relpath(path, root)
+            try:
+                text = read_text(path)
+            except Unreadable as exc:
+                r.always_on_incomplete.append(f"{rel} ({exc})")
+                continue
+            split = split_frontmatter(text)
+            if split is None:
+                # check_markdown_component already errors on this. Saying so
+                # again here would double-report one file; saying nothing
+                # would let it vanish from a total that is printed as fact.
+                r.always_on_incomplete.append(f"{rel} (no usable frontmatter block)")
+                continue
+            parts = [field_text(split[0], k) for k in ("name", "description")]
+            present = [x for x in parts if x]
+            if not present:
+                r.always_on_incomplete.append(f"{rel} (no name or description)")
+                continue
+            total += len(" ".join(present))
+            count += 1
+
+    r.always_on_tokens = tokens_from_chars(total, CHARS_PER_TOKEN_FRONTMATTER_X100)
+    r.always_on_components = count
+
+    if r.always_on_incomplete:
+        r.warn("always-on budget",
+               f"could not measure {len(r.always_on_incomplete)} component(s) -- "
+               f"{', '.join(r.always_on_incomplete)}. They contributed nothing to "
+               f"the total below, so it is a floor and not a total.")
+
+    if r.always_on_tokens > ALWAYS_ON_BUDGET:
+        # Deliberately also reported when the measurement is incomplete. A
+        # floor that is already over the ceiling is still over the ceiling,
+        # and reporting only "incomplete" there would be silence wearing a
+        # hedge.
+        floor = "at least " if r.always_on_incomplete else ""
+        r.warn("always-on budget",
+               f"~{floor}{r.always_on_tokens:,} tokens of name and description "
+               f"across {count} component(s), over the "
+               f"{ALWAYS_ON_BUDGET:,} budget -- this is charged on every request "
+               f"whether or not anything runs, so it is the most expensive prose "
+               f"in the plugin. Shorten a description, or drop a component.")
+
+
 def check_exemptions_resolve(root: str, r: Report) -> None:
     """An exemption for a file nobody wrote exempts nothing.
 
@@ -1043,6 +1173,9 @@ def validate(root: str) -> Report:
     guarded("hooks/hooks.json", r, check_hooks, root, r)
     guarded("layout", r, check_layout, root, r)
     guarded("context budget", r, check_context_budget, root, r)
+    # Next to the budget check so the two budget statements print together;
+    # before coverage, which must stay after check_context_budget.
+    guarded("always-on budget", r, check_always_on_budget, root, r)
     guarded("exemptions", r, check_exemptions_resolve, root, r)
     guarded("skills layout", r, check_skill_directories, root, r)
     # After the budget check, so it can see what that check weighed.
@@ -1091,6 +1224,14 @@ def main(argv: list[str] | None = None) -> int:
           f"{'/, '.join(COMPONENT_DIRS)}/ have no ceiling and were not "
           f"weighed (deliberate; see BUDGETS in {os.path.basename(__file__)}).",
           file=sys.stderr)
+    print(f"           {BUDGET_UNIT_NOTE}.", file=sys.stderr)
+    # Printed on every run, not only on a breach. A number that appears only
+    # when something is wrong is a number nobody has a baseline for, and this
+    # one is the plugin's largest recurring cost.
+    always_floor = "at least " if r.always_on_incomplete else ""
+    print(f"Always-on: ~{always_floor}{r.always_on_tokens:,} token(s) of name and "
+          f"description across {r.always_on_components} component(s), charged on "
+          f"every request (budget {ALWAYS_ON_BUDGET:,}).", file=sys.stderr)
     # The "floor, not a total" caveat is a real warning raised by
     # record_budget_coverage() and printed above with the others, not a bare
     # line here: printed here it was uncounted and --strict ignored it.
