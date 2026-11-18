@@ -10,7 +10,7 @@ tells you more than anything written here.
 ## 1. Install
 
 ```
-/plugin marketplace add thomaspino/testsquad
+/plugin marketplace add StrikerLucen/Agents-QA
 /plugin install testsquad
 ```
 

@@ -13,19 +13,18 @@ reports. Where something was *not* run, the page says so rather than implying it
 
 | Situation | Go to |
 |---|---|
-| The repository is **private** and you have access to it | [A — from a clone](#a-from-a-clone) |
+| You just want to use it | [C — straight from GitHub](#c-straight-from-github) |
+| You want to work on it, or need a specific branch | [A — from a clone](#a-from-a-clone) |
 | You already have the folder on this machine | [B — from a folder](#b-from-a-folder-you-already-have) |
-| The repository is public | [C — straight from GitHub](#c-straight-from-github) |
 
-As of 2026-11-17 `StrikerLucen/Agents-QA` is **private** (`gh repo view --json
-visibility`), so path C does not work for anyone yet.
+Most people want C. `StrikerLucen/Agents-QA` became public on 2026-11-17 (`gh repo view
+--json visibility`).
 
 ---
 
 ## A — from a clone
 
 ```sh
-gh auth login
 git clone --branch harden/silent-success-sweep https://github.com/StrikerLucen/Agents-QA.git
 claude plugin marketplace add ~/Agents-QA
 claude plugin install testsquad
@@ -36,9 +35,10 @@ do not appear in a session that was already running.
 
 Three traps, each of which has actually caught someone:
 
-- **Authenticate as the account that can see the repo.** The repo is private. A machine
-  logged into a different GitHub account gets a "not found" that reads exactly like a
-  typo.
+- **If the clone 404s, check which GitHub account you are logged in as.** The
+  repository is public now, so this should not happen — but while it was private, a
+  machine authenticated as a different account got a "not found" that reads exactly
+  like a typo. `gh auth status` is the check.
 - **Pass `--branch harden/silent-success-sweep`.** The default branch is `main`, and
   `main` predates the hardening work: missing fixture ground truth, a failing flake gate,
   no CI, and tests that could not fail. Omitting the flag installs that instead, with no
@@ -59,17 +59,16 @@ out `main` later silently swaps the plugin back to the un-hardened version.
 
 ## C — straight from GitHub
 
-Only once the repository is public:
-
 ```
-/plugin marketplace add <owner>/<repo>
+/plugin marketplace add StrikerLucen/Agents-QA
 /plugin install testsquad
 ```
 
-The owner/repo slug is deliberately left as a placeholder here. `plugin.json`,
-`CHANGELOG.md` and `QUICKSTART.md` currently name `thomaspino/testsquad` while the code
-lives at `StrikerLucen/Agents-QA`; until one of those is chosen as the canonical home,
-writing either one here would make this page wrong for somebody.
+Then **restart Claude Code**. This is the path for anyone who is not you: no clone, no
+`gh auth login`, nothing to build. The repository has been public since 2026-11-17.
+
+This pulls the **default branch**. That is only safe once the hardening work is on
+`main` — see the branch trap in path A.
 
 ---
 

@@ -112,5 +112,10 @@ ceiling before developers stop trusting a tool (§7); and per-language flake tax
 because async-wait causes 45% of Java flakes (74/161, the paper's own rounding) and
 is almost absent in Python — 3 instances in a study of 7,571 flaky tests (§19).
 
-[Unreleased]: https://github.com/thomaspino/testsquad/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/thomaspino/testsquad/releases/tag/v0.1.0
+[Unreleased]: https://github.com/StrikerLucen/Agents-QA/compare/main...harden/silent-success-sweep
+[0.1.0]: https://github.com/StrikerLucen/Agents-QA
+
+No `v0.1.0` tag exists — `git ls-remote --tags` returns nothing as of 2026-11-17.
+The two links above pointed at `thomaspino/testsquad` and at a tag that was never
+cut, so both were 404s. The 0.1.0 link goes to the repository root until a release
+is actually tagged; replace it then.
