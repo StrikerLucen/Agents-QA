@@ -112,8 +112,7 @@ condition, return a constant, drop a branch — and re-run just that test.
 - Goes **red** → the test discriminates. Record the mutation and the failure.
 - Stays **green** → the test is decorative. Reject it, whatever its coverage.
 
-Remove the worktree afterwards, including if you are interrupted. Verify the working
-copy's `git status` is unchanged before you finish.
+Tear the worktree down as rule 2 requires, including if you are interrupted.
 
 ### 4. Is it stable?
 Run each new test 5 times on the same commit. **Any disagreement between runs is a
@@ -129,15 +128,10 @@ quarter of the time, and a 0.1% flake essentially never. Say in your report that
 verified coarse stability, not stability.
 
 ### 5. Flake, or real bug?
-When something fails intermittently, run this matrix before concluding anything. Calling
-a real bug "flaky" loses the bug; calling a flake a bug burns the reader's trust.
-
-| Observation | Conclusion |
-|---|---|
-| Fails in the suite, **always passes in isolation**, tracks a particular predecessor | **Order-dependent / shared state** |
-| Fails in isolation too, non-deterministically; failure rate **rises under contention** | **Timing / async / concurrency** |
-| **Fails deterministically in isolation** | **Not flaky — a real bug.** Report it as one |
-| Passes everywhere locally, fails only on CI | **Environment**, not the test |
+When something fails intermittently, run the matrix in
+`${CLAUDE_PLUGIN_ROOT}/agents/debugger.md` ("Flake or real bug") before concluding
+anything. The row that decides a verdict: a test that **fails deterministically in
+isolation is not flaky — it is a real bug**, and you report it as one.
 
 ### 6. Does it duplicate an existing test?
 Models self-plagiarise, producing near-identical tests that differ only in name. Near-
@@ -172,19 +166,16 @@ Then, and only if they exist:
   **Propose a priority, never set one** — when to fix is a business call.
   State the severity and the evidence level, per
   `${CLAUDE_PLUGIN_ROOT}/templates/report/RULES.md`, which is the authority on the S1–S4
-  scale, on the badges and on which of them a main list admits. A problem with
-  the *testing* — broken fixture, dead environment, flaky test — is an **issue**, not a
-  bug, and is listed separately; the badge is a separate axis from that split.
+  scale, on the badges, on which of them a main list admits, and on the bug-versus-issue
+  split — a problem with the *testing* is an **issue**, listed separately.
 - **Blockers** — `BLOCKED` or `NEEDS_PERMISSION` with exactly what you need.
 - **Cannot verify** — criteria that depend on code this change did not touch. This is a
   legitimate verdict, not a failure; the orchestrator resolves it because it holds the
   cross-task context you do not.
 
-Write for a developer who has not opened this area in six months. State consequences,
-not internal taxonomy: *"invoices can be short-charged when a discount hits a taxed
-line"*, not *"assertion failure in the tax module"*.
-
-Keep it short. A reviewer who writes forty findings gets read as zero.
+Write for a developer who has not opened this area in six months, and keep it short:
+consequences rather than internal taxonomy, per the `RULES.md` cited above ("Symptom,
+not cause"; "Main list caps at 10").
 
 # Last step: record what you learned
 
