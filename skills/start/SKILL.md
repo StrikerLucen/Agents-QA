@@ -163,8 +163,9 @@ Playwright one. Three agents that match the stack, each with a sentence saying w
 eight generic ones.
 
 Every generated file is **fully regenerable**: stamp it with the plugin version and put
-nothing hand-written or learned inside it. All learning lives in `.testing/`.
-`/testsquad:upgrade` holds the rest of that rule, including `ts-<name>.local.md`.
+nothing hand-written or learned inside it. All learning lives in `.testing/`; stamp it
+too, in `.testing/schema-version`, which `/testsquad:upgrade` migrates from. It holds
+the rest of that rule, including `ts-<name>.local.md`.
 
 Derive the repo's conventions into `.testing/conventions.md` — a numbered rules file the
 agents *enforce*. Separating the rules from the enforcer means `/start` can refresh the
@@ -241,8 +242,7 @@ reusing cached results for packages whose files have not changed.
 | `.testing/preferences.json` | yes |
 | `.testing/risk-map.json` | yes |
 | `.testing/health-baseline.json` | yes |
-| `.testing/coverage-state.md` | yes |
-| `.testing/coverage-raw.json`, `coverage-diff.json` — `/diagnose` | yes |
+| `.testing/coverage-state.md`, `coverage-raw.json`, `coverage-diff.json` — `/diagnose` | yes |
 | `.testing/findings.json` — `/test`, `/debug` | yes |
 | `.testing/gates.json` — `/verify` | yes |
 | `.testing/mutation-plan.json` — `/mutate`; `tooling-radar.md` — `/scout` | yes |
@@ -252,18 +252,16 @@ reusing cached results for packages whose files have not changed.
 | `.testing/decisions.md` | yes |
 | `.testing/tasks/` | yes |
 | `.testing/tasks/current` — in-flight marker the guard hooks read; transient | no |
-| `.testing/bugs/` — one file per reported bug, so it survives the report | yes |
 | `.testing/roadmap.md` | yes |
 | `.testing/verification-log.md` | yes |
 | `.testing/env-safety.json` (redacted) | yes |
 | `.testing/feedback.json` — "not useful" clicks, feeds the EFP rate | yes |
 | `.testing/reports/` | **gitignored** |
+| `.gitignore` — add every **gitignored** row above to it | yes |
+| `.github/workflows/testsquad-pr.yml` — the PR Action, if offered at 13 | yes |
 
 Writes are atomic (temp file, then rename) and there is one file per item, so parallel
 agents cannot clobber each other or leave a half-written baseline.
-
-Add the **gitignored** rows above to `.gitignore` — the knowledge is worth committing,
-the generated HTML is not.
 
 ## Re-running
 

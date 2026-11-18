@@ -121,17 +121,73 @@ def run_git(repo: str, args: list[str]) -> str:
     return proc.stdout
 
 
-def assert_repo(repo: str) -> None:
+def resolve_repo(repo: str) -> tuple[str, str]:
+    """(git root actually used, this directory's path inside it).
+
+    `rev-parse --is-inside-work-tree` is true for ANY directory nested in ANY
+    repository, so on its own it cannot tell these two apart:
+
+      * a subdirectory of a monorepo, deliberately scoped -- legitimate;
+      * a directory with no history of its own, silently borrowing the
+        history of whatever repository happens to enclose it -- wrong.
+
+    Measured 2026-11-17: `risk_map.py examples/fixtures/node-ts` before the
+    fixture history was generated returned a confident ranking built from the
+    plugin's own commits, with `warnings: []`. Nothing in the output named the
+    repository the history came from, so the two cases rendered identically.
+    They are the same git state; only the caller knows which one they meant.
+    So the root is resolved, recorded, and said out loud whenever it is not
+    the directory that was asked for. The caller decides; the output can no
+    longer hide the question.
+
+    The second element is "" when `repo` IS the root. Both sides are compared
+    through realpath because git reports the physical path, so a repo reached
+    through a symlink (/var -> /private/var on macOS, and every tempdir under
+    it) would otherwise look like a subdirectory of itself.
+    """
     out = run_git(repo, ["rev-parse", "--is-inside-work-tree"]).strip()
     if out != "true":
         raise GitError(f"{repo} is not a git repository")
+    root = run_git(repo, ["rev-parse", "--show-toplevel"]).strip()
+    if not root:
+        # Never seen from a work tree, but a root we could not determine must
+        # not render as a root that matched: that is the silent-success shape
+        # this whole function exists to close.
+        raise GitError(
+            f"git rev-parse --show-toplevel returned nothing for {repo}; "
+            "refusing to rank files without knowing which repository's "
+            "history they came from"
+        )
+    rel = os.path.relpath(os.path.realpath(repo), os.path.realpath(root))
+    return root, "" if rel == os.curdir else rel.replace(os.sep, "/")
 
 
 RECORD_SEP = "\x1e"
 
 
+def strip_prefix(path: str, prefix: str) -> str | None:
+    """A root-relative git path as `ls-files` names it here, or None.
+
+    `git -C sub ls-files` prints paths relative to `sub`; `git -C sub log
+    --numstat` prints them relative to the repository ROOT. The two were
+    joined on a bare string match, so in a subdirectory they described
+    different namespaces and matched only by accident -- which is how
+    `node-ts/.gitignore` (2 lines) collected the churn of the enclosing
+    repository's own top-level `.gitignore` and ranked first at
+    relative_churn 8.5, measured 2026-11-17.
+
+    None for a path outside the subdirectory: it is not in `ls-files` here, so
+    it has nothing to be joined to.
+    """
+    if not prefix:
+        return path
+    head = prefix + "/"
+    return path[len(head):] if path.startswith(head) else None
+
+
 def read_history(repo: str, since: str | None, max_commits: int,
-                 diff_filter: str | None = None) -> list[dict]:
+                 diff_filter: str | None = None,
+                 prefix: str = "") -> list[dict]:
     """One dict per commit: sha, unix timestamp, subject, and per-file churn.
 
     --no-merges because a merge commit's numstat double-counts the work that
@@ -143,6 +199,12 @@ def read_history(repo: str, since: str | None, max_commits: int,
     between releases. Counting a file's creation as churn would give every
     file in a fresh import a relative_churn of 1.0 -- identical to a file that
     really was rewritten end to end.
+
+    `prefix` is this directory's path inside the repository root. When it is
+    set, history is scoped to that subdirectory with a pathspec and the paths
+    are rewritten into the same namespace `ls-files` uses here -- see
+    strip_prefix(). Without that, a monorepo subdirectory ranked nothing at
+    all and blamed the exclusion rules for it.
     """
     fmt = f"{RECORD_SEP}%H%x00%at%x00%s"
     args = ["log", "--no-merges", "--numstat", f"--format={fmt}",
@@ -151,6 +213,8 @@ def read_history(repo: str, since: str | None, max_commits: int,
         args.append(f"--diff-filter={diff_filter}")
     if since:
         args.append(f"--since={since}")
+    if prefix:
+        args += ["--", "."]  # cwd is `repo`, so this scopes to it
 
     commits: list[dict] = []
     for block in run_git(repo, args).split(RECORD_SEP):
@@ -178,7 +242,9 @@ def read_history(repo: str, since: str | None, max_commits: int,
             added, deleted, path = cols
             if added == "-" or deleted == "-":
                 continue  # binary file
-            path = _unrename(path)
+            path = strip_prefix(_unrename(path), prefix)
+            if path is None:
+                continue  # outside the scoped subdirectory
             try:
                 churn = int(added) + int(deleted)
             except ValueError:
@@ -409,10 +475,11 @@ def build(repo: str, *, since: str | None = None, max_commits: int = 20000,
           excludes: tuple[str, ...] = DEFAULT_EXCLUDES,
           include_tests: bool = False, top: int = 0,
           max_file_bytes: int = MAX_FILE_BYTES) -> dict:
-    assert_repo(repo)
-    commits = read_history(repo, since, max_commits)
+    git_root, prefix = resolve_repo(repo)
+    commits = read_history(repo, since, max_commits, prefix=prefix)
     # Separate pass: modifications only, for the churn numerator.
-    modifications = read_history(repo, since, max_commits, diff_filter="M")
+    modifications = read_history(repo, since, max_commits, diff_filter="M",
+                                 prefix=prefix)
     modified_churn: dict[str, int] = defaultdict(int)
     for commit in modifications:
         for path, lines in commit["files"]:
@@ -437,7 +504,7 @@ def build(repo: str, *, since: str | None = None, max_commits: int = 20000,
 
     # Authors need a second pass; --numstat and %an in one format is fiddly to
     # parse reliably, and contributor spread is only a tie-breaker.
-    author_by_sha = _authors_by_sha(repo, since, max_commits)
+    author_by_sha = _authors_by_sha(repo, since, max_commits, prefix=prefix)
 
     for commit in commits:
         weight = time_weight(commit["timestamp"], oldest, newest)
@@ -493,10 +560,25 @@ def build(repo: str, *, since: str | None = None, max_commits: int = 20000,
     # A window that caught nothing produces an empty map, which reads exactly
     # like "this repo is low risk". Say which it is.
     warnings = []
+    if prefix:
+        # First in the list on purpose: every number under it is scored from
+        # the history of a repository the caller did not name. Whether that is
+        # right is the caller's call -- but it can no longer be made silently.
+        warnings.append(
+            f"{os.path.abspath(repo)} is not a git repository root. Its "
+            f"history was read from the enclosing repository at {git_root}, "
+            f"scoped to '{prefix}/'. That is correct when you meant to scope "
+            "to a subdirectory of a monorepo. It is WRONG if this directory "
+            "was meant to have a repository of its own: then everything below "
+            "describes another project's history, not this one's. Check "
+            "git_root before you act on the ranking."
+        )
     if not commits:
         warnings.append(
-            f"No commits found in the window (since={since!r}). "
-            "This is absence of data, not absence of risk -- widen --since."
+            f"No commits found in the window (since={since!r})"
+            + (f" that touch '{prefix}/' in {git_root}" if prefix else "")
+            + ". This is absence of data, not absence of risk -- widen "
+            "--since."
         )
     elif not files:
         warnings.append(
@@ -534,6 +616,13 @@ def build(repo: str, *, since: str | None = None, max_commits: int = 20000,
     return {
         "schema": SCHEMA,
         "repo": os.path.abspath(repo),
+        # The repository the history actually came from, and where `repo`
+        # sits inside it ("" when they are the same directory). Always
+        # present, including in the ordinary case: a reader must be able to
+        # tell "the root is the directory I asked for" from "nobody recorded
+        # which root this was" without inferring either from an absence.
+        "git_root": git_root,
+        "path_in_repo": prefix,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "window": {
             "since": since,
@@ -559,10 +648,17 @@ def build(repo: str, *, since: str | None = None, max_commits: int = 20000,
     }
 
 
-def _authors_by_sha(repo: str, since: str | None, max_commits: int) -> dict[str, str]:
+def _authors_by_sha(repo: str, since: str | None, max_commits: int,
+                    prefix: str = "") -> dict[str, str]:
+    # Scoped to the same subdirectory as read_history(): --max-count applies
+    # before the pathspec, so an unscoped pass over a large monorepo can spend
+    # its whole budget on commits that never touched this directory and come
+    # back without the authors of the commits that did.
     args = ["log", "--no-merges", "--format=%H%x00%ae", f"--max-count={max_commits}"]
     if since:
         args.append(f"--since={since}")
+    if prefix:
+        args += ["--", "."]
     out: dict[str, str] = {}
     for line in run_git(repo, args).splitlines():
         sha, _, email = line.partition("\x00")
@@ -722,9 +818,16 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             print(f"error: cannot write {args.out}: {exc}", file=sys.stderr)
             return 2
+        # The git root is named even when it is the directory asked for. A
+        # headline that mentions the enclosing repository only when something
+        # is wrong teaches a reader to skim past it; one that always says
+        # which history it read makes the odd case legible at a glance.
         print(f"{len(result['files'])} files scored from "
               f"{result['window']['commits_analyzed']} commits "
-              f"-> {args.out}",
+              f"in {result['git_root']}"
+              + (f" (scoped to {result['path_in_repo']}/)"
+                 if result["path_in_repo"] else "")
+              + f" -> {args.out}",
               file=sys.stderr)
         for f in result["files"][:5]:
             print(f"  L{f['likelihood']}  {f['path']}  ({f['why']})", file=sys.stderr)

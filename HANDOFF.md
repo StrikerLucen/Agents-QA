@@ -1,6 +1,7 @@
 # HANDOFF — say "continue" and start here
 
-**State measured 2026-11-12.** Everything below was produced by running it, not by
+**State measured 2026-11-18**, superseding the 2026-11-12 header this file carried
+while its body was updated through 2026-11-16 and beyond. Everything below was produced by running it, not by
 recollection. Where this file and the code disagree, **the code wins** — re-measure with
 the commands in [Verify the state yourself](#verify-the-state-yourself).
 
@@ -25,7 +26,10 @@ python3 scripts/validate_plugin.py . --strict
 python3 scripts/flake_smells.py tests scripts --fail-on block
 ```
 
-`unittest discover` does not work in `tests/`; use the form above. Python 3.9 is the
+Use the form above; it is what CI runs. (`unittest discover` works too — measured
+2026-11-16, same tests, same result. This file claimed otherwise and the claim was
+never run. A wall of failures from *either* form means the fixture history was not
+regenerated.) Python 3.9 is the
 floor. Everything is stdlib — nothing to install.
 
 ---
@@ -42,9 +46,9 @@ produced by running the commands above, not by recollection.**
 | Own flake gate on own code | **exit 0 now.** A clone of `e9bdf9b` gives 9 `no-assertion` block findings and exit 1 — all 9 were false positives (assertions delegated to a `timed()` helper the rule cannot see), fixed on this branch |
 | Agents / skills / stacks | 7 / 16 / 10 |
 | Eval cases | 27, with 81 graders, over 11 claims |
-| Evals ever run | **No.** `evals/SCORECARD.md` is still a template |
+| Evals ever run | **Partly.** 3 of 27 cases, 2026-11-16: claim 1 scored **worse than no plugin** (mean Δ −0.20, p = 0.35). `evals/SCORECARD.md` is still a template because its rule 4 forbids publishing while any claim reads NO DATA, and 10 of 11 do. See [`evals/RUN-2026-11-16-partial.md`](evals/RUN-2026-11-16-partial.md) |
 
-**Built and measured**: the deterministic core — stdlib Python across nine scripts,
+**Built and measured**: the deterministic core — stdlib Python across ten scripts (`ls scripts/*.py`, measured 2026-11-18),
 each mutation-tested under the protocol in §5.
 
 **Written but not measured**: the seven agents and sixteen commands are prompts. The
@@ -107,6 +111,16 @@ did not know about are too.
 
 ## 4. Next, in priority order
 
+0. **A pattern worth naming before the list.** On 2026-11-18, four entries in this very
+   section were dispatched to agents and **three of them described defects that no
+   longer existed or never had**: the `/start` inventory (withdrawn in
+   `docs/PROMPT-REVIEW.md` two days earlier), the mode-000 template, the UTF-16 agent,
+   and the `no-assertion` false-positive rate. Each cost an agent a full run. A closed
+   finding left open in this file is not harmless: it is an instruction to go and fix
+   something that is already fine, and it crowds out the real defects — each of those
+   runs found one only because the agent measured before complying. **Close entries here
+   when they close, and when a finding is withdrawn elsewhere, withdraw it here too.**
+
 1. **Run the evals.** `cd evals && claude plugin eval`, then fill in `SCORECARD.md`.
    This is still the only thing that converts the eleven behavioural claims from design
    intent into evidence. `README.md` makes no behavioural claim and says why, under
@@ -130,13 +144,20 @@ did not know about are too.
      remain in `tests/test_integration.py` and `tests/test_fixture_manifest.py`, both
      parsing the test module's own source — a clarity nit, not this defect class, since
      a raise there is a loud test error rather than a silent wrong number.
-   - **`flake_smells`'s `no-assertion` rule cannot see an assertion delegated to a
-     same-file helper.** 9 of 9 findings on this repo were false positives: a **100%
-     rate** against the project's own ~10% switch-off threshold. The fix is intra-file
-     helper resolution — a real feature.
-   - **`flake_smells` emits the path as `"path"` in `summary["skipped"]` and `"file"`
-     in `skipped_files`.** It crashed a consumer today. Unifying is a schema change to
-     `testsquad.flakesmells/1`.
+   - *(rate stale 2026-11-18)* This said `no-assertion` had a **100% false-positive
+     rate** (9 of 9) on this repo. Re-measured 2026-11-18: `flake_smells.py tests`
+     returns **0 `no-assertion` findings**. Whatever closed it was never recorded here,
+     so the withdrawn finding was nearly dispatched again. The underlying limitation —
+     an assertion delegated to a same-file helper is invisible to a line scanner — is
+     real and unfixed; the rate attached to it is what was wrong.
+   - *(closed 2026-11-18, owner approved)* `flake_smells` emitted the path as `"path"`
+     in `summary["skipped"]` and `"file"` in `skipped_files`, which crashed a consumer.
+     Unified on `"file"`; schema bumped **`testsquad.flakesmells/1` → `/2`**, so a
+     pinned reader gets a loud "unknown schema" rather than a `KeyError` on a document
+     still advertising the old shape. Emitting both keys was rejected — it unifies
+     nothing and leaves the second to rot. **Still open, cheapest in the same bump:**
+     `result["files"][*]` keys its path as `"path"` while `findings[*]` use `"file"`,
+     a third spelling of one concept in one document.
    - **A shared reader for the consent record.** The contract is now pinned
      (`consent.execute_repo_commands` in `.testing/preferences.json`, four states,
      fail-closed) and `tests/test_consent_contract.py` guards it against drift. But it
@@ -152,21 +173,65 @@ did not know about are too.
      the command list the user agrees to, and nothing asserts that what it shows is the
      list the analyst later matches against. Two halves of one gate, pinned separately.
 4. **Smaller, well-specified cleanups** — each found and reported today, none urgent:
-   - `test_robustness.py:386/529/553/1279/1483` skip when `arid_nodes.py` is absent.
-     Those are missing-*production-code* skips, not platform guards, and should fail
-     like the fixture ones now do.
+   - *(closed 2026-11-18)* Missing-production-code skips in `test_robustness.py` now
+     fail loudly. **11 sites, not the 5 listed here** — the line numbers had drifted and
+     3 were not skips at all: `if arid is None: continue` silently dropped a script from
+     the loop and reported pass having examined one file fewer. With the module deleted
+     the file went from green-with-8-skips to 22 failures. Genuine platform guards (git,
+     filesystem, privilege, interpreter) were kept.
    - `pr_comment.py`'s `health-baseline.json` and `coverage-diff.json` have no wrapper
      key, so a `{}` there is still counted as an input that ran. Closing it means
      deciding which field is mandatory — a product call, not a guess.
-   - A mode-000 file in `templates/agents/*.tmpl` still passes validation; a UTF-16
-     agent `.md` validates clean. The second needs the real CLI to judge, not a guess.
-   - M15's last piece: the "What gets written" inventory in `skills/start/SKILL.md`
-     is missing `mutation-plan.json`, `tooling-radar.md`, `coverage-raw.json` and
-     `tasks/current`. M13, M14, M17 and M15's naming and CI halves are closed.
-   - **Four files are at their context ceiling** — re-measure before editing any of
-     them, the numbers move: `templates/ci/testsquad-pr.yml` (**5 bytes**),
-     `agents/automation-engineer.md`, `templates/agents/ts-qa-gatekeeper.md.tmpl`,
-     `skills/start/SKILL.md`. The next prose edit to any of them breaches the budget.
+   - *(both withdrawn 2026-11-18 — neither reproduced; a third, real defect found
+     while checking them)* A mode-000 file in `templates/agents/*.tmpl` is already
+     reported `UNKNOWN … could not be read`, exit 1. A UTF-16 agent `.md` already warns
+     and fails under `--strict`. The old "decode path" diagnosis is false twice over:
+     there is no `latin-1` decode in the file at all, and `read_text_sniffed()` uses
+     `errors="replace"` everywhere, so no decode-error branch exists to be unreachable.
+     **The real defect, found and fixed:** `glob.glob()` returns `[]` for a directory it
+     cannot list exactly as for an empty one. With `templates/agents` unlistable, all
+     four templates vanished, the weighed count fell 28 → 24, and the run printed
+     byte-for-byte what a healthy tree prints — exit 0. For a template the budget check
+     is the *only* check, so that lost every verdict. The lone hint was a bare `print()`
+     starting with "warning:" that was not in `r.warnings`, so it went uncounted and
+     `--strict` ignored it. **Still open, scope call:** a UTF-16 agent *template* does
+     validate clean, because templates are size-checked and never decoded.
+   - *(closed, and it was never open)* This entry claimed the "What gets written"
+     inventory in `skills/start/SKILL.md` was missing `mutation-plan.json`,
+     `tooling-radar.md`, `coverage-raw.json` and `tasks/current`. All four were
+     already in the table; `docs/PROMPT-REVIEW.md` records M15 withdrawn 2026-11-16
+     and this file was not updated, so the withdrawn finding was dispatched again on
+     2026-11-18 and cost an agent a run. Two *real* omissions were found instead —
+     `/start` also writes `.gitignore` and `.github/workflows/testsquad-pr.yml` — plus
+     one over-claim: `.testing/bugs/` was listed and nothing in the plugin creates it.
+   - **The context budgets are not measuring tokens, and the ceilings were never
+     calibrated.** `check_context_budget` computes `os.path.getsize(path) // 4` over the
+     whole file, frontmatter included, against a 4-chars-per-token constant nobody
+     measured. Recovered from `claude plugin details` (CLI 2.1.276) and solved across
+     all 23 components on 2026-11-18: this corpus runs **2.86 chars/token** of body text
+     and **3.11** for frontmatter prose, so the gate undercounts real tokens by ~30% —
+     a "3,500" ceiling admits about **4,900**. Three separate errors compound and partly
+     cancel: wrong divisor, frontmatter counted here but billed separately by the CLI,
+     and bytes vs characters. Two decisions are the owner's:
+     **(i)** redefine the unit — budget the frontmatter-stripped body and either label
+     the number as bytes or divide by the measured 2.9; **(ii)** then re-set the numeric
+     ceilings deliberately. Under a corrected unit five components would genuinely fail
+     (`automation-engineer` ~4,545, `debugger` ~4,147, `reporter` ~4,003, `start`
+     ~4,002, `qa-gatekeeper` ~3,677), so (ii) is not cosmetic. Also unguarded: the
+     ~**3,121 real tokens** the component listing adds to *every* request — the larger
+     bill, measured by nothing in this repo. Caveat on all of it: the CLI's per-component
+     figures are pro-rated allocations of two corpus totals, not per-file tokenizations,
+     so no tool here measures any single file's true token count.
+   - **One file is at its context ceiling**, not four. Measured 2026-11-18 with the
+     validator's own estimator against `BUDGETS` in `scripts/validate_plugin.py`:
+     `skills/start/SKILL.md` 2,995/3,000 (**headroom 5**);
+     `agents/automation-engineer.md` 3,410/3,500 (90);
+     `templates/agents/ts-qa-gatekeeper.md.tmpl` 1,535/1,800 (265);
+     `templates/ci/testsquad-pr.yml` 1,599 against **no ceiling at all** — the
+     validator weighs `agents/*.md`, `skills/*/SKILL.md`, `templates/agents/*.tmpl`
+     and `templates/report/RULES.md`, and never looks at `templates/ci/`. The
+     "**5 bytes**" in the previous wording was `skills/start/SKILL.md`'s headroom in
+     tokens, attached to the wrong file. Re-measure before editing: the numbers move.
      This is now a structural signal rather than four coincidences: the ceilings may be
      wrong for these roles, or these files need a deliberate dedup pass. Two
      restructuring levers were identified and not pulled, both in `docs/PROMPT-REVIEW.md`;

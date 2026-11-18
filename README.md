@@ -61,7 +61,7 @@ that afternoon. **The command is the answer; the number is not.**
 | Gate | What it enforces |
 |---|---|
 | the suite | 13 test modules in `tests/`, covering the ten modules in `scripts/` |
-| `validate_plugin.py --strict` | manifest validity, plus context budgets — 3,500 tokens per agent, 3,000 per skill, 1,600 per agent template, 1,200 for the report rules |
+| `validate_plugin.py --strict` | manifest validity, plus context budgets — 3,500 per agent, 3,000 per skill, 1,600 per agent template, 1,200 for the report rules. The unit is `bytes // 4`, **not** a tokenizer: measured 2026-11-18 this corpus runs ~2.86 chars/token, so a "3,500" ceiling admits roughly 4,900 real tokens |
 | `flake_smells.py` on `tests scripts` | the project's own flake detector (20 rules, `len(RULES)` measured 2026-11-16) run against the project's own tests, failing the build on any `block` finding |
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs all three on every push to
@@ -84,7 +84,7 @@ is not earned is worse than no badge.
 | `templates/` | what gets generated into a user's repo |
 | `examples/fixtures/` | 3 repos with planted defects; `MANIFEST.json` is ground truth |
 | `evals/` | 27 cases, 81 graders, 11 behavioural claims + a deterministic pre-gate, 5 runs per case — **3 cases run once, 2026-11-16; 10 of 11 claims still have no data** ([partial result](evals/RUN-2026-11-16-partial.md)) |
-| `docs/` | the citation ledger and three audits |
+| `docs/` | the citation ledger, three audits, and three user docs (quickstart, install, FAQ) |
 | `hooks/` | one hook ships enabled (`SessionStart`); three more are opt-in in `hooks/examples/` |
 
 `examples/fixtures/MANIFEST.json` records an expected verdict for all **71** fixture
@@ -123,7 +123,7 @@ the incidents behind them, are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 | | |
 |---|---|
-| [docs/INSTALL.md](docs/INSTALL.md) | step-by-step install, including from a private repo or a local folder, and what it costs in context |
+| [docs/INSTALL.md](docs/INSTALL.md) | step-by-step install — from GitHub, a clone, or a local folder — and what it costs in context |
 | [docs/QUICKSTART.md](docs/QUICKSTART.md) | the zero-token fixture check, a first real run, reading a report |
 | [docs/FAQ.md](docs/FAQ.md) | what this gets wrong, stated specifically — start here if you are skeptical |
 | [docs/RESEARCH.md](docs/RESEARCH.md) | the citation behind every non-obvious design decision |

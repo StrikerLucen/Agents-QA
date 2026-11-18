@@ -29,6 +29,11 @@ import validate_plugin as vp  # noqa: E402
 
 BODY = "x " * 300  # comfortably over MIN_BODY_BYTES, so a good component is clean
 
+# The real plugin, for the handful of tests whose subject is this repository's
+# own configuration rather than a fixture tree.
+PLUGIN_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
 
 def good_agent(name: str) -> str:
     return (f"---\nname: {name}\ndescription: >\n  does one thing, well\n"
@@ -605,6 +610,28 @@ class BudgetCoverageTests(PluginTreeMixin, unittest.TestCase):
         self.assertIn("at least", buf.getvalue())
         self.assertIn("is a floor, not a total", buf.getvalue())
 
+    def test_an_unlistable_directory_is_a_counted_warning(self):
+        """The caveat used to be a bare print() in main() beginning with the
+        word "warning:" that was not in r.warnings. It was never counted in
+        the "N warning(s)" summary and --strict walked straight past it, so a
+        directory of shipped components that could not be opened exited 0
+        while the run printed a line calling itself a warning. A label is not
+        a behaviour."""
+        locked = self.path("stacks/locked")
+        os.makedirs(locked)
+        self.write("stacks/locked/thing.md", "x" * 100)
+        os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o700)
+        if os.access(locked, os.R_OK):
+            self.skipTest("running as a user that ignores file permissions")
+        report = vp.validate(self.tmp)
+        hits = [w for w in report.warnings if "is a floor, not a total" in w]
+        self.assertTrue(hits, f"the caveat is not a counted warning: "
+                              f"{report.warnings!r}")
+        self.assertIn("stacks/locked", hits[0])
+        self.assertEqual(vp.main([self.tmp, "--strict"]), 1,
+                         "--strict passed over an unlistable component directory")
+
     def test_a_listable_tree_does_not_claim_an_incomplete_scan(self):
         # The false-positive guard: "at least" must not appear when the walk
         # saw everything, or the hedge becomes meaningless.
@@ -881,6 +908,119 @@ class ComponentDirectoryTests(PluginTreeMixin, unittest.TestCase):
         self.assertEqual(report.unvalidated, [])
 
 
+class TemplateDirectoryTests(PluginTreeMixin, unittest.TestCase):
+    """The same hole, one directory over, and this one survived.
+
+    agents/ was probed; the directories the *template* globs depend on were
+    not. Measured on this repository before this class existed: `chmod 000
+    templates/agents` printed "Validation passed: 26 component(s) checked, 0
+    warning(s), 0 could not be validated" and exited 0, while the number of
+    files weighed against a ceiling silently fell from 28 to 24. All four
+    agent templates had vanished from the run.
+
+    It is worse here than for agents/. check_context_budget() is the ONLY
+    check in the program that opens a template, so a glob that comes back
+    empty does not cost those files their budget verdict -- it costs them
+    every verdict there is, and the run says the same words it says about a
+    tree where all four are fine.
+    """
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(self.path("templates/agents"))
+        self.write("templates/agents/aaa.tmpl", "a" * 2000)
+        self.write("templates/report/RULES.md", "r" * 2000)
+        # The real EXEMPT names this file, and check_exemptions_resolve()
+        # reports an exemption whose directory exists without it. Writing it
+        # keeps the baseline clean, so a finding below is the injected one.
+        self.write("templates/report/STYLE.md", "y" * 4000)
+
+    def _lock(self, rel):
+        os.chmod(self.path(rel), 0o000)
+        self.addCleanup(os.chmod, self.path(rel), 0o700)
+        if os.access(self.path(rel), os.R_OK):
+            self.skipTest("running as a user that ignores file permissions")
+
+    def test_the_fixture_with_templates_is_clean(self):
+        # Without this the tests below could pass against a tree that was
+        # already failing for a reason that has nothing to do with listing.
+        self.assertBaselineIsClean()
+
+    def test_an_unlistable_template_directory_is_reported(self):
+        self._lock("templates/agents")
+        report = vp.validate(self.tmp)
+        hits = self.assertUnvalidated(report, "templates/agents")
+        self.assertIn("could not be listed", " ".join(hits))
+        self.assertSurvivors(report, "alpha.md", "one/SKILL.md")
+
+    def test_an_unlistable_template_directory_fails_the_run(self):
+        # Not --strict. A component with no verdict is already a failure, and
+        # exit 0 about four files nobody opened is the entire defect.
+        self._lock("templates/agents")
+        self.assertEqual(vp.main([self.tmp]), 1)
+
+    def test_the_message_says_the_templates_were_never_opened(self):
+        # For a template the budget is the only check, so "not enumerated"
+        # means "no verdict at all". A reader must not be left assuming some
+        # other check looked at the contents; none did.
+        self._lock("templates/agents")
+        hits = self.assertUnvalidated(vp.validate(self.tmp), "templates/agents")
+        self.assertIn("nothing else in this run opens these files",
+                      " ".join(hits))
+
+    def test_one_unlistable_directory_is_reported_once(self):
+        self._lock("templates/agents")
+        report = vp.validate(self.tmp)
+        self.assertEqual(
+            len([m for m in report.unvalidated if "templates/agents" in m]), 1,
+            f"one unlistable directory, one report: {report.unvalidated!r}")
+
+    def test_an_unlistable_report_directory_is_reported(self):
+        self._lock("templates/report")
+        report = vp.validate(self.tmp)
+        hits = self.assertUnvalidated(report, "templates/report")
+        self.assertIn("could not be listed", " ".join(hits))
+
+    def test_a_locked_directory_does_not_make_an_exemption_look_stale(self):
+        """os.path.exists() says False both for a file that is not there and
+        for one inside a directory that cannot be opened. The second was
+        reported as the first -- "that file does not [exist] -- delete it, or
+        create the file it was reserving" about a live exemption, printed by
+        the check whose whole purpose is to catch claims nobody verified."""
+        self.write("templates/report/STYLE.md", "y" * 4000)
+        self.exempt_table({"templates/report/STYLE.md": "rationale"})
+        self._lock("templates/report")
+        report = vp.validate(self.tmp)
+        self.assertEqual([w for w in report.warnings if w.startswith("EXEMPT:")],
+                         [], "a locked directory was read as a missing file")
+
+    def exempt_table(self, mapping):
+        original = vp.EXEMPT
+        vp.EXEMPT = mapping
+        self.addCleanup(setattr, vp, "EXEMPT", original)
+
+    # -- the false-positive guards, which are the whole judgement -----------
+
+    def test_an_empty_template_directory_stays_silent(self):
+        """A plugin may ship no templates. If this goes red the check has
+        started reporting a legitimate plugin, which costs more than the miss
+        it closed."""
+        os.remove(self.path("templates/agents/aaa.tmpl"))
+        report = vp.validate(self.tmp)
+        self.assertEqual(report.unvalidated, [])
+        self.assertEqual(report.errors, [])
+        self.assertEqual(report.warnings, [])
+
+    def test_an_absent_template_directory_stays_silent(self):
+        shutil.rmtree(self.path("templates"))
+        report = vp.validate(self.tmp)
+        self.assertEqual(report.unvalidated, [])
+        self.assertEqual(report.warnings, [])
+
+    def test_a_listable_template_directory_stays_silent(self):
+        self.assertEqual(vp.validate(self.tmp).unvalidated, [])
+
+
 # --------------------------------------------------------------------------
 # a per-file ceiling is an exception for one file, not a new default
 # --------------------------------------------------------------------------
@@ -1002,11 +1142,67 @@ class ExemptionResolutionTests(PluginTreeMixin, unittest.TestCase):
         """The regression guard on the real EXEMPT, not on a fixture. Two
         entries here named files that had never been written; this is the
         check that says so if it happens again."""
-        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
         missing = [rel for rel in vp.EXEMPT
-                   if not os.path.exists(os.path.join(root, *rel.split("/")))]
+                   if not os.path.exists(os.path.join(PLUGIN_ROOT,
+                                                      *rel.split("/")))]
         self.assertEqual(missing, [],
                          f"EXEMPT names files that do not exist: {missing!r}")
+
+    @staticmethod
+    def _snapshot(root):
+        """Everything a run of `root` reports, except the EXEMPT warnings.
+
+        Those are excluded deliberately. check_exemptions_resolve() reports on
+        the entries themselves, so an entry naming a file nobody wrote would
+        otherwise prove itself "reachable" by producing a warning about its
+        own deadness -- the test would then pass on exactly the config it
+        exists to catch.
+        """
+        r = vp.validate(root)
+        return (sorted(r.budgeted), sorted(r.unbudgeted),
+                sorted(w for w in r.warnings if not w.startswith("EXEMPT:")),
+                sorted(r.errors), sorted(r.unvalidated), r.checked)
+
+    def test_every_shipped_exemption_is_reachable(self):
+        """A file that exists is not the same as an exemption that does
+        anything, and this is the stricter half.
+
+        Only two sites consult EXEMPT: the `rel in EXEMPT` skip in
+        check_context_budget(), which sees only what the four budget globs
+        match, and the `rel not in EXEMPT` filter in record_budget_coverage(),
+        which sees only what lives under COMPONENT_DIRS. A key outside both
+        exempts nothing, changes no output, and still reads as a decision
+        somebody weighed -- dead config, which is a lie about what this gate
+        enforces.
+
+        `docs/RESEARCH.md` was such a key from the initial commit: docs/ is
+        not globbed for a budget and is not a COMPONENT_DIR, so no ceiling was
+        ever applied to it and there was nothing to exempt it from. Two more
+        entries in that first table named files that had never been written.
+        Three of the original four did nothing, and nothing said so.
+
+        Measured by deletion rather than argued from the source, so it stays
+        true when the sites move: an entry is reachable when removing it
+        changes what a run of this repository reports.
+        """
+        original = dict(vp.EXEMPT)
+        self.exempt(original)        # restores the real table when this ends
+        self.assertTrue(original, "EXEMPT is empty; nothing is being enforced")
+        baseline = self._snapshot(PLUGIN_ROOT)
+        for rel in original:
+            with self.subTest(entry=rel):
+                vp.EXEMPT = {k: v for k, v in original.items() if k != rel}
+                try:
+                    without = self._snapshot(PLUGIN_ROOT)
+                finally:
+                    vp.EXEMPT = original
+                self.assertNotEqual(
+                    without, baseline,
+                    f"EXEMPT entry {rel!r} is dead: deleting it changes "
+                    f"nothing this validator reports about {PLUGIN_ROOT}. "
+                    f"Either no check consults it, and the entry should go, "
+                    f"or the check that did has moved and the entry should "
+                    f"follow it. Leaving it is config that lies.")
 
 
 if __name__ == "__main__":

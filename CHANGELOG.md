@@ -7,7 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Work on `harden/silent-success-sweep`. The entry under 0.1.0 below was written at
+Everything below is on `main` as of 2026-11-18 (`harden/silent-success-sweep` merged
+in #1; `git log main..harden/silent-success-sweep` is empty). The entry under 0.1.0 was written at
 release and never revised; several of its claims were wrong when written and are
 corrected in place, with what was corrected noted where it is not obvious.
 
@@ -44,8 +45,13 @@ corrected in place, with what was corrected noted where it is not obvious.
 
 ### Not done — stated so silence does not read as success
 
-- **The evals have never run.** `evals/SCORECARD.md` is still a template, so every
-  behavioural claim in this file is design intent, not evidence.
+- **The evals have barely run, and the one result is bad.** A bounded run on 2026-11-16
+  took **3 of 27 cases**, all under claim 1, and the plugin scored **worse than no
+  plugin**: mean Δ −0.20, p = 0.35 at n=10 per arm. Ten of the eleven claims still have
+  no data, so `evals/SCORECARD.md` remains a template — its rule 4 forbids publishing
+  one while any claim reads NO DATA. Every behavioural claim in this file is still
+  design intent rather than evidence; the one place it was tested, the evidence pointed
+  the other way. See `evals/RUN-2026-11-16-partial.md`.
 - **`claude plugin validate --strict` passes**, run 2026-11-16 with CLI 2.1.276. It is
   **not** a superset of `scripts/validate_plugin.py . --strict` (26 components, 0
   warnings, 0 could not be validated, same date): the CLI validates the *marketplace

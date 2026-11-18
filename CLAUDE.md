@@ -87,8 +87,16 @@ defect in this repo, and most were caught by the project's own tools.
   silent — and say in the output that you stayed silent.
 - **Silence must never look like success.** "I could not read it", "nobody ran this"
   and "there is nothing wrong" must be distinguishable in every output.
-- **Context budgets are enforced** by `validate_plugin.py --strict`: 3,500 tokens per
-  agent, 3,000 per skill, 1,600 per template. Prose costs tokens on every request.
+- **Context budgets are enforced** by `validate_plugin.py --strict`: 3,500 per agent,
+  3,000 per skill, 1,600 per template. Prose costs tokens on every request.
+  - **The unit is `bytes // 4`, not tokens.** `check_context_budget` stats the whole
+    file, frontmatter included, and divides by a 4-chars-per-token constant nobody
+    measured. Against `claude plugin details` (CLI 2.1.276, 2026-11-18) this corpus is
+    ~**2.86 chars/token** of body text, so the gate undercounts by ~30%: "3,500" admits
+    ~4,900 real tokens. Redefining the unit, and then re-setting the ceilings, is an
+    open owner decision — see `HANDOFF.md` §4.
+  - The ~**3,121 real tokens** the component listing costs on *every* request are
+    measured by nothing here. That is the bill that never stops.
 - **Never edit product code to make a test pass.** Report the bug.
 
 ## Layout
@@ -102,11 +110,15 @@ defect in this repo, and most were caught by the project's own tools.
 | `templates/` | what gets generated into a user's repo |
 | `examples/fixtures/` | 3 repos with seeded bugs and decoys; `MANIFEST.json` is ground truth |
 | `evals/` | 27 cases, 11 falsifiable claims, scored as rates over 5 runs |
-| `docs/` | RESEARCH (the citation ledger) + four review documents |
+| `docs/` | RESEARCH (the citation ledger), 3 audits, 3 user docs — 7 files, `ls docs/*.md` |
 
 ## Known state
 
-`evals/SCORECARD.md` is still a template. **No behavioural claim has been measured.**
+`evals/SCORECARD.md` is still a template, because its rule 4 forbids publishing one
+while any claim reads NO DATA and **10 of 11 do**. One has been measured: a bounded run
+on 2026-11-16 took 3 of 27 cases, all under claim 1, and the plugin scored **worse than
+no plugin** (mean Δ −0.20; p = 0.35 at n=10 per arm, so not significant).
+[`evals/RUN-2026-11-16-partial.md`](evals/RUN-2026-11-16-partial.md) has the numbers.
 `README.md` says so, under *Read this before you believe anything else here* — its
 opening section, before anything about what the plugin does — and it should keep saying
 so until the evals actually run. (That README was written 2026-11-16. Before then there

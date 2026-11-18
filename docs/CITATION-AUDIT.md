@@ -26,7 +26,8 @@
 > finding is now closed, it says what was actually done and what command shows it.
 
 Scope: every quantitative or attributed claim in `agents/*.md` (7), `skills/*/SKILL.md`
-(16), `stacks/*.md` (9, including `dart-flutter.md`), `templates/report/{STYLE,RULES}.md`,
+(16), `stacks/*.md` (10 as of 2026-11-18, including `dart-flutter.md` and `swift.md`; this
+line said 9 and was never re-counted), `templates/report/{STYLE,RULES}.md`,
 `templates/agents/*.tmpl`, `templates/knowledge/*.md`, `scripts/*.py` docstrings and
 comments and `CHANGELOG.md`. Checked against `docs/RESEARCH.md`, the ledger.
 
@@ -78,6 +79,15 @@ comments and `CHANGELOG.md`. Checked against `docs/RESEARCH.md`, the ledger.
 > **One claim was deliberately *not* written into it.** The brief for this pass asserted
 > that `claude plugin validate --strict` "now runs and passes". It does not, and the
 > `CHANGELOG` says so instead: `which claude` → not found, and
+
+> **Amended 2026-11-18. This entry was wrong, and wrong in a way this ledger documents
+> elsewhere.** `claude plugin validate .` **does** run and **does** pass — measured
+> 2026-11-16 and again 2026-11-18 with CLI 2.1.276. `which claude` reported it missing
+> because the CLI lives at `~/.local/bin/claude`, which is not on the default `PATH`;
+> `HANDOFF.md` records that exact mistake costing a session. The rest of the entry
+> stands: the CLI is genuinely not on the CI runners, and it validates the *marketplace
+> manifest* only, so it is not a superset of `scripts/validate_plugin.py --strict` and
+> the stand-in is still what checks the other 25 components.
 > `.github/workflows/ci.yml` states in its own header comment *"No `claude` CLI job. The
 > CLI is not available on the runners"*. What runs, locally and in CI, is
 > `scripts/validate_plugin.py . --strict` — the stand-in — which passes at **26
@@ -172,8 +182,15 @@ genuinely unsourced material in this area. **It has since been fixed in
 **None of D-1…D-7 or N-1 reaches `docs/QUICKSTART.md`, `docs/FAQ.md` or `CHANGELOG.md`**
 (`grep -F`-confirmed 2026-11-16, all eight claims, against the three files that exist).
 ~~`README.md`~~ — the original sentence named `README.md` as a fourth file and said the
-set was "grep-confirmed" against it. **There is no `README.md` in this repository and
-never has been**, so that quarter of the check was never run and could not have been.
+set was "grep-confirmed" against it. **There was no `README.md` in this repository when
+this was written**, so that quarter of the check was never run and could not have been.
+
+> **Amended 2026-11-18.** The original wording was "and never has been". That is now
+> false: `README.md` was added in `c2ea0cf` on 2026-11-16, and
+> `git log --all --oneline --diff-filter=A -- README.md` — the command this file
+> nominates below as *the* evidence — returns it. The withdrawal above still stands on
+> the narrower point it actually rests on: no README existed on 2026-11-12, so the
+> check claimed against it could not have run. Only the absolute phrasing was wrong.
 The exposure is one tier down and
 real: `agents/tech-scout.md` and `skills/mutate/SKILL.md` are prompts the model is
 instructed to reproduce, and `scripts/arid_nodes.py` prints its `why=` strings — so
@@ -783,10 +800,17 @@ the repo.
 
 ~~`README.md:47`~~
 
-**This remediation was never applied, because the file it was applied to has never
-existed.** `find . -name 'README*' -not -path './.git/*'` returns nothing, and
-`git log --all --diff-filter=A -- README.md` returns nothing: there is no `README.md` in
-this repository and there never has been, in any commit on any branch.
+**This remediation was never applied, because the file it was applied to did not exist
+when the remediation was claimed.** As measured on 2026-11-12,
+`find . -name 'README*' -not -path './.git/*'` returned nothing and
+`git log --all --diff-filter=A -- README.md` returned nothing.
+
+> **Amended 2026-11-18.** Both commands now return a result: `README.md` was added in
+> `c2ea0cf` on 2026-11-16. The finding stands — the remediation was claimed against a
+> file that did not exist at the time — but the sentence "there never has been, in any
+> commit on any branch" has expired and is corrected here rather than left to be
+> quoted. A dated measurement that is allowed to read as a permanent fact is the same
+> defect this ledger exists to catch.
 
 The "Before" string is nowhere in the tree either. `git log --all -S "Batch bug lists"`
 returns exactly one commit — the initial commit — and `git grep -n "Batch bug lists"

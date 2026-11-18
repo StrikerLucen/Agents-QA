@@ -76,7 +76,15 @@ if __package__ in (None, ""):  # run as a script: scripts/ is already sys.path[0
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from atomic_io import write_text_atomic  # noqa: E402
 
-SCHEMA = "testsquad.flakesmells/1"
+# Bumped 1 -> 2 when summary["skipped"] stopped keying the path as "path" and
+# started keying it as "file", matching this script's own `skipped_files` and
+# every other emitter here. A renamed field in an emitted document is a
+# breaking change for anything downstream, and the version string is the only
+# place a consumer can find that out: leaving it at /1 would have handed a
+# pinned reader a document that claims the old shape and then raises KeyError
+# on it -- a silent break wearing the old version number. /2 makes it a loud
+# "unknown schema" instead, which is the failure this project prefers.
+SCHEMA = "testsquad.flakesmells/2"
 
 SEVERITIES = ("block", "warn", "info")
 
@@ -194,7 +202,46 @@ def detect_language(path: str) -> str | None:
 
 
 def is_test_file(path: str) -> bool:
-    return bool(TEST_FILE_PATTERN.search(path.replace(os.sep, "/")))
+    """True when `path` names a file this gate is allowed to scan.
+
+    The path is normalised BEFORE the pattern runs, and that is the whole
+    point of this function existing rather than being one inline `.search()`.
+    Without it, `tests/../scripts/risk_map.py` matched `(^|/)tests?/` and
+    every one of the test-only rules ran against production code: a sleep in
+    a retry loop, a bare `except`, a `time.sleep` in a backoff -- all correct
+    there, all reported. This project switches a check off entirely above
+    ~10% effective false positives, so a traversal path reaching production
+    code is the expensive direction of wrong, not a cosmetic one.
+
+    Separators are translated to "/" both before and after `normpath`,
+    because `ntpath.normpath` hands back `os.sep` and the pattern only knows
+    "/". `os.sep`/`os.altsep` are used rather than a blind `"\\" -> "/"`:
+    a backslash is a legal character in a POSIX filename, so rewriting it
+    there would invent separators that do not exist and turn a file really
+    called `a\\tests\\test_a.py` into a "test file" -- a false positive, the
+    one direction this file is not allowed to drift in.
+
+    What normalisation deliberately does NOT do: resolve symlinks. `..` is
+    collapsed lexically, so `tests/link/../test_a.py` is read as
+    `tests/test_a.py` even when `link` points elsewhere. Resolving would mean
+    touching the filesystem from a pure predicate, and the lexical reading is
+    the one the regex was written against.
+
+    Knock-on effects, measured rather than assumed: `""` and `"."` normalise
+    to `"."` (not a test file, as before); a trailing slash is dropped, so a
+    bare directory argument `"tests/"` is no longer called a test *file* --
+    `detect_language()` already rejects it before this is ever reached; and a
+    directory whose NAME merely contains dots, like `a/..b../tests.py`, is
+    untouched, because `normpath` only collapses a segment that is exactly
+    `..`.
+    """
+    norm = path.replace(os.sep, "/")
+    if os.altsep:
+        norm = norm.replace(os.altsep, "/")
+    norm = os.path.normpath(norm).replace(os.sep, "/")
+    if os.altsep:
+        norm = norm.replace(os.altsep, "/")
+    return bool(TEST_FILE_PATTERN.search(norm))
 
 
 # --------------------------------------------------------------------------
@@ -2202,7 +2249,7 @@ def scan_paths(paths: list[str], use_ast: bool = True, *,
         if not is_test_file(path):
             # Not a test file. Silence here is the point: a sleep in product
             # code is not a smell.
-            skipped.append({"path": path, "reason": "not a test file"})
+            skipped.append({"file": path, "reason": "not a test file"})
             continue
         raw, cut, why_not = read_lines_detailed(path, max_bytes=max_bytes,
                                                 max_line_chars=max_line_chars)
@@ -2216,7 +2263,7 @@ def scan_paths(paths: list[str], use_ast: bool = True, *,
             # had not caught. A permission error, a broken symlink and a
             # NUL-byte file need three different reactions from a reader.
             skipped.append({
-                "path": path,
+                "file": path,
                 "reason": why_not or "not read, and the reader did not say why",
             })
             continue
@@ -2256,7 +2303,16 @@ def scan_paths(paths: list[str], use_ast: bool = True, *,
     # "not a test file" is a decision, not a failure. `skipped_files` carries
     # only the test files this gate was supposed to read and could not -- the
     # ones whose silence would otherwise be mistaken for a clean result.
-    unread = [{"file": s["path"], "reason": s["reason"]} for s in skipped
+    #
+    # Both lists key the path as "file", and that is now true of every list
+    # this script emits as well as of arid_nodes.py, risk_map.py and
+    # env_safety_check.py. It used to be "path" here and "file" there, which
+    # is not a style quibble: a consumer walking summary["skipped"] with the
+    # key it had learned from skipped_files raised KeyError, which is a crash
+    # in a gate whose entire job is to say what it did NOT read. Renaming a
+    # field of a published document is a breaking change, so SCHEMA went to
+    # testsquad.flakesmells/2 in the same edit -- see the note there.
+    unread = [{"file": s["file"], "reason": s["reason"]} for s in skipped
               if s["reason"] != "not a test file"]
     # A truncated line is a *third* state, and it has to stay distinguishable
     # from both of the other two: the file was read (so it is not in
