@@ -540,8 +540,23 @@ BUDGETS = {
 # Keys are paths relative to the plugin root, and check_exemptions_resolve()
 # below holds them to that: an entry naming a file nobody wrote exempts
 # nothing while reading like a decision somebody made.
+#
+# AN ENTRY MUST ALSO BE REACHABLE, which is a second and stricter thing. Two
+# sites consult this table and only two: the `rel in EXEMPT` skip in
+# check_context_budget(), which sees only what the four budget globs match,
+# and the `rel not in EXEMPT` filter in record_budget_coverage(), which sees
+# only what lives under COMPONENT_DIRS. A key outside both is dead config --
+# it exempts nothing, changes no output, and still reads as a weighed
+# decision. `docs/RESEARCH.md` sat here from the initial commit and was never
+# reachable by either site: docs/ is not globbed for a budget and is not a
+# COMPONENT_DIR, because it is developer documentation that is never loaded
+# into a context window. Nothing had ever put it *inside* a budget, so
+# exempting it from one was a no-op, and it was removed rather than made
+# reachable -- adding docs/ to COMPONENT_DIRS would have taught the coverage
+# count to enumerate files that are not shipped components at all.
+# test_every_shipped_exemption_is_reachable in tests/test_validate_plugin.py
+# measures this by deletion and fails if an entry stops mattering again.
 EXEMPT = {
-    "docs/RESEARCH.md":              "human reference; never loaded at runtime",
     "templates/report/STYLE.md":     "rationale; only the reporter and humans read it",
 }
 
@@ -610,6 +625,42 @@ def check_context_budget(root: str, r: Report) -> None:
         (os.path.join(root, "templates", "report", "RULES.md"),
          BUDGETS["report-rules"], "report rules", True),
     ]
+    # EMPTY IS LEGITIMATE; UNLISTABLE NEVER IS -- the same rule check_layout()
+    # applies to agents/, applied to the directories the globs above depend
+    # on. glob.glob() returns [] for a directory it cannot list exactly as it
+    # does for one that is empty, so a locked templates/agents/ deleted all
+    # four agent templates from the run and said nothing: measured on this
+    # repo as "Validation passed: 26 component(s) checked, 0 warning(s), 0
+    # could not be validated" with `chmod 000 templates/agents`, which is
+    # byte-for-byte what a tree whose templates are all fine prints. For a
+    # template this check is the only one there is, so losing the glob loses
+    # the component entirely rather than merely its budget.
+    #
+    # Only these two are probed. agents/ is probed by check_layout() and
+    # skills/ by check_skill_directories(), each of which has to list its
+    # directory anyway and reports its own failure; probing them again would
+    # report one locked directory twice and inflate the count of components
+    # with no verdict. One listdir, one directory.
+    #
+    # An ABSENT directory stays silent, and that is the shape this must never
+    # fire on: a plugin that ships no templates is a real plugin. The only
+    # tree this fires on is one where the bytes of a shipped component are
+    # unreachable, so the false-positive risk is zero.
+    for rel_dir, label in (("templates/agents", "agent template"),
+                           ("templates/report", "report rules file")):
+        probe = os.path.join(root, *rel_dir.split("/"))
+        if not os.path.isdir(probe):
+            continue
+        try:
+            os.listdir(probe)
+        except OSError as exc:
+            r.cannot_validate(rel_dir, f"directory could not be listed ({exc}); no "
+                                       f"{label} in it was enumerated, so none of "
+                                       "them has a verdict, none is counted below "
+                                       "and nothing else in this run opens these "
+                                       "files -- this is not the same as a plugin "
+                                       f"that ships no {label}s")
+
     for pattern, group_ceiling, label, sole_check in checks:
         for path in sorted(glob.glob(pattern)):
             rel = os.path.relpath(path, root)
@@ -704,6 +755,18 @@ def check_exemptions_resolve(root: str, r: Report) -> None:
         if not os.path.isdir(parent):
             continue
         if not os.path.exists(target):
+            # "The file is not there" and "the directory holding it could not
+            # be opened" are different statements, and os.path.exists()
+            # answers False to both: a mode-000 templates/report/ made this
+            # tell the reader to delete a live exemption because its file was
+            # missing, when nothing had been able to look. The locked
+            # directory already gets a no-verdict report of its own in
+            # check_context_budget(); anything said about the entry here
+            # would be a guess wearing the costume of a finding.
+            try:
+                os.listdir(parent)
+            except OSError:
+                continue
             r.warn("EXEMPT",
                    f"{rel} is exempted from the context budget "
                    f"(\"{reason}\"), but {os.path.dirname(rel)}/ exists and "
@@ -735,12 +798,15 @@ def record_budget_coverage(root: str, r: Report) -> None:
     false positives gets switched off, taking the real rules with it.
     """
     budgeted = set(r.budgeted)
+    unlisted: list[str] = []
 
-    def unlistable(_exc: OSError) -> None:
+    def unlistable(exc: OSError) -> None:
         # os.walk swallows a directory it cannot list and walks on, which
         # would silently shrink the total and make the printed count a
         # confident understatement. Record it instead.
         r.budget_scan_incomplete = True
+        name = getattr(exc, "filename", None)
+        unlisted.append(os.path.relpath(name, root) if name else "a directory")
 
     for component in COMPONENT_DIRS:
         base = os.path.join(root, component)
@@ -752,6 +818,20 @@ def record_budget_coverage(root: str, r: Report) -> None:
                 if rel not in budgeted and rel not in EXEMPT:
                     r.unbudgeted.append(rel)
     r.unbudgeted.sort()
+    if unlisted:
+        # A finding, not just a hedge on the printed count. This used to be a
+        # bare print() in main() that began with the word "warning:" and was
+        # not in r.warnings: it was never counted in the "N warning(s)"
+        # summary and --strict passed straight over it, so a directory of
+        # shipped components that could not be opened exited 0. A line that
+        # calls itself a warning and does not behave like one is the same
+        # defect as silence, wearing a label.
+        r.warn("budget coverage",
+               "could not list " + ", ".join(sorted(set(unlisted))) +
+               f" under {'/, '.join(COMPONENT_DIRS)}/, so the count of files "
+               "with no ceiling is a floor, not a total -- whatever is inside "
+               "was neither weighed nor counted, and this is not the same as "
+               "a directory that is empty")
 
 
 def guarded(where: str, r: Report, fn, *args) -> object:
@@ -885,9 +965,9 @@ def main(argv: list[str] | None = None) -> int:
           f"{'/, '.join(COMPONENT_DIRS)}/ have no ceiling and were not "
           f"weighed (deliberate; see BUDGETS in {os.path.basename(__file__)}).",
           file=sys.stderr)
-    if r.budget_scan_incomplete:
-        print("warning: a directory under those paths could not be listed, so "
-              "the second number is a floor, not a total", file=sys.stderr)
+    # The "floor, not a total" caveat is a real warning raised by
+    # record_budget_coverage() and printed above with the others, not a bare
+    # line here: printed here it was uncounted and --strict ignored it.
 
     if r.errors:
         judged_wrong = len(r.errors) - len(r.unvalidated)

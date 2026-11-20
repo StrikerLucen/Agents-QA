@@ -1144,6 +1144,87 @@ class TestFileSelection(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertFalse(fs.is_test_file(path), path)
 
+    def test_a_traversal_out_of_a_test_directory_is_not_a_test_file(self):
+        """`tests/../scripts/risk_map.py` is production code.
+
+        Before the path was normalised, the `(^|/)tests?/` branch matched the
+        literal `tests/` that the `..` immediately cancels, so all twenty
+        test-only rules ran against production source. Every finding that
+        produced was a false positive, and this project switches a check off
+        entirely above ~10% effective false positives -- so this is the
+        expensive direction, not a tidy-up.
+        """
+        for path in ["tests/../scripts/risk_map.py",
+                     "./tests/../scripts/risk_map.py",
+                     "a/tests/../../scripts/risk_map.py",
+                     "spec/../src/app.js",
+                     "a/spec/../../src/app.js",
+                     "src/__tests__/../app.js",
+                     "/abs/tests/../src/app.py",
+                     "tests/..",
+                     "tests/../src/app.py"]:
+            with self.subTest(path=path):
+                self.assertFalse(fs.is_test_file(path), path)
+
+    def test_normalisation_keeps_real_test_paths(self):
+        """The fix must not buy its precision with recall.
+
+        A `..` or a `./` that does NOT cancel the test directory, an absolute
+        path, and a duplicated separator all still name test files.
+        """
+        for path in ["./tests/test_foo.py",
+                     "/abs/tests/test_foo.py",
+                     "../tests/test_a.py",
+                     "foo/../tests/test_a.py",
+                     "tests//test_a.py",
+                     "tests/./test_a.py",
+                     "tests/sub/../test_a.py",
+                     "./test_foo.py"]:
+            with self.subTest(path=path):
+                self.assertTrue(fs.is_test_file(path), path)
+
+    def test_dots_inside_a_directory_name_are_left_alone(self):
+        """Only a segment that is exactly `..` is a traversal.
+
+        A directory really called `..b..` is a legal name, and collapsing it
+        would lose a real test file -- a miss, which is the cheaper failure,
+        but still a wrong answer. `my..tests` is the mirror image: it has
+        never matched and must not start to.
+        """
+        self.assertTrue(fs.is_test_file("a/..b../tests.py"))
+        self.assertTrue(fs.is_test_file("a/..b../test_x.py"))
+        self.assertFalse(fs.is_test_file("my..tests/foo.py"))
+
+    def test_degenerate_paths_are_not_test_files(self):
+        """"" and "." both normalise to "." and must stay silent.
+
+        `normpath("")` is `"."`, which is the one case where normalisation
+        invents a character that was not in the input. It must not be read as
+        a path component that matches anything.
+        """
+        for path in ["", ".", "/", "./", "tests/"]:
+            with self.subTest(path=path):
+                self.assertFalse(fs.is_test_file(path), path)
+
+    def test_a_backslash_is_not_treated_as_a_separator_on_posix(self):
+        """Platform-aware, deliberately: `os.sep`/`os.altsep`, never a blind
+        `"\\\\" -> "/"`.
+
+        On POSIX a backslash is an ordinary filename character, so a single
+        file really named `a\\tests\\test_a.py` is production code with a
+        strange name, and rewriting it would invent a `tests/` directory --
+        a false positive. On Windows `os.sep` is the backslash and the same
+        string IS a test path, so the assertion is made against the host's
+        own separators rather than a hard-coded answer.
+        """
+        windows_style = "C:\\proj\\tests\\test_a.py"
+        if os.sep == "\\" or os.altsep == "\\":
+            self.assertTrue(fs.is_test_file(windows_style))
+            self.assertFalse(fs.is_test_file("C:\\proj\\tests\\..\\src\\a.py"))
+        else:
+            self.assertFalse(fs.is_test_file(windows_style))
+            self.assertFalse(fs.is_test_file("a\\tests\\test_a.py"))
+
 
 class TempTree(unittest.TestCase):
     def setUp(self):
@@ -1171,6 +1252,64 @@ class TestScanPaths(TempTree):
         self.assertEqual(result["summary"]["findings"], 0)
         self.assertEqual(result["summary"]["files_scanned"], 0)
         self.assertEqual(result["summary"]["files_skipped"], 1)
+
+    def test_production_code_reached_through_a_traversal_is_not_scanned(self):
+        """End to end, not just the predicate.
+
+        `iter_paths()` yields a non-directory argument verbatim, so a path
+        like `<root>/tests/../src/worker.py` -- which is how a CI invocation
+        or a `git diff --name-only` pipeline can legitimately spell it --
+        reaches `is_test_file()` with the `tests/` segment still in it. The
+        file it actually names is production code, and the twenty test-only
+        rules must not run on it. The `time.sleep` below is the canary: it is
+        a `sleep`-rule finding in a test file and correct code here.
+        """
+        self.write("src/worker.py",
+                   "import time\n"
+                   "def run():\n"
+                   "    time.sleep(2)\n")
+        os.makedirs(os.path.join(self.root, "tests"), exist_ok=True)
+        traversal = os.path.join(self.root, "tests", "..", "src", "worker.py")
+        result = fs.scan_paths([traversal])
+        self.assertEqual(result["summary"]["findings"], 0,
+                         result["summary"]["by_rule"])
+        self.assertEqual(result["summary"]["files_scanned"], 0)
+        # ... and the silence is accounted for: it is a decision ("not a test
+        # file"), which is not the same thing as a file this gate failed to
+        # read, so it belongs in the disposition log and NOT in skipped_files.
+        self.assertEqual([s["reason"] for s in result["summary"]["skipped"]],
+                         ["not a test file"])
+        self.assertEqual(result["skipped_files"], [])
+
+    def test_skipped_and_skipped_files_key_the_path_the_same_way(self):
+        """One document, one name for the path: `file`.
+
+        `summary["skipped"]` keyed it as `"path"` while `skipped_files` keyed
+        it as `"file"`, and a consumer that had learned one key from one list
+        raised KeyError on the other. Both now say `"file"`, matching
+        arid_nodes.py, risk_map.py and env_safety_check.py, and the rename is
+        why SCHEMA is testsquad.flakesmells/2.
+        """
+        self.write("src/worker.py", "def run():\n    return 1\n")
+        self.write("tests/test_blob.py", b"\x00\x01\x02\xff" * 64, binary=True)
+        result = fs.scan_paths([self.root])
+
+        disposition = result["summary"]["skipped"]
+        self.assertEqual(len(disposition), 2, disposition)
+        for entry in disposition:
+            with self.subTest(entry=entry):
+                self.assertIn("file", entry)
+                self.assertNotIn("path", entry)
+
+        unread = result["skipped_files"]
+        self.assertEqual(len(unread), 1, unread)
+        self.assertIn("file", unread[0])
+        self.assertNotIn("path", unread[0])
+
+        # The same path, spelled the same way, in both lists.
+        self.assertIn(unread[0]["file"], [e["file"] for e in disposition])
+        self.assertEqual(fs.SCHEMA, result["schema"])
+        self.assertEqual("testsquad.flakesmells/2", result["schema"])
 
     def test_binary_file_is_skipped_gracefully(self):
         self.write("tests/test_blob.py", b"\x00\x01\x02\xff" * 64, binary=True)

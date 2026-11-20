@@ -20,7 +20,7 @@
 #
 #   * If a job here is red, it is red because the repository really is in that
 #     state. Nothing is marked `continue-on-error`. A green badge that is not
-#     earned is worse than no badge. See CONTRIBUTING.md, "Expect red".
+#     earned is worse than no badge. See CONTRIBUTING.md, "If a gate is red".
 
 name: CI
 
@@ -90,10 +90,11 @@ jobs:
         run: ./regen_git_history.sh
 
       - name: Run the test suite
-        # Run by name, not by discovery. `python3 -m unittest discover` does
-        # not work from inside tests/ in this layout; this is the exact
-        # invocation documented in HANDOFF.md and CONTRIBUTING.md, and the one
-        # every contributor runs locally.
+        # Run by name, not by discovery. `discover` also works -- measured
+        # 2026-11-16, same tests, same result; the claim that it did not was
+        # never run. This form is used because it is the exact invocation
+        # documented in CONTRIBUTING.md and README.md, and the one every
+        # contributor runs locally, so a failure here reproduces there.
         working-directory: tests
         run: ls test_*.py | sed 's/\.py$//' | xargs python3 -m unittest
 

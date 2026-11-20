@@ -673,6 +673,278 @@ class TestWorkingSymlinksAreMeasuredAsLinks(unittest.TestCase):
         self.assertEqual(entry["lines"], 1)
 
 
+class TestHistorySourceIsNamed(unittest.TestCase):
+    """Which repository's history produced this ranking must be in the output.
+
+    `rev-parse --is-inside-work-tree` is true for any directory nested in any
+    repository, so these two states are identical to git and opposite to a
+    reader:
+
+      (a) scoping deliberately to a subdirectory of a monorepo -- legitimate;
+      (b) a directory with no history of its own, silently borrowing the
+          history of whatever encloses it -- wrong.
+
+    Measured 2026-11-17: `risk_map.py examples/fixtures/node-ts` before the
+    fixture history had been generated returned ten commits of the plugin's
+    own, ranked `.gitignore` at relative_churn 8.5, and said `warnings: []`.
+    Nothing named the repository it had read. That is this project's own rule
+    -- silence must never look like success -- broken in its own code.
+
+    (b) cannot be refused, because it is indistinguishable from (a) without
+    knowing the caller's intent. So every run records the root it used, and
+    says so out loud whenever it is not the directory that was asked for.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+
+    # Four commits touch sub/; two touch only the root. Pinned here because
+    # the scoped window has to report the first number and not the total.
+    ENCLOSING_COMMITS_TOUCHING_SUB = 4
+
+    def _enclosing(self):
+        """A repo whose history lives at the top level and in sub/."""
+        repo = Repo(self.root)
+        repo.write("sub/src/app.py", 10)
+        repo.write("outside.py", 10)
+        repo.commit("initial commit")
+        for i in range(3):
+            repo.write("sub/src/app.py", 10 + (i + 1) * 5)
+            repo.write("outside.py", 10 + (i + 1) * 40)
+            repo.commit("fix: wrong total" if i else "feat: more")
+        for i in range(2):
+            repo.write("outside.py", 200 + i * 50)
+            repo.commit("fix: nothing to do with sub")
+        return repo
+
+    @staticmethod
+    def _scope_warning(result):
+        return [w for w in result["warnings"] if "not a git repository root" in w]
+
+    def test_a_repository_root_records_the_root_it_used(self):
+        # The ordinary case still answers the question. "The root is what I
+        # asked for" and "nobody recorded a root" must not both be an absence.
+        self._enclosing()
+        result = rm.build(self.root, since=None)
+        self.assertEqual(os.path.realpath(result["git_root"]),
+                         os.path.realpath(self.root))
+        self.assertEqual(result["path_in_repo"], "")
+        self.assertEqual(self._scope_warning(result), [],
+                         "a run on a root has nothing to warn about")
+
+    def test_a_subdirectory_names_the_repository_it_actually_read(self):
+        self._enclosing()
+        sub = os.path.join(self.root, "sub")
+        result = rm.build(sub, since=None)
+
+        self.assertEqual(os.path.realpath(result["git_root"]),
+                         os.path.realpath(self.root))
+        self.assertEqual(result["path_in_repo"], "sub")
+        warned = self._scope_warning(result)
+        self.assertTrue(warned, "borrowing an enclosing repository's history "
+                                "must not be silent")
+        self.assertIn(os.path.realpath(self.root),
+                      os.path.realpath(warned[0].split(" at ")[-1].split(",")[0]),
+                      "the warning has to NAME the root, not merely mention "
+                      "that there was one")
+
+    def test_the_two_cases_do_not_look_alike(self):
+        # The whole point. The same directory, the same files, the same git
+        # answer to --is-inside-work-tree -- and output a reader can tell
+        # apart without knowing anything beyond what is printed.
+        self._enclosing()
+        sub = os.path.join(self.root, "sub")
+        borrowed = rm.build(sub, since=None)
+
+        own = tempfile.TemporaryDirectory()
+        self.addCleanup(own.cleanup)
+        standalone = Repo(own.name)
+        standalone.write("src/app.py", 10)
+        standalone.commit("initial commit")
+        standalone.write("src/app.py", 25)
+        standalone.commit("fix: wrong total")
+        direct = rm.build(own.name, since=None)
+
+        self.assertNotEqual(os.path.realpath(borrowed["git_root"]),
+                            os.path.realpath(borrowed["repo"]))
+        self.assertEqual(os.path.realpath(direct["git_root"]),
+                         os.path.realpath(direct["repo"]))
+        self.assertTrue(self._scope_warning(borrowed))
+        self.assertEqual(self._scope_warning(direct), [])
+
+    def test_a_monorepo_subdirectory_still_produces_a_useful_ranking(self):
+        # Naming the problem is not allowed to cost the legitimate case. A
+        # subdirectory with real history must still be ranked, with the churn
+        # that really happened to it -- before this, it ranked NOTHING and
+        # blamed the exclusion rules for it.
+        self._enclosing()
+        result = rm.build(os.path.join(self.root, "sub"), since=None)
+
+        ranked = {f["path"]: f for f in result["files"]}
+        self.assertIn("src/app.py", ranked,
+                      "a scoped subdirectory that was changed must be ranked")
+        self.assertGreater(ranked["src/app.py"]["churned_lines"], 0)
+        self.assertGreater(ranked["src/app.py"]["commits"], 1)
+        self.assertEqual(result["summary"]["files_ranked"], len(result["files"]))
+        # commits_analyzed is the headline the CLI prints. In a scoped run it
+        # has to count the commits that touched this directory -- counting
+        # the whole monorepo's would describe work this ranking never saw.
+        self.assertEqual(result["window"]["commits_analyzed"],
+                         self.ENCLOSING_COMMITS_TOUCHING_SUB)
+
+    def test_churn_from_outside_the_subdirectory_is_not_credited_to_it(self):
+        # The mechanism behind the 8.5: `git -C sub ls-files` prints paths
+        # relative to sub, `git -C sub log --numstat` prints them relative to
+        # the ROOT, and the two were joined on a bare string match. A 2-line
+        # sub/.gitignore therefore inherited the churn of the root's own
+        # .gitignore and ranked first.
+        repo = Repo(self.root)
+        repo.write("sub/.gitignore", 2)
+        repo.write("sub/src/app.py", 10)
+        repo.write(".gitignore", 2)
+        repo.commit("initial commit")
+        for i in range(4):
+            repo.write(".gitignore", 2 + (i + 1) * 30)
+            repo.write("sub/src/app.py", 10 + i)
+            repo.commit("chore: ignore more")
+
+        result = rm.build(os.path.join(self.root, "sub"), since=None)
+        ranked = {f["path"]: f for f in result["files"]}
+        self.assertIn(".gitignore", ranked,
+                      "sub/.gitignore is tracked here and must still appear")
+        self.assertEqual(ranked[".gitignore"]["churned_lines"], 0,
+                         "sub/.gitignore was never modified; the file that "
+                         "was churned is a different file at the root")
+        self.assertEqual(ranked[".gitignore"]["relative_churn"], 0.0)
+        self.assertNotIn("outside.py", ranked)
+
+    def test_a_subdirectory_with_no_history_of_its_own_says_which_root(self):
+        # Scoping found nothing: that must read as "no data for this path in
+        # THAT repository", not as a quiet clean bill of health.
+        repo = Repo(self.root)
+        repo.write("outside.py", 10)
+        repo.commit("initial commit")
+        quiet = os.path.join(self.root, "untracked_sub")
+        os.makedirs(quiet)
+
+        result = rm.build(quiet, since=None)
+        self.assertEqual(result["files"], [])
+        self.assertTrue(self._scope_warning(result))
+        self.assertTrue(any(os.path.realpath(self.root) in w
+                            for w in result["warnings"]),
+                        "an empty ranking must still name the repository it "
+                        "looked in")
+
+    def test_a_root_reached_through_a_symlink_is_not_called_a_subdirectory(self):
+        # git reports the physical path from --show-toplevel. Comparing it to
+        # an unresolved argument would make every repo under a symlinked
+        # parent (/var -> /private/var, and every macOS tempdir) warn that it
+        # had borrowed its own history -- a false positive on the ordinary
+        # case, which is how a warning gets switched off for good.
+        real = os.path.join(self.root, "real")
+        os.makedirs(real)
+        repo = Repo(real)
+        repo.write("src/app.py", 10)
+        repo.commit("initial commit")
+        repo.write("src/app.py", 20)
+        repo.commit("fix: wrong total")
+        link = os.path.join(self.root, "link")
+        try:
+            os.symlink(real, link)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable here")
+
+        result = rm.build(link, since=None)
+        self.assertEqual(result["path_in_repo"], "")
+        self.assertEqual(self._scope_warning(result), [])
+
+    def test_an_unknown_root_stops_rather_than_ranking_anyway(self):
+        # "git could not tell me which repository this is" must not render as
+        # "this repository". The ranking is refused instead: a map whose
+        # provenance is unknown is the exact shape this class exists to stop.
+        self._enclosing()
+        real = rm.run_git
+
+        def lying_git(repo, args):
+            if args[:2] == ["rev-parse", "--show-toplevel"]:
+                return "\n"
+            return real(repo, args)
+
+        rm.run_git = lying_git
+        self.addCleanup(setattr, rm, "run_git", real)
+        with self.assertRaises(rm.GitError) as caught:
+            rm.build(self.root, since=None)
+        self.assertIn("show-toplevel", str(caught.exception))
+
+    def test_the_cli_headline_names_the_history_source_in_both_modes(self):
+        self._enclosing()
+        sub = os.path.join(self.root, "sub")
+
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(rm.main([sub, "--since", ""]), 0)
+        self.assertIn(os.path.abspath(self.root), err.getvalue())
+
+        # The headline LINE itself, not merely somewhere on the stream: a
+        # reader who skims one line must still see which history was read.
+        # Asserting against the whole of stderr passed even with the root
+        # removed from the headline, because the warning below it happened to
+        # contain the same path.
+        headline = self._out_mode_headline(sub)
+        self.assertIn(os.path.abspath(self.root), headline,
+                      "the headline must name the repository the commits "
+                      "came from, not just the directory asked for")
+        self.assertIn("scoped to sub/", headline)
+
+        at_root = self._out_mode_headline(self.root)
+        self.assertIn(os.path.abspath(self.root), at_root,
+                      "the ordinary case names its root too; a line that "
+                      "only appears when something is wrong gets skimmed "
+                      "past when it does appear")
+        self.assertNotIn("scoped to", at_root)
+
+    def _out_mode_headline(self, repo):
+        """The one line --out mode prints above the top-five preview."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            out = os.path.join(out_dir, "risk.json")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(err):
+                self.assertEqual(
+                    rm.main([repo, "--since", "", "--out", out]), 0)
+            with open(out) as fh:
+                json.load(fh)
+            lines = [ln for ln in err.getvalue().splitlines() if out in ln]
+            self.assertEqual(len(lines), 1,
+                             "expected exactly one headline naming the "
+                             f"output file, got {lines!r}")
+            return lines[0]
+
+
+class TestStripPrefix(unittest.TestCase):
+    """Root-relative git paths rewritten into the namespace `ls-files` uses
+    inside a subdirectory. None means "outside this scope", which is not the
+    same as "at the top of it"."""
+
+    def test_no_prefix_is_a_passthrough(self):
+        self.assertEqual(rm.strip_prefix("a/b.py", ""), "a/b.py")
+
+    def test_a_path_inside_the_prefix_loses_it(self):
+        self.assertEqual(rm.strip_prefix("sub/a/b.py", "sub"), "a/b.py")
+
+    def test_a_path_outside_the_prefix_is_dropped_not_kept(self):
+        self.assertIsNone(rm.strip_prefix("other/b.py", "sub"))
+
+    def test_a_sibling_sharing_the_prefix_text_is_not_captured(self):
+        self.assertIsNone(rm.strip_prefix("submarine/b.py", "sub"))
+
+    def test_the_prefix_directory_itself_is_not_an_empty_path(self):
+        self.assertIsNone(rm.strip_prefix("sub", "sub"))
+
+
 class TestPercentile(unittest.TestCase):
     def test_bounds(self):
         vals = [1.0, 2.0, 3.0, 4.0]

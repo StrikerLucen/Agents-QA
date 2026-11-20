@@ -33,8 +33,18 @@ Use the form above; it is what CI runs and what every contributor runs locally.
 result. An earlier version of this file said it did not; that was never measured. If
 you get a wall of failures from *either* form, you skipped the fixture regeneration.
 
-The second gate enforces context budgets as well as manifest validity: 3,500 tokens per
-agent, 3,000 per skill, 1,600 per agent template. Prose costs tokens on every single
+The second gate enforces context budgets as well as manifest validity: 3,500 per
+agent, 3,000 per skill, 1,600 per agent template.
+
+**Those are not tokens, whatever the gate calls them.** `check_context_budget` computes
+`os.path.getsize(path) // 4` on the whole file, frontmatter included. Measured against
+`claude plugin details` on 2026-11-18 (CLI 2.1.276), this corpus tokenizes at about
+**2.86 characters per token** for body text, so the gate undercounts real tokens by
+roughly 30% and a "3,500" ceiling admits about **4,900**. The ceilings have never been
+calibrated against a real tokenizer; they were chosen under a 4-chars-per-token
+assumption that was never measured. Treat a budget number here as a byte proxy. Note
+also that nothing in the gate measures the ~**3,121 real tokens** the component listing
+adds to *every* request, which is the larger of the two bills. Prose costs tokens on every single
 request, so a file that grows past its budget is a regression in the product. If your
 change needs more room, pay for it by restructuring — usually some other file already
 says the same thing better.

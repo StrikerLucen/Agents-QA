@@ -24,6 +24,7 @@ committed. Platform-dependent cases skip rather than fail.
 
 import ast
 import contextlib
+import functools
 import io
 import json
 import os
@@ -51,10 +52,48 @@ import risk_map as rmap  # noqa: E402
 import session_context as sctx  # noqa: E402
 import validate_plugin as vplug  # noqa: E402
 
-try:  # arid_nodes only just landed; a missing module must not break the file.
+# The import is guarded so that ONE missing script does not take the other
+# two hundred tests in this file down with it -- not so that its absence can
+# pass quietly. Every test that needs the module calls require_arid() (or
+# wears @requires_arid) and FAILS when it is gone. A missing production
+# script is a broken checkout, not a platform this file does not apply to,
+# and a skip there is the "silence looks like success" defect this suite
+# exists to catch: the run reports green having tested nothing.
+ARID_IMPORT_ERROR = None
+try:
     import arid_nodes as arid
-except ImportError:  # pragma: no cover - depends on checkout
+except ImportError as _arid_exc:  # pragma: no cover - depends on checkout
     arid = None
+    ARID_IMPORT_ERROR = _arid_exc
+
+
+def require_arid(case):
+    """Fail -- never skip -- when scripts/arid_nodes.py did not import.
+
+    The message has to be unmistakably about the checkout rather than about
+    arid_nodes.py's behaviour, because the two land in the same red block of
+    a CI log and the reader's next move differs completely: restore a file,
+    versus debug a scanner.
+    """
+    if arid is None:
+        case.fail(
+            "PRODUCTION CODE MISSING, NOT A BUG IN THE CODE UNDER TEST: "
+            "scripts/arid_nodes.py could not be imported ({0}), so this test "
+            "exercised nothing and asserts nothing about arid_nodes.py. "
+            "Restore scripts/arid_nodes.py and re-run. This used to skip, "
+            "which made a checkout with the script deleted report green -- "
+            "silence must never look like success."
+            .format(ARID_IMPORT_ERROR))
+
+
+def requires_arid(test_method):
+    """Decorator form of require_arid(), replacing an @unittest.skipIf."""
+    @functools.wraps(test_method)
+    def wrapper(self, *args, **kwargs):
+        require_arid(self)
+        return test_method(self, *args, **kwargs)
+    return wrapper
+
 
 HAVE_GIT = shutil.which("git") is not None
 
@@ -551,7 +590,7 @@ class EncodingTests(TempMixin, unittest.TestCase):
         self.assertEqual(result["summary"]["files_scanned"], 0)
         skipped = result["summary"]["skipped"]
         self.assertEqual(len(skipped), 1, skipped)
-        self.assertIn("test_a.py", skipped[0]["path"])
+        self.assertIn("test_a.py", skipped[0]["file"])
         reason = skipped[0]["reason"]
         self.assertIn("binary", reason)
         # The same file must not ALSO be called unreadable: "I was denied
@@ -567,7 +606,7 @@ class EncodingTests(TempMixin, unittest.TestCase):
         # three independent wordings.
         self.assertIn("NUL byte in the first 8000 bytes", reason)
 
-    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    @requires_arid
     def test_arid_nodes_handles_latin1_and_nul(self):
         self.write("a.py", b"x = 1\ny = caf\xe9\n", binary=True)
         self.write("b.py", b"x = 1\x00\n", binary=True)
@@ -580,7 +619,7 @@ class EncodingTests(TempMixin, unittest.TestCase):
         self.assertIn("NUL byte in the first 8000 bytes", reason)
         self.assertNotIn("unreadable", reason)
 
-    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    @requires_arid
     def test_arid_nodes_does_not_publish_a_secret_in_a_snippet(self):
         """docs/SECURITY-REVIEW.md S3-1, the arid_nodes half.
 
@@ -644,9 +683,10 @@ class StructureTests(TempMixin, unittest.TestCase):
         # summary["skipped"]: that one is the full disposition log and
         # includes "not a test file", which is a decision rather than a
         # failure. The key is "file" here, matching arid_nodes.py,
-        # risk_map.py and env_safety_check.py; summary["skipped"] keys the
-        # same thing as "path", which is what made this test ERROR with a
-        # KeyError rather than fail. Reported, not papered over.
+        # risk_map.py and env_safety_check.py -- and, since the
+        # testsquad.flakesmells/2 bump, summary["skipped"] as well. It used
+        # to key the same thing as "path", which is what made this test ERROR
+        # with a KeyError rather than fail; both lists now agree.
         unread = result["skipped_files"]
         self.assertEqual([s["file"] for s in unread],
                          [self.path("test_huge.py")])
@@ -742,7 +782,7 @@ class StructureTests(TempMixin, unittest.TestCase):
         self.assertEqual(result["truncated_lines"], [])
         self.assertNotIn("PARTLY scanned", fsm.render_text(result))
 
-    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    @requires_arid
     def test_arid_nodes_does_not_silently_shorten_a_long_line(self):
         """REGRESSION. arid_nodes.py had a 2MB file ceiling and no per-line
         bound at all, so a single long line was planned in full. Measured on
@@ -766,7 +806,7 @@ class StructureTests(TempMixin, unittest.TestCase):
         self.assertIn("NOT read", cut["reason"])
         self.assertIn("PARTLY read", arid.render_text(result))
 
-    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    @requires_arid
     def test_arid_nodes_cost_is_linear_in_the_lines_of_one_function(self):
         """REGRESSION. _single_statement_body() rebuilt the whole enclosing
         function's body list for every candidate line in it, and was called
@@ -1623,11 +1663,14 @@ class ResourceBoundTests(unittest.TestCase):
         normalize_coverage.py is the remaining one; it is owned by another
         change in flight and is deliberately left here as the only entry.
         """
+        # arid_nodes.py is one of the scripts under examination here. If it
+        # is gone, this loop would otherwise examine one script fewer and
+        # still pass -- a quieter version of the skip that used to guard
+        # the tests above, and the same defect.
+        require_arid(self)
         unbounded = []
         for name in ("flake_smells.py", "arid_nodes.py", "normalize_coverage.py",
                      "risk_map.py"):
-            if arid is None and name == "arid_nodes.py":
-                continue
             src = self.source(name)
             if "getsize" not in src and "MAX_BYTES" not in src:
                 unbounded.append(name)
@@ -1637,9 +1680,12 @@ class ResourceBoundTests(unittest.TestCase):
         # A ceiling that drops a file quietly is worse than no ceiling: the
         # report then reads exactly like one over a clean repository. Every
         # script that gained a ceiling must also have gained the skip list.
+        # arid_nodes.py is one of the scripts under examination here. If it
+        # is gone, this loop would otherwise examine one script fewer and
+        # still pass -- a quieter version of the skip that used to guard
+        # the tests above, and the same defect.
+        require_arid(self)
         for name in ("flake_smells.py", "arid_nodes.py", "risk_map.py"):
-            if arid is None and name == "arid_nodes.py":
-                continue
             src = self.source(name)
             with self.subTest(script=name):
                 self.assertIn("skipped_files", src)
@@ -1660,9 +1706,12 @@ class ResourceBoundTests(unittest.TestCase):
         that fires without depending on the machine's C stack, so it is as
         true on a developer's Mac as on an Ubuntu runner.
         """
+        # arid_nodes.py is one of the scripts under examination here. If it
+        # is gone, this loop would otherwise examine one script fewer and
+        # still pass -- a quieter version of the skip that used to guard
+        # the tests above, and the same defect.
+        require_arid(self)
         for name in ("arid_nodes.py", "flake_smells.py"):
-            if arid is None and name == "arid_nodes.py":
-                continue
             self.assertIn(name, self._ast_parse_scripts())
             src = self.source(name)
             with self.subTest(script=name):
@@ -1749,8 +1798,7 @@ class ResourceBoundTests(unittest.TestCase):
         # arid_nodes does bound its OUTPUT (max_per_file, default 7), which is
         # the thing its research argues for. That bound says nothing about how
         # much input it will chew through first.
-        if arid is None:
-            self.skipTest("arid_nodes.py is not present in this checkout")
+        require_arid(self)
         self.assertIn("max_per_file", self.source("arid_nodes.py"))
 
     def test_normalize_coverage_caps_uncovered_lines_per_file(self):
@@ -2293,7 +2341,7 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         # walked rather than the file being skipped or parsed as empty.
         self.assertEqual(result["summary"]["by_rule"], {"no-assertion": 1})
 
-    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    @requires_arid
     def test_arid_nodes_on_regex_bait(self):
         lines = [
             "logger.info(" + "'a', " * 5000 + ")\n",
@@ -2332,7 +2380,7 @@ class ReDoSTests(TempMixin, unittest.TestCase):
             assert_ast_depth_reported(self, full, arid, self.path("bait.py"),
                                       scanned_key="files", scanned_value=1)
 
-    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    @requires_arid
     def test_arid_nodes_reports_a_file_it_could_not_parse(self):
         """The platform-independent half of the test above.
 
@@ -2356,7 +2404,7 @@ class ReDoSTests(TempMixin, unittest.TestCase):
         # or it lands in a count a gate could grow a threshold on.
         self.assertNotIn("ast-nesting-too-deep", result["summary"]["suppressed_by_rule"])
 
-    @unittest.skipIf(arid is None, "arid_nodes.py is not present in this checkout")
+    @requires_arid
     def test_arid_nodes_really_does_survive_a_too_deep_file(self):
         """The forced test above proves the reporting; this proves the catch.
 
@@ -2968,6 +3016,174 @@ class AstNestingCapTests(unittest.TestCase):
                 self.assertEqual(
                     set(got.values()), {expected},
                     f"{name}: expected {expected!r} from all three, got {got}")
+
+
+# --------------------------------------------------------------------------
+# the policy that replaced the arid_nodes skips
+# --------------------------------------------------------------------------
+
+class MissingProductionCodePolicyTest(unittest.TestCase):
+    """Eight tests in this file used to skip when scripts/arid_nodes.py was
+    absent. A skip is silence, and with the script deleted the whole file
+    still reported green -- it had simply stopped testing arid_nodes.py and
+    said nothing. Measured before the change: with the module moved aside,
+    `python3 -B -m unittest test_robustness` reported OK with 8 skips; after
+    it reports 21 failures and 0 skips.
+
+    These tests pin the replacement in both directions, because the old
+    behaviour is one `@unittest.skipIf` away and its symptom is a quiet green
+    run that nothing else in the suite would notice.
+
+    Genuine platform guards are untouched and must stay: a missing `git`
+    binary, a filesystem that will not take a newline in a name, an
+    interpreter that dies rather than raising from ast.parse. Those say "this
+    machine cannot host the experiment". A missing script says "the subject
+    of the experiment is gone", which is a broken checkout, not a platform.
+    """
+
+    def probe(self):
+        """A TestCase instance to call the helper against, so a failure is
+        caught here rather than failing this test."""
+        return unittest.TestCase("run")
+
+    def expect_failure(self, call, *args):
+        """Call something that must FAIL, and hand back the message.
+
+        assertRaises(AssertionError) is not enough: if the helper skips, the
+        SkipTest escapes the context manager and unittest records *this* test
+        as skipped -- the regression test for an unwanted skip disappearing
+        into a skip.
+        """
+        try:
+            call(*args)
+        except unittest.SkipTest as exc:
+            self.fail("require_arid() skipped instead of failing. A skip is "
+                      "silence: {0}".format(exc))
+        except AssertionError as exc:
+            return str(exc)
+        self.fail("require_arid() neither failed nor skipped with the module "
+                  "absent")
+
+    def test_a_missing_module_fails_and_says_it_is_the_checkout(self):
+        with mock.patch.object(sys.modules[__name__], "arid", None):
+            with mock.patch.object(sys.modules[__name__], "ARID_IMPORT_ERROR",
+                                   ImportError("No module named 'arid_nodes'")):
+                message = self.expect_failure(require_arid, self.probe())
+        self.assertIn("scripts/arid_nodes.py", message,
+                      "the failure must name the file to restore")
+        self.assertIn("PRODUCTION CODE MISSING", message)
+        self.assertIn("NOT A BUG IN THE CODE UNDER TEST", message,
+                      "a reader triaging a red CI log must be able to tell "
+                      "'the module is gone' from 'the test found a bug' "
+                      "without opening the file")
+        self.assertIn("No module named 'arid_nodes'", message,
+                      "the underlying ImportError must ride along, or a "
+                      "half-broken module reads as a deleted one")
+
+    def test_the_decorator_fails_rather_than_skipping(self):
+        """The decorator is what replaced @unittest.skipIf on seven tests, so
+        it is the thing that has to be proven not to skip."""
+        ran = []
+
+        class Subject(unittest.TestCase):
+            # Deliberately NOT named test_*: this is the probe body, not a
+            # test, and flake_smells.py rightly blocks an assertion-free
+            # test_*. unittest runs whatever method name it is handed.
+            @requires_arid
+            def probe_body(inner):
+                ran.append(True)
+
+        with mock.patch.object(sys.modules[__name__], "arid", None):
+            result = unittest.TestResult()
+            Subject("probe_body").run(result)
+        self.assertEqual([], ran, "the body must not run without the module")
+        self.assertEqual([], result.skipped,
+                         "the decorator skipped; that is the defect it "
+                         "replaced")
+        self.assertEqual(1, len(result.failures))
+        self.assertIn("PRODUCTION CODE MISSING", result.failures[0][1])
+
+    def test_the_decorator_runs_the_test_when_the_module_is_there(self):
+        """The other half: the guard must not be a blanket failure. Without
+        this, a decorator that always failed would pass the test above."""
+        ran = []
+
+        class Subject(unittest.TestCase):
+            # Deliberately NOT named test_*: this is the probe body, not a
+            # test, and flake_smells.py rightly blocks an assertion-free
+            # test_*. unittest runs whatever method name it is handed.
+            @requires_arid
+            def probe_body(inner):
+                ran.append(True)
+
+        self.assertIsNotNone(arid, "scripts/arid_nodes.py did not import, so "
+                                   "this control could not run")
+        result = unittest.TestResult()
+        Subject("probe_body").run(result)
+        self.assertEqual([True], ran)
+        self.assertEqual([], result.failures + result.errors)
+        self.assertEqual([], result.skipped)
+
+    def test_no_skip_in_this_module_is_tied_to_a_missing_script(self):
+        """Source-level guard. Re-adding one `@unittest.skipIf(arid is None,
+        ...)` would restore the silence, and no behavioural test above would
+        notice -- the restored skip would simply not run.
+
+        It deliberately does NOT ban skips outright: the git, filesystem and
+        interpreter guards in this file are legitimate and must survive.
+        """
+        with open(os.path.abspath(__file__), encoding="utf-8") as fh:
+            source = fh.read()
+        try:
+            tree = ast.parse(source)
+        except RecursionError:
+            self.fail("this module's own source is too deeply nested for "
+                      "ast.parse; the guard below did NOT run, so nothing "
+                      "checked that a missing script still fails loudly")
+        offenders = []
+        for node in ast.walk(tree):
+            name = None
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = getattr(func, "attr", None) or getattr(func, "id", None)
+            elif isinstance(node, ast.Raise) and node.exc is not None:
+                exc = node.exc
+                target = exc.func if isinstance(exc, ast.Call) else exc
+                name = getattr(target, "attr", None) or getattr(target, "id",
+                                                                None)
+            if name not in ("skipTest", "SkipTest", "skip", "skipIf",
+                            "skipUnless"):
+                continue
+            segment = ast.get_source_segment(source, node) or ""
+            if "arid" in segment or "SCRIPTS" in segment:
+                offenders.append("line {0}: {1}".format(node.lineno, name))
+        self.assertEqual(
+            [], offenders,
+            "a skip conditioned on a missing production script is silence "
+            "that looks like success; call require_arid() (or wear "
+            "@requires_arid) so the run goes red instead: {0}"
+            .format(offenders))
+
+    def test_the_guard_above_can_actually_see_an_offender(self):
+        """A grep that matches nothing is indistinguishable from a grep that
+        cannot match. This forces one through the same code path."""
+        source = ("import unittest\n"
+                  "class T(unittest.TestCase):\n"
+                  "    @unittest.skipIf(arid is None, 'absent')\n"
+                  "    def test_x(self):\n        pass\n")
+        tree = ast.parse(source)
+        found = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "attr", None)
+                if name in ("skipIf", "skipUnless", "skipTest"):
+                    segment = ast.get_source_segment(source, node) or ""
+                    if "arid" in segment:
+                        found.append(name)
+        self.assertEqual(["skipIf"], found,
+                         "the detection the guard relies on does not fire on "
+                         "the exact pattern that was removed")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

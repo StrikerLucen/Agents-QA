@@ -135,7 +135,9 @@ request whether you use it or not. The per-component figures are only paid when 
 component is invoked.
 
 Note for contributors: the CLI's projection puts five components **above** the ceilings
-`scripts/validate_plugin.py --strict` enforces (3,500 per agent, 3,000 per skill), while
+`scripts/validate_plugin.py --strict` enforces (3,500 per agent, 3,000 per skill) — but
+those ceilings are `bytes // 4`, not a token count, and this corpus runs ~2.86
+chars/token, so the gate undercounts by roughly 30% while
 the script reports all 26 as passing. The two count differently; which is authoritative
 has not been established here. Recorded rather than resolved.
 
@@ -168,16 +170,24 @@ a false positive matters more here than a miss.
 
 `risk_map.py` is left out of that list on purpose — see the warning below.
 
-> **`risk_map.py` on a fresh clone reports the wrong repository's history.** The fixture
-> repos carry no `.git` of their own until `examples/fixtures/regen_git_history.sh` has
-> been run, and a directory with no history of its own falls through to the *enclosing*
-> repository's. Measured 2026-11-17 on a clean clone: `risk_map.py node-ts` returned ten
-> commits dated 2026-11-12 to 2026-11-16 — the plugin's own — and ranked `.gitignore`,
-> with `warnings: []`. `risk_map.py` checks `rev-parse --is-inside-work-tree`, true for
-> any directory nested in any repo, and never records `--show-toplevel`, so nothing in
-> the output distinguishes "scoped to a subdirectory of a monorepo", which is correct
-> behaviour, from "used a history that is not this project's", which is not. Run
-> `regen_git_history.sh` first; `src/cart.ts` should then rank first.
+> **`risk_map.py` on a fresh clone reads the enclosing repository's history, and now
+> says so.** The fixture repos carry no `.git` of their own until
+> `examples/fixtures/regen_git_history.sh` has been run, and a directory with no history
+> of its own falls through to the *enclosing* repository's. Measured 2026-11-17 that was
+> silent: `risk_map.py node-ts` returned ten commits dated 2026-11-12 to 2026-11-16 —
+> the plugin's own — ranked `.gitignore` at `relative_churn` 8.5, and said
+> `warnings: []`. `rev-parse --is-inside-work-tree` is true for any directory nested in
+> any repo, so on its own it cannot tell "scoped to a subdirectory of a monorepo", which
+> is correct, from "borrowed a history that is not this project's", which is not.
+>
+> Since 2026-11-18 every run records `git_root` (the repository the commits were read
+> from) and `path_in_repo`, and warns, in the JSON `warnings` array and on stderr,
+> whenever `git_root` is not the directory you asked for. Which of the two cases you are
+> in is still *your* call — the plugin cannot know your intent — but it is no longer
+> invisible. The same change scopes the history to the subdirectory, so the aliased
+> `.gitignore` is gone and a genuine monorepo package now ranks its own files instead of
+> none. **Run `regen_git_history.sh` first anyway**; `src/cart.ts` then ranks first, with
+> `warnings: []`.
 
 ---
 

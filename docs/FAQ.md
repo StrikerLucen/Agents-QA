@@ -50,9 +50,17 @@ of magnitude and re-run them rather than quoting it — this page carried
 the count moved again between two measurements taken that afternoon.
 
 ```sh
-cat scripts/*.py | wc -l                              # raw
-cat scripts/*.py | grep -vE '^\s*$|^\s*#' | wc -l     # non-blank, non-comment
+cat scripts/*.py | wc -l
+cat scripts/*.py | grep -vE '^\s*$|^\s*#' | wc -l
 ```
+
+The first is raw lines, the second excludes blanks and comment lines. The labels are
+here rather than as trailing `#` comments because zsh leaves `interactive_comments`
+off: pasted into an interactive zsh prompt, a trailing comment arrives as an argument.
+Observed 2026-11-17 on a block in `docs/QUICKSTART.md`, which produced
+`env_safety_check.py: error: unrecognized arguments: # must print UNSAFE`. Note that
+`zsh -c '...'` does **not** reproduce it — a non-interactive zsh accepts comments — so
+the check is a real interactive prompt.
 
 The division of labour is the design: anything a verdict depends on — can the
 suite run, can this test fail, is this environment safe — is executed, not
@@ -97,7 +105,7 @@ uses for its budgets:
 | | Tokens |
 |---|---|
 | Session preamble, every request in a repo with `.testing/` | **~139** (555 chars, measured on a `.testing/` with a profile, a health baseline, three conventions and one known issue — it scales with those files). The **ceiling** is the stable number: `tests/test_integration.py` enforces 2,000 chars, fed deliberately oversized input |
-| A `/testsquad:test` run | **~7,900 at the two-agent floor, ~15,300 at the four-agent ceiling** — skill 1,890, report rules 957, plus 2–4 agents at 2,398–3,486 each |
+| A `/testsquad:test` run | **~7,700 at the two-agent floor, ~16,500 at the four-agent ceiling**, as `bytes // 4` — skill 1,890, report rules 995, plus 2–4 agents at 2,414–3,410 each (measured 2026-11-18). Real tokens run ~30% higher: this corpus is ~2.86 chars/token, so `bytes // 4` understates. Add ~**3,121 real tokens on every request** for the component listing, which no gate here measures |
 | Any single agent / skill | ≤3,500 / ≤3,000, enforced by `scripts/validate_plugin.py --strict` |
 
 *The previous version of this table said ~150 tokens / 578 chars / a 1,500-char cap, and
@@ -109,9 +117,13 @@ No `.testing/` directory, no preamble: the hook exits silently on a repo that
 has never run `/testsquad:start`.
 
 The orchestrator picks **2–4 agents**, not all seven, and that is a cost
-decision with numbers behind it: cost bottoms out around 4–6 subagents and rises
-after; a four-agent system can burn ten times a single agent; past roughly six
-hand-offs you pay about four times the cost for half the success rate.
+decision, though the numbers behind it are weaker than they look: cost bottoms out
+around 4–6 subagents and rises after; a four-agent system can burn ten times a single
+agent; past roughly six hand-offs you pay about four times the cost for half the
+success rate. [`docs/RESEARCH.md`](RESEARCH.md) §21 sources all three to an industry
+write-up rather than a peer-reviewed measurement and says to **treat them as
+directional**: they justify "pick a few agents, not all of them", not a precise
+optimum.
 
 The honest caveat: the dominant cost of a real run is usually not the plugin. It
 is your own suite, which `/testsquad:health` runs three times by default, plus
@@ -145,7 +157,9 @@ Rust or Java.
 `TODO: add assertion` scaffolds in comments, not in docstrings — distinguishing
 a docstring from any other string literal near the top of a block needs a
 parser, and this is a line scanner. Accepted deliberately
-(`scripts/flake_smells.py:1166`).
+(`scripts/flake_smells.py`, the comment beginning "Known limitation, accepted
+deliberately" — quoted rather than given as a line number, because line numbers in this
+repo have gone stale within a single session).
 
 **The secret-entropy heuristic has false positives.** A value of 20+ characters
 with two character classes and entropy ≥3.0 bits, assigned to a credential-shaped

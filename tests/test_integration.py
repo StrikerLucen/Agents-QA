@@ -1196,7 +1196,7 @@ class SchemaCompatibilityTest(ChainCase):
     EXPECTED = {
         "arid_nodes": "testsquad.aridnodes/1",
         "env_safety_check": "testsquad.envsafety/1",
-        "flake_smells": "testsquad.flakesmells/1",
+        "flake_smells": "testsquad.flakesmells/2",
         "normalize_coverage": "testsquad.coverage/1",
         "risk_map": "testsquad.riskmap/1",
     }
@@ -1234,7 +1234,7 @@ class SchemaCompatibilityTest(ChainCase):
             ("risk_map.py", (subject, "--since", ""), "testsquad.riskmap/1"),
             ("normalize_coverage.py", (report,), "testsquad.coverage/1"),
             ("flake_smells.py", (os.path.join(subject, "tests"),),
-             "testsquad.flakesmells/1"),
+             "testsquad.flakesmells/2"),
             ("arid_nodes.py", (os.path.join(subject, "shop"),),
              "testsquad.aridnodes/1"),
         )
