@@ -618,6 +618,16 @@ passes with **0 warnings**, so nothing is over budget.
 **Re-measured 2026-11-16, and the headroom has got worse, not better.** Using the
 validator's own `estimate_tokens()`:
 
+> **The table below is in a retired unit. Read it as history, not as current.**
+> `estimate_tokens()` computed `os.path.getsize(path) // 4` over the whole file,
+> frontmatter included, against a 4-chars-per-token constant nobody had measured. It
+> was retired on 2026-11-18 and replaced by `body_tokens()`, which measures the
+> frontmatter-stripped body against a divisor calibrated at **2.86 chars/token** for
+> this corpus. The old numbers are not wrong about what they measured; they are not
+> token counts. In the current unit `automation-engineer.md` is **4,546**, not 3,486 —
+> the finding below was understated by about 30%, not overstated. The figures are left
+> unedited so the dated claim stays checkable.
+
 | File | Then | Now | Ceiling |
 |---|---|---|---|
 | `agents/automation-engineer.md` | ~3,183 | **3,486** | 3,500 |
@@ -631,7 +641,7 @@ no longer a tidiness exercise. Reproduce with:
 
 ```sh
 python3 -c "import sys; sys.path.insert(0,'scripts'); import validate_plugin as v; \
-print(v.estimate_tokens('agents/automation-engineer.md'))"
+print(v.body_tokens('agents/automation-engineer.md'))"
 ```
 
 | Candidate | Where | Est. saving |

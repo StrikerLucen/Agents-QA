@@ -14,6 +14,10 @@ or are writing the reporter itself. This file is what you follow.
 7. **Appendix** — collapsed: known issues, unconfirmed items, raw data.
 
 ## Hard rules
+Each one is checkable against a draft. This list *is* the pre-publication review: a `no`
+on any of them is a defect in the report, not a stylistic preference.
+
+- **One verdict sentence, ≤25 words**, naming a state and one next action.
 - **Main list caps at 10.** Print `N of M shown, ranked by business risk`.
 - **Every finding carries exactly one evidence badge.** ✅ **reproduced** — you ran it and
   saw it fail, N of M times, on a stated commit. 👁 **observed** — present in a log, trace
@@ -41,6 +45,11 @@ or are writing the reporter itself. This file is what you follow.
 - **Colour is never the only signal** — every status carries a word or icon.
 - **No secrets, ever.** Key names and redacted previews only.
 - **Coverage is never a headline score.** Report which high-risk code is untested.
+- **The report survives grayscale, dark mode and a 360px screen** with every status still
+  readable and no horizontal scroll.
+- **Every item carries a one-click "not useful / couldn't reproduce" control, and no check
+  above 10% EFP appears in the main list.** A check nobody acts on is demoted, not shown
+  louder.
 
 ## First run on a repo
 Everything is new, so novelty cannot rank. Show findings on **critical-risk code only**,
@@ -48,14 +57,6 @@ capped at 10; everything else goes to a counted, non-blocking, explicitly labell
 pre-existing backlog. Say so: *"First scan. 7 shown from highest-risk code; 143
 pre-existing in the backlog."* **A pre-existing finding never blocks a PR.**
 
-## Before publishing — all must be yes
-1. Does the first sentence say whether to worry and what to do first?
-2. Is the main list ≤10, with the remainder counted?
-3. Is every main-list item reproduced or observed?
-4. Does every number have a runnable command beside it?
-5. Are bugs and issues in separate lists?
-6. Are findings clustered by cause rather than listed per symptom?
-7. Is every headline phrased as a consequence, not a taxonomy?
-8. Do emphasised rows pass the ≤ max(2, 30%) check?
-9. Does every status carry a word or icon as well as colour?
-10. Are there zero secrets and zero unconfirmed items outside the appendix?
+## Before publishing
+Re-read **Hard rules** against your draft, line by line. A `no` on any line blocks
+publication. There is no second checklist: this file is the one that runs.

@@ -48,8 +48,7 @@ waste); **arid-node suppression** — nodes whose mutation teaches nobody anythi
 as logging, trivial accessors and presentation, while money arithmetic, boundary
 comparisons, authorization connectors and loop conditions stay mutable however they are
 named; the **per-file cap** (`--max-per-file`, default 7); and the weighted operator
-draw. Suppression is the difference between 820 and 7, and it **matters more than the
-choice of tool**.
+draw. Suppression **matters more than the choice of tool**.
 
 Exit 0 means a plan was produced — possibly a partial one, see below. **Any non-zero
 exit means no plan exists**: report that the plan could not be produced, quote stderr,
@@ -94,35 +93,21 @@ people learn to never run one again.
 
 ## Operators: five, weighted
 
-The script draws one of these per line. **Measured:** these five are the ones with
-published per-operator share, survivability and productivity (Petrović et al., TSE 2021 —
-RESEARCH §20), so they are the five we can weight honestly. **A choice, not a finding:**
-stopping at five. No paper says five is optimal; the mutation-reduction literature bounds
-*removing* operators and explicitly exempts *adding* them (RESEARCH §20). What is measured
-is that suppression pays more at this effort budget — 820 mutants down to 7 (RESEARCH §15)
-— so a bigger catalogue is a cost question we have not spent on, not a settled one.
-
-| Operator | Note |
-|---|---|
-| **SBR** statement block removal | Roughly **68%** of generated mutants |
-| **ROR** relational operator replacement | **84.1% productive** — weight toward it |
-| **AOR** arithmetic operator replacement | |
-| **LCR** logical connector replacement | |
-| **UOI** unary operator insertion | **74.5% productive** — weight away from it |
+The script draws one of five per line — **SBR**, **ROR**, **AOR**, **LCR**, **UOI** — and
+weights the draw itself, so you never choose one. **Measured:** these five are the ones
+with published per-operator share, survivability and productivity; the table is RESEARCH
+§20 (Petrović et al., TSE 2021). **A choice, not a finding:** stopping at five. No paper
+says five is optimal; the mutation-reduction literature bounds *removing* operators and
+explicitly exempts *adding* them (RESEARCH §20). What is measured is that suppression pays
+more at this effort budget (RESEARCH §15), so a bigger catalogue is a cost question we
+have not spent on, not a settled one.
 
 ## Scoping to the diff
 
-`--diff` scopes the plan. The mutation tool itself still has to be told, and the
-per-tool flags differ more than the docs suggest:
-
-| Language | Tool | Diff-scoped invocation |
-|---|---|---|
-| PHP | Infection | `--git-diff-lines --git-diff-base=origin/main` — line-level, the strictest |
-| Rust | cargo-mutants | `--in-diff /tmp/pr.diff` |
-| C# | Stryker.NET | `--since:origin/main --with-baseline` |
-| JS/TS | StrykerJS | **`--incremental`, not `--since`** — `--since` is Stryker.NET only and the docs conflate the two. Reuses ~94% of prior results |
-| Java | PIT | `historyInputLocation` — experimental, can report a false "still killed". Reliable git scoping needs commercial arcmutate |
-| **Go** | — | **Effectively dead.** `go-mutesting` last commit 2021, `gremlins` semi-dormant since 2026-03-30. Say so rather than recommending something unmaintained |
+`--diff` scopes the plan. The mutation tool itself still has to be told, and the per-tool
+flags differ more than the docs suggest — **read the verified per-tool flag table in
+RESEARCH §15 and quote it; never guess a flag.** Go is the exception that needs no lookup:
+it has no maintained mutation tool, so say that rather than recommending an unmaintained one.
 
 ## Never gate on a mutation score
 
@@ -153,9 +138,8 @@ This is not a comment box. It is an input to the next run: pass `--feedback` and
 nodes are suppressed, with the output recording which suppressions came from feedback
 rather than from a built-in rule. A node type reported useless twice becomes a
 suppression proposal, which goes through `/testsquad:learn` and needs the user's approval
-before it lands in `.testing/conventions.md`. Developer feedback growing the suppression rules is what
-took Google from 15% to 89% usefulness (RESEARCH §15), and it is the only mechanism here
-that improves with use.
+before it lands in `.testing/conventions.md`. Developer feedback growing the suppression
+rules (RESEARCH §15) is the only mechanism here that improves with use.
 
 ## Output
 

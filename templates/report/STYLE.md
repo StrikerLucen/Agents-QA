@@ -507,35 +507,13 @@ from 6% to 4% flakiness in two months — the cheapest win in the literature.
 
 ## Report review checklist
 
-Run this against the draft **before publishing**. Any `no` blocks publication.
+**The checklist lives in `RULES.md`, under *Hard rules*, and that is the copy that
+runs.** It is phrased there as checkable imperatives, and it now carries the three checks
+this file used to hold alone: the ≤25-word verdict sentence, the grayscale / dark-mode /
+360px check, and the feedback control plus the 10% EFP bar.
 
-1. Does the report open with exactly one verdict sentence of ≤25 words that
-   names a state and one next action? ☐ yes ☐ no
-2. Is the top section ≤10 items, containing only new / reproduced / untriaged
-   findings? ☐ yes ☐ no
-3. If anything was truncated, is the honest "N of M shown, ranked by business
-   risk" line present with the true M? ☐ yes ☐ no
-4. Is every headline a symptom, with no stack frame, file path, exception class
-   or test function name in it? ☐ yes ☐ no
-5. Are emphasised rows ≤30% of all rows, with red used only for
-   reproduced-and-critical? ☐ yes ☐ no
-6. Does every number in sections 1–5 carry a literal, copy-pasteable command
-   that reproduces it? ☐ yes ☐ no
-7. Does every finding carry exactly one evidence badge, with 📖/💭 confined to
-   the collapsed appendix *and* excluded from the bug total, each with its
-   disqualifying reason? ☐ yes ☐ no
-8. Are bugs (product) and issues (testing) in two separate lists with separate
-   counts, with every failure classified product / test / infrastructure?
-   ☐ yes ☐ no
-9. Is every cluster collapsed to one finding with a count, so that length tracks
-   distinct problems rather than failing tests? ☐ yes ☐ no
-10. Is every severity shown with its computed inputs, and every priority marked
-    "proposed" or attributed to a named human? ☐ yes ☐ no
-11. Is the ranking by business cost, stated in words, rather than by count?
-    ☐ yes ☐ no
-12. Does the report survive grayscale, dark mode and a 360px-wide screen with
-    every status still readable and no horizontal scroll? ☐ yes ☐ no
-13. Does every item carry a one-click "not useful / couldn't reproduce" control,
-    and is no check above 10% EFP present in the main list? ☐ yes ☐ no
-
-A `no` on any line is a defect in the report, not a stylistic preference.
+There were three checklists here with two different counts — a 13-point list in this
+file, a 10-point list in `RULES.md`, and a skill that called the first one binding. An
+agent that satisfied one could fail another, and "binding" meant nothing while it was
+ambiguous which one bound. One list, in the file every report-producing agent already
+reads.

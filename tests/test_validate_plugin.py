@@ -1205,5 +1205,235 @@ class ExemptionResolutionTests(PluginTreeMixin, unittest.TestCase):
                     f"follow it. Leaving it is config that lies.")
 
 
+# --------------------------------------------------------------------------
+# the unit itself: what a budget number means
+# --------------------------------------------------------------------------
+
+class TokenUnitTests(unittest.TestCase):
+    """The arithmetic, in isolation from any file.
+
+    These pin the two properties the gate's credibility rests on: the number
+    printed is the number compared, and the boundary is where the comment
+    says it is.
+    """
+
+    def test_tokens_round_up_so_the_gate_never_under_reports(self):
+        # 2.86 chars/token: 286 characters is exactly 100 tokens.
+        self.assertEqual(vp.tokens_from_chars(286, 286), 100)
+        # One character more must not still read as 100.
+        self.assertEqual(vp.tokens_from_chars(287, 286), 101)
+
+    def test_a_file_at_exactly_the_ceiling_is_silent_and_one_char_over_is_not(self):
+        # The boundary a reader can act on: 1,800 tokens is 5,148 characters.
+        self.assertEqual(vp.tokens_from_chars(5_148, 286), 1_800)
+        self.assertEqual(vp.tokens_from_chars(5_149, 286), 1_801)
+
+    def test_zero_characters_is_zero_tokens(self):
+        self.assertEqual(vp.tokens_from_chars(0, 286), 0)
+
+    def test_the_two_divisors_are_not_interchangeable(self):
+        """Frontmatter prose is denser; using the body divisor on it inflates.
+
+        This is not a style point. Applying 2.86 to the always-on corpus gives
+        3,374 tokens against a measured 3,110 -- 8% of a number that is
+        charged on every single request.
+        """
+        self.assertNotEqual(vp.CHARS_PER_TOKEN_BODY_X100,
+                            vp.CHARS_PER_TOKEN_FRONTMATTER_X100)
+        chars = 9_672
+        self.assertGreater(vp.tokens_from_chars(chars, vp.CHARS_PER_TOKEN_BODY_X100),
+                           vp.tokens_from_chars(chars, vp.CHARS_PER_TOKEN_FRONTMATTER_X100))
+
+    def test_the_documented_float_is_derived_from_the_enforced_integer(self):
+        """Written twice, they drift. CALIBRATION must not restate a literal."""
+        self.assertEqual(vp.CALIBRATION["chars_per_token_body"],
+                         vp.CHARS_PER_TOKEN_BODY_X100 / 100)
+        self.assertEqual(vp.CALIBRATION["chars_per_token_frontmatter"],
+                         vp.CHARS_PER_TOKEN_FRONTMATTER_X100 / 100)
+
+    def test_the_unit_note_cannot_be_miscounted_as_a_warning(self):
+        """scripts/project_state.py classifies any output line containing
+        'warn' as a warning. A provenance line must not trip it."""
+        self.assertNotIn("warn", vp.BUDGET_UNIT_NOTE.lower())
+
+    def test_the_unit_note_says_it_is_an_estimate(self):
+        """The whole point of moving provenance out of the docstring."""
+        self.assertIn("estimate", vp.BUDGET_UNIT_NOTE.lower())
+        self.assertIn(vp.CALIBRATION["measured_on"], vp.BUDGET_UNIT_NOTE)
+
+
+class BodyTokensTests(PluginTreeMixin, unittest.TestCase):
+    """What body_tokens() counts, and what it deliberately does not."""
+
+    def test_frontmatter_is_not_counted(self):
+        """The property nothing in this repo checked before.
+
+        A long description is charged on every request by the always-on
+        budget; charging it again here would bill it twice.
+        """
+        body = "y" * 1_000
+        short = "---\nname: a\ndescription: >\n  s\n---\n" + body
+        long_fm = ("---\nname: a\ndescription: >\n  " + ("q " * 300) + "\n---\n") + body
+        self.write("agents/short.md", short)
+        self.write("agents/long.md", long_fm)
+        self.assertEqual(vp.body_tokens(self.path("agents/short.md")),
+                         vp.body_tokens(self.path("agents/long.md")))
+
+    def test_a_file_without_frontmatter_is_measured_whole(self):
+        """Not a silent fallback -- check_markdown_component already errors
+        on a missing block, so the loud verdict exists elsewhere."""
+        self.write("agents/raw.md", "z" * 286)
+        self.assertEqual(vp.body_tokens(self.path("agents/raw.md")), 100)
+
+    def test_characters_not_bytes(self):
+        """A UTF-16 component weighs what it costs a model, not a disk."""
+        text = "---\nname: a\ndescription: >\n  s\n---\n" + ("e" * 286)
+        self.write("agents/u16.md", text.encode("utf-16"))
+        self.assertEqual(vp.body_tokens(self.path("agents/u16.md")), 100)
+
+    def test_an_unreadable_component_raises_unreadable_not_oserror(self):
+        self.replace_with_dir("agents/alpha.md")
+        with self.assertRaises(vp.Unreadable):
+            vp.body_tokens(self.path("agents/alpha.md"))
+
+
+class CalibrationStalenessTests(unittest.TestCase):
+    """The divisor is an empirical measurement of a corpus that moves.
+
+    Nothing here can re-derive it: that needs the CLI, which is not on the CI
+    runners. What it can do is notice when the corpus has drifted far enough
+    that the number should be re-measured, and say so by name rather than
+    letting it rot the way estimate_tokens()'s docstring did.
+    """
+
+    def test_the_component_count_the_calibration_was_taken_over_still_holds(self):
+        count, _ = vp.calibration_corpus(PLUGIN_ROOT)
+        self.assertEqual(
+            count, vp.CALIBRATION["components"],
+            f"The calibration in validate_plugin.py was measured over "
+            f"{vp.CALIBRATION['components']} components; there are now {count}. "
+            f"The divisor may still be right, but nobody has checked it against "
+            f"this corpus. Re-measure with `claude plugin details`, or update "
+            f"CALIBRATION['components'] and say in the commit why the old "
+            f"divisor still applies.")
+
+    def test_the_corpus_has_not_drifted_far_enough_to_invalidate_the_divisor(self):
+        _, total = vp.calibration_corpus(PLUGIN_ROOT)
+        baseline = vp.CALIBRATION["body_chars"]
+        low, high = int(baseline * 0.75), int(baseline * 1.25)
+        self.assertTrue(
+            low <= total <= high,
+            f"The calibration was measured over {baseline:,} characters of body "
+            f"prose; the corpus is now {total:,}, outside +/-25%. A divisor is a "
+            f"property of the text it was measured on. Re-measure it.")
+
+
+# --------------------------------------------------------------------------
+# reading a value nothing in scripts/ could read before
+# --------------------------------------------------------------------------
+
+class FieldTextTests(unittest.TestCase):
+    """field_text() against the shapes that actually occur."""
+
+    def test_a_plain_scalar_reads_as_itself(self):
+        self.assertEqual(vp.field_text("name: alpha\n", "name"), "alpha")
+
+    def test_a_folded_scalar_returns_its_text_not_its_marker(self):
+        """The whole reason this function exists: field() returns '>'."""
+        fm = "name: a\ndescription: >\n  one two\n  three\n"
+        self.assertEqual(vp.field("description" and fm, "description"), ">")
+        self.assertEqual(vp.field_text(fm, "description"), "one two three")
+
+    def test_a_literal_block_is_read_too(self):
+        fm = "description: |\n  one\n  two\n"
+        self.assertEqual(vp.field_text(fm, "description"), "one two")
+
+    def test_every_block_marker_variant_is_recognised(self):
+        for marker in vp.BLOCK_SCALAR_MARKERS:
+            with self.subTest(marker=marker):
+                fm = f"description: {marker}\n  body text\n"
+                self.assertEqual(vp.field_text(fm, "description"), "body text")
+
+    def test_an_unindented_line_ends_the_block(self):
+        """Without this the reader swallows the rest of the frontmatter and
+        the always-on total silently inflates."""
+        fm = "description: >\n  wanted\ntools: Read, Grep\nmodel: opus\n"
+        self.assertEqual(vp.field_text(fm, "description"), "wanted")
+
+    def test_quotes_are_stripped_from_a_plain_scalar(self):
+        self.assertEqual(vp.field_text('name: "alpha"\n', "name"), "alpha")
+
+    def test_a_missing_field_is_none_not_empty(self):
+        """None and "" mean different things: absent, versus present and
+        empty. A caller that cannot tell them apart reports 0 for both."""
+        self.assertIsNone(vp.field_text("name: a\n", "description"))
+
+    def test_every_shipped_component_has_readable_frontmatter_text(self):
+        """If this fails the always-on total is a floor and nobody noticed."""
+        import glob as _glob
+        for pattern in ("agents/*.md", "skills/*/SKILL.md"):
+            for path in sorted(_glob.glob(os.path.join(PLUGIN_ROOT, pattern))):
+                with self.subTest(component=os.path.basename(os.path.dirname(path))):
+                    fm, _ = vp.split_frontmatter(vp.read_text(path))
+                    self.assertTrue(vp.field_text(fm, "name"))
+                    desc = vp.field_text(fm, "description")
+                    self.assertTrue(desc)
+                    self.assertNotIn(desc, vp.BLOCK_SCALAR_MARKERS)
+
+
+class AlwaysOnBudgetTests(PluginTreeMixin, unittest.TestCase):
+    """The bill that is paid when nothing runs."""
+
+    def test_a_clean_tree_is_silent_and_reports_a_total(self):
+        report = vp.validate(self.tmp)
+        self.assertEqual([w for w in report.warnings if "always-on" in w], [])
+        self.assertGreater(report.always_on_tokens, 0)
+        self.assertEqual(report.always_on_components, 5)   # 3 agents + 2 skills
+
+    def test_a_fat_description_breaches_the_budget(self):
+        self.write("agents/alpha.md",
+                   "---\nname: alpha\ndescription: >\n  " + ("word " * 4000) +
+                   "\n---\n" + BODY)
+        report = vp.validate(self.tmp)
+        self.assertSurvivors(report, "always-on budget")
+        self.assertTrue(any("over the" in w and "always-on" in w
+                            for w in report.warnings), report.warnings)
+
+    def test_an_unreadable_component_makes_the_total_a_floor_and_says_so(self):
+        """Silence must never look like success: a component that could not be
+        measured contributed 0, and a total that quietly includes a 0 is a
+        wrong number stated confidently."""
+        self.replace_with_dir("agents/alpha.md")
+        report = vp.validate(self.tmp)
+        self.assertTrue(report.always_on_incomplete)
+        self.assertTrue(any("floor and not a total" in w for w in report.warnings),
+                        report.warnings)
+
+    def test_a_floor_already_over_the_ceiling_still_reports_the_breach(self):
+        """Reporting only 'incomplete' when the measured part is already over
+        would be silence wearing a hedge."""
+        self.write("agents/bravo.md",
+                   "---\nname: bravo\ndescription: >\n  " + ("word " * 4000) +
+                   "\n---\n" + BODY)
+        self.replace_with_dir("agents/alpha.md")
+        report = vp.validate(self.tmp)
+        breach = [w for w in report.warnings if "over the" in w and "always-on" in w]
+        self.assertTrue(breach, report.warnings)
+        self.assertIn("at least", breach[0])
+
+    def test_templates_are_not_counted(self):
+        """They ship into a user's repo; they are not in this plugin's
+        listing, so charging them here would invent a cost."""
+        before = vp.validate(self.tmp).always_on_tokens
+        self.write("templates/agents/zz.tmpl",
+                   "---\nname: zz\ndescription: >\n  " + ("word " * 2000) + "\n---\n")
+        self.assertEqual(vp.validate(self.tmp).always_on_tokens, before)
+
+    def test_the_quotable_summary_line_is_still_untouched(self):
+        """r.checked must not move: the stdout summary is pinned byte-for-byte
+        elsewhere and quoted verbatim in two docs."""
+        self.assertEqual(vp.validate(self.tmp).checked, 7)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
